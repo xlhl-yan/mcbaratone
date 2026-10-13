@@ -6,6 +6,17 @@
 > 我在游戏里打字它能听见，能跟着我跑、帮我挖矿打怪，偶尔还会主动开口聊天。
 >
 > **成分表：100% 纯 AI 出品，无人工添加。**（连这句玩笑也是它自己写的 🐋）
+>
+> ---
+>
+> **English:** A personal fork of [jhwodchuck/mcbaratone](https://github.com/jhwodchuck/mcbaratone).
+> Upstream aims at an unattended, no-cheat run from world spawn to the Ender Dragon; this fork retargets it so a
+> **DeepSeek Harness (DSH) agent plays Minecraft _with_ you** — it hears what you type in game chat, follows you
+> around, mines and fights on request, and occasionally speaks up on its own.
+>
+> _Ingredients: 100% pure AI, no human additives. (This joke included.)_
+>
+> Everything below this line is in Chinese.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Java 25](https://img.shields.io/badge/Java-25-ED8B00.svg)](bridge/gradle.properties)
