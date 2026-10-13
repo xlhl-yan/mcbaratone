@@ -4,6 +4,8 @@
 >
 > 上游的目标是「无干预从出生点打到末影龙」；本 fork 改成 **让 DeepSeek Harness（DSH）里的 AI 陪我玩 Minecraft** ——
 > 我在游戏里打字它能听见，能跟着我跑、帮我挖矿打怪，偶尔还会主动开口聊天。
+>
+> **成分表：100% 纯 AI 出品，无人工添加。**（连这句玩笑也是它自己写的 🐋）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Java 25](https://img.shields.io/badge/Java-25-ED8B00.svg)](bridge/gradle.properties)
