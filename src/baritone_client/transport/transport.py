@@ -38,6 +38,28 @@ from ..observability import (
 logger = logging.getLogger(__name__)
 
 
+def decode_bridge_bytes(raw: bytes) -> str:
+    """Decode a chunk received from the Java bridge.
+
+    The bridge writes with ``new PrintWriter(socket.getOutputStream(), true)``
+    (see BaritoneAPIBridge.java) which uses the *JVM default* charset. On a
+    Chinese Windows install that is GB18030/GBK, not UTF-8. Decoding with a
+    hard-coded UTF-8 therefore raises UnicodeDecodeError as soon as any
+    non-ASCII text (world name, chat, item names...) appears in a response,
+    which kills the read loop and surfaces as a timeout on every route.
+
+    Strategy: try the encoding the bridge actually used first, then UTF-8,
+    then a lossless fallback so a single odd byte can never break the reader.
+    """
+    for encoding in ("gb18030", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    # Neither worked cleanly: keep the stream alive instead of crashing.
+    return raw.decode("utf-8", errors="replace")
+
+
 def connect(host: str, port: int, timeout: float = 2.0):
     """Create and connect a TCP socket. Separated out so tests can patch it."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -408,7 +430,7 @@ class TcpTransport(Transport):
                 with self._lock:
                     active_socket = self._socket
                 try:
-                    chunk = active_socket.recv(4096).decode("utf-8")
+                    chunk = decode_bridge_bytes(active_socket.recv(4096))
                     if not chunk:
                         if self._shutdown_event.is_set():
                             break

@@ -303,10 +303,31 @@ class CommandDispatcher:
 
             success = True
 
-            # Bridge returns status "ok" or "error"
-            if response.get("status") == "ok":
+            # transport.dispatch() 已经把 bridge 的信封剥掉了（并在 status 为
+            # "error" 时抛异常），所以这里的 response **就是数据本身**。
+            #
+            # ⚠ 坑：不要拿 response["status"] 当"成功与否"的唯一判据。
+            #   · 大部分 route 的 data 里根本没有 status；
+            #   · 但 `sequence` 的 data **自带** status:"completed" ——
+            #     上一版只认 "ok"，于是每次 sequence 都被判成失败：
+            #     mine_quantity 静默返回 {}，而且 run() 还会回退到 chat 再发一次
+            #     "#mine ..."，同一个挖矿被执行两遍。
+            # 现在只把明确的错误状态当失败，其余（None / ok / completed）都算成功，
+            # 并且始终把整个 response 当数据返回，不再去剥 response["data"]。
+            status = response.get("status")
+            if status is None or status in ("ok", "completed"):
+                # 分两种情况，靠"有没有独立的 data 字段"来区分：
+                #   · 信封：{"status":"ok", "data":{...}}  → 真数据在 data 里
+                #   · 已经是数据：sequence 的 {"partial_results":..., "status":"completed"}
+                #     或 get_state 的 {"position":...}  → 整个 response 就是数据
+                # 之前两版各错一边：只看 status=="ok" 会把 sequence 判成失败；
+                # 无条件返回整个 response 又会让信封形态的调用方拿到多一层壳。
+                if isinstance(response.get("data"), (dict, list)):
+                    payload_data = response["data"]
+                else:
+                    payload_data = response
                 return CommandResult.success(
-                    response.get("data", {}),
+                    payload_data,
                     retry_status=response.get("retry_status"),
                     circuit_breaker_state=response.get("circuit_breaker_state"),
                     priority_level=response.get("priority_level")

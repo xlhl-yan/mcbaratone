@@ -184,22 +184,85 @@ public class SequenceCommandHandler extends AbstractCommandHandler {
                 break;
 
             case "mine":
-                // mine <block> [count]
-                String[] mineParts = args.split("\\s+", 2);
-                params.addProperty("block", mineParts[0]);
-                if (mineParts.length > 1) {
-                    try {
-                        params.addProperty("count", Integer.parseInt(mineParts[1]));
-                    } catch (NumberFormatException e) {
-                        // ignore
+                // 两种参数顺序都要吃，因为调用方来自两个不同年代的约定：
+                //   mine <block_type> [count]          <- 老写法
+                //   mine <count> <block_type>          <- MCP 的 mine_quantity 就是这么拼的
+                // 而且真正的 handler 认的是 block_type / quantity，
+                // 老代码写的 "block" / "count" 名字对不上（实测报 Missing block_type）。
+                String[] mineParts = args.split("\\s+");
+                if (mineParts.length >= 1 && !mineParts[0].isEmpty()) {
+                    int next = 1;
+                    Integer lead = tryParseInt(mineParts[0]);
+                    if (lead != null && mineParts.length >= 2) {
+                        params.addProperty("quantity", lead);
+                        params.addProperty("count", lead);
+                        params.addProperty("block_type", mineParts[1]);
+                        params.addProperty("block", mineParts[1]);
+                        next = 2;
+                    } else {
+                        params.addProperty("block_type", mineParts[0]);
+                        params.addProperty("block", mineParts[0]);
+                        if (mineParts.length > 1) {
+                            Integer n = tryParseInt(mineParts[1]);
+                            if (n != null) {
+                                params.addProperty("quantity", n);
+                                params.addProperty("count", n);
+                                next = 2;
+                            }
+                        }
+                    }
+                    // 后面若还有三组数字，当坐标
+                    if (mineParts.length >= next + 3) {
+                        Integer mx = tryParseInt(mineParts[next]);
+                        Integer my = tryParseInt(mineParts[next + 1]);
+                        Integer mz = tryParseInt(mineParts[next + 2]);
+                        if (mx != null && my != null && mz != null) {
+                            params.addProperty("x", mx);
+                            params.addProperty("y", my);
+                            params.addProperty("z", mz);
+                        }
                     }
                 }
+                break;
+
+            case "follow":
+                // follow player <name> | follow entity <type> | follow <target>
+                // GotoCommandHandler 靠 params.action 区分 goto/come/follow，
+                // 缺了它就会掉进 goto 分支去要 x/y/z（实测报 Missing coordinate parameters）。
+                params.addProperty("action", "follow");
+                String followArgs = args.trim();
+                String[] followParts = followArgs.split("\\s+", 2);
+                if (followParts.length == 2
+                        && (followParts[0].equalsIgnoreCase("player")
+                                || followParts[0].equalsIgnoreCase("entity"))) {
+                    params.addProperty("entity", followParts[1]);
+                } else if (!followArgs.isEmpty()) {
+                    params.addProperty("entity", followArgs);
+                } else {
+                    params.addProperty("entity", "player");
+                }
+                break;
+
+            case "come":
+                params.addProperty("action", "come");
                 break;
 
             default:
                 // Generic parameter handling - store the raw args
                 params.addProperty("args", args);
                 break;
+        }
+    }
+
+    /** 能解析成整数就返回它，否则 null —— 用来容忍两种参数顺序。 */
+    private static Integer tryParseInt(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

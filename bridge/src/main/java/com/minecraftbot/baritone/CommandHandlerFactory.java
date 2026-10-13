@@ -41,6 +41,8 @@ public class CommandHandlerFactory {
         registerHandler("get_combat_snapshot", StateCommandHandler.class);
         registerHandler("get_player_pos", PlayerPositionCommandHandler.class);
         registerHandler("scan_biomes", BiomeScanCommandHandler.class);
+        // 只读：准星当前指着什么（以前这个数据只能靠 use_item 顺带带出来，但调它会真右键）
+        registerHandler("get_look_target", GetLookTargetCommandHandler.class);
 
         // Build commands
         registerHandler("build", BuildCommandHandler.class);
@@ -112,6 +114,10 @@ public class CommandHandlerFactory {
 
         // Sequence Commands with Rollback
         registerHandler("sequence", SequenceCommandHandler.class);
+
+        // 游戏消息该唤醒哪个 DSH 会话（玩家在游戏里敲 !waken <id> 改它）
+        registerHandler("get_waken_session", GetWakenSessionCommandHandler.class);
+        registerHandler("set_waken_session", SetWakenSessionCommandHandler.class);
 
         logger.info("Command handler registry initialized with {} handlers", handlerRegistry.size());
     }

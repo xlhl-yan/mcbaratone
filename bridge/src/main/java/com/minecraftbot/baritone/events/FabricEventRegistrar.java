@@ -2,6 +2,7 @@ package com.minecraftbot.baritone.events;
 
 import com.minecraftbot.baritone.EventManager;
 import com.minecraftbot.baritone.BaritoneAPIBridge;
+import com.minecraftbot.baritone.WakenSessionStore;
 import com.google.gson.JsonObject;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
@@ -37,6 +38,26 @@ public class FabricEventRegistrar {
                 eventManager.publishEvent(EventManager.EventType.CHAT, data);
             }
         });
+
+        // Player chat listener. The GAME channel above only carries system/game
+        // messages, so on a multiplayer server every line a player typed was
+        // invisible to the bridge. CHAT also hands us the sender's GameProfile,
+        // which is what lets a driver tell "who said this" from "the server said
+        // this" instead of guessing from the rendered line.
+        ClientReceiveMessageEvents.CHAT.register(
+                (message, signedMessage, sender, params, timestamp) -> {
+                    String text = message.getString();
+                    String senderName = (sender != null) ? sender.name() : null;
+                    JsonObject data = new JsonObject();
+                    data.addProperty("message", text);
+                    if (senderName != null && !senderName.isEmpty()) {
+                        data.addProperty("sender", senderName);
+                    }
+                    eventManager.publishEvent(EventManager.EventType.CHAT, data,
+                            EventManager.Priority.NORMAL, "player_chat");
+
+                    handleWakenCommand(text, senderName);
+                });
 
         // Block break listener (when player starts breaking a block)
         AttackBlockCallback.EVENT.register((player, world, hand, pos, direction) -> {
@@ -116,5 +137,45 @@ public class FabricEventRegistrar {
         });
 
         LOGGER.info("Fabric event listeners registered");
+    }
+
+    /**
+     * 处理游戏内的设置命令（{@code 唤醒会话 <id>} / {@code !waken <id>} 等）：
+     * 把「DSH 该唤醒哪个会话」写进本地配置。
+     *
+     * <p>两个客户端都装了 bridge，同一条聊天两边都会收到，所以：
+     * <ul>
+     *   <li><b>写盘不受发送者限制</b> —— 玩家可能在自己客户端敲，也可能切到 AI
+     *       客户端敲。两种情况下 AI 这侧的配置都必须落上，因为 DSH 读的是它。</li>
+     *   <li><b>只有回话去重</b> —— 只在「发送者不是自己」时吭声。这样无论命令从
+     *       哪边发出，都恰好只有一个客户端回复。</li>
+     * </ul>
+     */
+    private void handleWakenCommand(String rawMessage, String senderName) {
+        String wanted = WakenSessionStore.matchCommand(rawMessage);
+        if (wanted == null) {
+            return;
+        }
+        Minecraft client = Minecraft.getInstance();
+        if (client.player == null) {
+            return;
+        }
+
+        boolean written = WakenSessionStore.write(wanted);
+
+        String self = client.player.getGameProfile().name();
+        if (senderName == null || senderName.equals(self)) {
+            return; // 这半边只负责写，不吭声
+        }
+
+        final String reply;
+        if (!written) {
+            reply = "[bridge] 写入失败，检查游戏目录 config 的写权限";
+        } else if (wanted.isEmpty()) {
+            reply = "[bridge] 已清除，游戏消息回到「自动挑最近会话」";
+        } else {
+            reply = "[bridge] 已记住唤醒会话：" + wanted;
+        }
+        client.player.connection.sendChat(reply);
     }
 }

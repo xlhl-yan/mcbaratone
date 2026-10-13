@@ -34,8 +34,29 @@ class CommandFacade:
             priority = priority.value
         if priority not in ("high", "normal", "low"):
             raise ValidationError(f"Invalid priority '{priority}'. Must be 'high', 'normal', or 'low'", field="priority")
-        payload = {"message": command, "priority": priority}
-        result = self.dispatcher.dispatch("chat", payload)
+        normalized = command.strip()
+        if normalized.startswith(("#", "/")):
+            # An explicit Baritone ("#") or Minecraft ("/") command: the bridge's
+            # chat handler executes those verbatim.
+            payload = {"message": normalized, "priority": priority}
+            result = self.dispatcher.dispatch("chat", payload)
+        else:
+            # Prefer the bridge's structured command channel first. Its
+            # `sequence` handler parses "cmd arg arg" into the params each bridge
+            # command expects ("craft oak_planks 4") and reports unknown commands
+            # as errors. The chat handler would instead type the text into game
+            # chat and report success while doing nothing at all.
+            result = self.dispatcher.dispatch(
+                "sequence", {"sequence": normalized, "priority": priority}
+            )
+            data = result.get_data() if result.is_success() else None
+            if not result.is_success() or (
+                isinstance(data, dict) and data.get("validation_errors")
+            ):
+                # Not a bridge command (e.g. a Baritone setting or "help"), so
+                # fall back to a raw Baritone command with the "#" prefix.
+                payload = {"message": "#" + normalized, "priority": priority}
+                result = self.dispatcher.dispatch("chat", payload)
         if result.is_success():
             return result.get_data()
         else:

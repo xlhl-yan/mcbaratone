@@ -34,7 +34,7 @@ from mcp.server.session import ServerSession
 from ..utils.cache_manager import CacheStats
 from ..core.client import Client
 from ..transport.command_dispatcher import CommandResult
-from ..core.exceptions import TransportError
+from ..core.exceptions import CommandError, TransportError
 from ..core.facades.goals import GoalFactory
 from ..transport.transport import TcpTransport, WebSocketTransport
 from ..utils.upload_manager import UploadProgress
@@ -328,6 +328,554 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         return _call_bridge(ctx, "command/run", lambda client: client.command.run(command))
 
     @mcp.tool()
+    def say(message: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Say something in Minecraft chat as the bot.
+
+        Goes straight to the bridge's `chat` handler WITHOUT a "#" prefix, so it
+        is spoken as a normal player message. Do not use run_command for this:
+        that path treats the text as a command (or splices it into `sequence`),
+        never as conversation.
+        """
+        return _call_bridge(
+            ctx, "command/say", lambda client: client.transport.dispatch("chat", {"message": message})
+        )
+
+    @mcp.tool()
+    def eat(
+        ctx: RequestContext,
+        food: str = "",
+        hold_ms: int = 1800,
+        timeout_s: float = 8.0,
+    ) -> Dict[str, Any]:
+        """Eat food to restore hunger (and let natural regeneration heal you).
+
+        Picks edible food from the inventory (or the one named in `food`, e.g.
+        "cooked_beef"), moves it into the selected hotbar slot if needed, then
+        holds right-click until the item is actually consumed.
+
+        Use this when health is dropping or hunger is low; do NOT use
+        run_command("use_item") — that only fires a single right-click and food
+        needs to be held down, and it can't find food for you.
+        """
+        name = (food or "").strip().lower()
+        if name and not name.startswith("minecraft:"):
+            name = "minecraft:" + name
+
+        def _food_score(item_id: str) -> int:
+            """Better food first (rough order; enough to pick sensibly)."""
+            short = item_id.replace("minecraft:", "")
+            table = {
+                "golden_apple": 100,
+                "enchanted_golden_apple": 110,
+                "cooked_beef": 90,
+                "cooked_porkchop": 90,
+                "cooked_mutton": 88,
+                "cooked_chicken": 86,
+                "cooked_salmon": 86,
+                "cooked_cod": 84,
+                "cooked_rabbit": 84,
+                "bread": 80,
+                "baked_potato": 78,
+                "apple": 70,
+                "carrot": 68,
+                "golden_carrot": 95,
+                "melon_slice": 60,
+                "sweet_berries": 58,
+                "glow_berries": 58,
+                "dried_kelp": 55,
+                "beetroot": 50,
+                "potato": 40,
+                "beef": 35,
+                "porkchop": 35,
+                "chicken": 33,
+                "mutton": 34,
+                "salmon": 32,
+                "cod": 30,
+                "rotten_flesh": 5,
+            }
+            return table.get(short, 0)
+
+        def _run(client):
+            inventory = client.transport.dispatch("get_inventory", {})
+            entries = (inventory or {}).get("inventory") or []
+            candidates = []
+            for entry in entries:
+                item_id = str(entry.get("id") or "")
+                count = int(entry.get("count") or 0)
+                if count <= 0:
+                    continue
+                if name:
+                    if item_id != name:
+                        continue
+                elif _food_score(item_id) <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "slot": int(entry.get("slot", -1)),
+                        "id": item_id,
+                        "count": count,
+                        "score": _food_score(item_id),
+                    }
+                )
+            if not candidates:
+                raise CommandError(
+                    f"no edible food in inventory (looked for {name or 'any known food'})"
+                )
+
+            # 快捷栏 0-8 可以直接手持；在主背包就得先换过来
+            hotbar = [c for c in candidates if 0 <= c["slot"] <= 8]
+            chosen = max(hotbar or candidates, key=lambda c: c["score"])
+            if chosen["slot"] > 8:
+                client.transport.dispatch(
+                    "inventory_click",
+                    {"slot": chosen["slot"], "button": 0, "type": "SWAP"},
+                )
+                time.sleep(0.35)
+                moved = client.transport.dispatch("get_inventory", {})
+                for entry in (moved or {}).get("inventory") or []:
+                    if entry.get("id") == chosen["id"] and 0 <= int(entry.get("slot", -1)) <= 8:
+                        chosen = {**chosen, "slot": int(entry["slot"])}
+                        break
+                else:
+                    raise CommandError("failed to move food into the hotbar")
+
+            client.transport.dispatch("select_slot", {"slot": chosen["slot"]})
+            time.sleep(0.15)
+            client.transport.dispatch(
+                "use_item", {"hand": "MAIN_HAND", "duration_ms": max(200, int(hold_ms))}
+            )
+
+            # 等它真吃完：库存里那份数量应该减少
+            deadline = time.time() + max(1.0, float(timeout_s))
+            before = chosen["count"]
+            while time.time() < deadline:
+                time.sleep(0.35)
+                after = client.transport.dispatch("get_inventory", {})
+                remaining = 0
+                for entry in (after or {}).get("inventory") or []:
+                    if entry.get("id") == chosen["id"]:
+                        remaining += int(entry.get("count") or 0)
+                if remaining < before:
+                    state = client.transport.dispatch("get_state", {}) or {}
+                    return {
+                        "ate": chosen["id"].replace("minecraft:", ""),
+                        "consumed": before - remaining,
+                        "remaining": remaining,
+                        "health": state.get("health"),
+                        "food_level": state.get("food_level"),
+                    }
+            # 创造模式吃东西**不消耗物品**，所以"数量减少"这条验证永远不成立。
+            # 那种情况下不再报错，如实说明即可（2026-10-13 在创造调试世界里踩到）。
+            state = client.transport.dispatch("get_state", {}) or {}
+            mode = str(state.get("game_mode") or "")
+            if mode == "creative":
+                return {
+                    "ate": chosen["id"].replace("minecraft:", ""),
+                    "consumed": 0,
+                    "remaining": before,
+                    "note": "creative mode: eating does not consume the item, so this is unverifiable — treated as done",
+                    "health": state.get("health"),
+                    "food_level": state.get("food_level"),
+                }
+            raise CommandError(
+                f"held {chosen['id']} but nothing was consumed "
+                f"(is the player actually able to eat? full hunger?)"
+            )
+
+        return _call_bridge(ctx, "command/eat", _run)
+
+    @mcp.tool()
+    def look_around(
+        ctx: RequestContext,
+        yaw: float = 0.0,
+        pitch: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Turn the bot's head (absolute angles in degrees)."""
+        return _call_bridge(
+            ctx,
+            "command/look",
+            lambda client: client.transport.dispatch("look", {"yaw": yaw, "pitch": pitch}),
+        )
+
+    @mcp.tool()
+    def get_inventory(ctx: RequestContext) -> Dict[str, Any]:
+        """List what the bot is carrying (slot / item / count), plus selected slot."""
+        return _call_bridge(
+            ctx, "command/get_inventory", lambda client: client.transport.dispatch("get_inventory", {})
+        )
+
+    @mcp.tool()
+    def select_slot(slot: int, ctx: RequestContext) -> Dict[str, Any]:
+        """Hold a hotbar slot (0-8). Slots 9+ are the main inventory and cannot be held."""
+        if slot < 0 or slot > 8:
+            raise ValueError("slot must be 0-8 (hotbar); use throw_item/equip to move other items")
+        return _call_bridge(
+            ctx,
+            "command/select_slot",
+            lambda client: client.transport.dispatch("select_slot", {"slot": int(slot)}),
+        )
+
+    @mcp.tool()
+    def throw_item(
+        ctx: RequestContext,
+        slot: Optional[int] = None,
+        all: bool = False,
+    ) -> Dict[str, Any]:
+        """Drop an item on the ground (give something to the user this way).
+
+        `slot` selects a hotbar slot first; omit it to drop whatever is held.
+        `all=True` drops the whole stack instead of one item.
+        """
+        def _run(client):
+            if slot is not None:
+                if slot < 0 or slot > 8:
+                    raise CommandError("slot must be 0-8 (hotbar) — move it there first")
+                client.transport.dispatch("select_slot", {"slot": int(slot)})
+                time.sleep(0.15)
+            return client.transport.dispatch("throw_item", {"all": bool(all)})
+
+        return _call_bridge(ctx, "command/throw_item", _run)
+
+    @mcp.tool()
+    def attack_nearest(
+        ctx: RequestContext,
+        max_distance: float = 4.0,
+        swings: int = 3,
+        min_cooldown: float = 0.9,
+        hostile_only: bool = True,
+        entity_type: str = "",
+    ) -> Dict[str, Any]:
+        """Swing at the nearest mob.
+
+        The bridge's attack_entity only performs ONE swing and refuses while the
+        attack cooldown isn't ready, so this loops `swings` times with a pause
+        between hits. Give `entity_type` (e.g. "zombie") to pick a specific kind,
+        or leave it empty to hit whatever hostile mob is closest.
+        """
+        hostiles = {
+            "zombie", "husk", "drowned", "skeleton", "stray", "spider", "cave_spider",
+            "creeper", "enderman", "witch", "slime", "magma_cube", "silverfish",
+            "blaze", "ghast", "piglin", "piglin_brute", "hoglin", "zoglin",
+            "pillager", "vindicator", "evoker", "ravager", "phantom", "guardian",
+            "elder_guardian", "shulker", "wither_skeleton", "warden", "bogged",
+        }
+
+        def _run(client):
+            wanted = (entity_type or "").strip().lower().replace("minecraft:", "")
+            hits = 0
+            seen = ""
+            for _ in range(max(1, int(swings))):
+                found = client.transport.dispatch(
+                    "get_entities", {"radius": max(6, int(max_distance) + 4)}
+                )
+                candidates = []
+                for entry in (found or {}).get("entities") or []:
+                    kind = str(entry.get("type") or "").replace("minecraft:", "")
+                    if "player" in kind:
+                        continue
+                    if not entry.get("is_living"):
+                        continue
+                    if wanted:
+                        if kind != wanted:
+                            continue
+                    elif hostile_only and kind not in hostiles:
+                        continue
+                    distance = float(entry.get("distance") or 9999)
+                    if distance > float(max_distance):
+                        continue
+                    candidates.append({"id": entry.get("id"), "type": kind, "distance": distance})
+                if not candidates:
+                    break
+                target = min(candidates, key=lambda c: c["distance"])
+                seen = target["type"]
+                result = client.transport.dispatch(
+                    "attack_entity",
+                    {"entity_id": target["id"], "min_cooldown": float(min_cooldown)},
+                )
+                if isinstance(result, dict) and result.get("attacked"):
+                    hits += 1
+                time.sleep(0.65)
+            return {
+                "swings": hits,
+                "target": seen or None,
+                "note": "0 swings usually means: nothing in range, or attack cooldown not ready",
+            }
+
+        return _call_bridge(ctx, "command/attack_nearest", _run)
+
+    @mcp.tool()
+    def equip(
+        ctx: RequestContext,
+        item: str = "",
+        slot: str = "",
+    ) -> Dict[str, Any]:
+        """Equip armour or move an item to the off hand (by item name or slot).
+
+        bridge 的 equip handler 要求 **slot 和 item 都给**：slot 是目标槽名
+        (head/chest/legs/feet/offhand)，item 是要穿的物品 id。不传 slot 时这里
+        按物品名自动推断（iron_helmet → head，iron_chestplate → chest …）。
+        """
+        target = (slot or "").strip().lower()
+        if not target and item:
+            name = item.lower().replace("minecraft:", "")
+            if "helmet" in name or "cap" in name or "skull" in name or "head" in name:
+                target = "head"
+            elif "chestplate" in name or "tunic" in name or "elytra" in name:
+                target = "chest"
+            elif "leggings" in name or "pants" in name:
+                target = "legs"
+            elif "boots" in name:
+                target = "feet"
+            else:
+                target = "offhand"
+        if not target:
+            raise ValueError("give either item or slot")
+        params: Dict[str, Any] = {"slot": target}
+        if item:
+            params["item"] = item
+        return _call_bridge(
+            ctx, "command/equip", lambda client: client.transport.dispatch("equip", params)
+        )
+
+    @mcp.tool()
+    def place_torches(ctx: RequestContext, x: int = 0, y: int = 0, z: int = 0) -> Dict[str, Any]:
+        """Place torches around the given spot (omit coords to use the bot's own position)."""
+        def _run(client):
+            params: Dict[str, Any] = {}
+            if x or y or z:
+                params = {"x": int(x), "y": int(y), "z": int(z)}
+            else:
+                # handler 明确要求坐标（原话 "Coordinates required for torch placement"），
+                # 不传就报错，所以这里自己取当前位置补上。
+                state = client.transport.dispatch("get_state", {}) or {}
+                pos = state.get("block_position") or state.get("position") or {}
+                params = {
+                    "x": int(pos.get("x", 0)),
+                    "y": int(pos.get("y", 0)),
+                    "z": int(pos.get("z", 0)),
+                }
+            return client.transport.dispatch("place_torches", params)
+
+        return _call_bridge(ctx, "command/place_torches", _run)
+
+    @mcp.tool()
+    def interact_block(
+        ctx: RequestContext,
+        x: int,
+        y: int,
+        z: int,
+        hand: str = "MAIN_HAND",
+    ) -> Dict[str, Any]:
+        """Right-click a block (open doors, press buttons, use chests).
+
+        ⚠ 两个必须知道的限制：
+
+        1. bridge 的 handler **无视玩家朝向**，它自己从眼睛位置向**方块中心**做几何
+           射线，并要求命中的方块正好是目标，否则报
+           "Target is not visible on a real block ray"。所以这里先转头瞄准只是让
+           动作看起来合理，真正决定成败的是站位的几何关系。
+        2. **薄方块（门/按钮/拉杆/火把）极容易打不中**：它们的形状只占方块一角，
+           瞄准中心的射线会从旁边擦过去。实测门(关门, facing=west, 门板在 x∈[5.0,5.19])
+           **站在东侧打不中、站在西侧(门板那一侧)才能打中**。整块方块（箱子/熔炉/
+           工作台）没这个问题。
+           → 遇到这个报错时的正确做法是**换个方向靠近目标**，而不是反复重试。
+        """
+        def _run(client):
+            client.transport.dispatch(
+                "look_at", {"x": x + 0.5, "y": y + 0.5, "z": z + 0.5}
+            )
+            time.sleep(0.25)
+            return client.transport.dispatch(
+                "interact_block", {"x": int(x), "y": int(y), "z": int(z), "hand": hand}
+            )
+
+        return _call_bridge(ctx, "command/interact_block", _run)
+
+    @mcp.tool()
+    def look_at(ctx: RequestContext, x: float, y: float, z: float) -> Dict[str, Any]:
+        """Turn the bot's head toward a world position."""
+        return _call_bridge(
+            ctx,
+            "command/look_at",
+            lambda client: client.transport.dispatch(
+                "look_at", {"x": float(x), "y": float(y), "z": float(z)}
+            ),
+        )
+
+    @mcp.tool()
+    def get_death_location(ctx: RequestContext) -> Dict[str, Any]:
+        """Where the bot last died (useful for going back for its stuff)."""
+        return _call_bridge(
+            ctx,
+            "command/get_death_location",
+            lambda client: client.transport.dispatch("get_death_location", {}),
+        )
+
+    @mcp.tool()
+    def respawn(ctx: RequestContext) -> Dict[str, Any]:
+        """Respawn after death."""
+        return _call_bridge(
+            ctx, "command/respawn", lambda client: client.transport.dispatch("respawn", {})
+        )
+
+    #
+    # 信息查询（只读）
+    #
+
+    @mcp.tool()
+    def get_entities(radius: int = 32, ctx: RequestContext = None) -> Dict[str, Any]:
+        """List nearby entities.
+
+        Each entry has type / name (display name) / distance / position / is_living
+        / health / is_aggressive. NOTE: coordinates live under `position`, and
+        `name` is the DISPLAY name (Chinese), not the account name.
+        """
+        return _call_bridge(
+            ctx,
+            "command/get_entities",
+            lambda client: client.transport.dispatch("get_entities", {"radius": int(radius)}),
+        )
+
+    @mcp.tool()
+    def get_player_pos(ctx: RequestContext) -> Dict[str, Any]:
+        """Where the bot's player is (exact + block position)."""
+        return _call_bridge(
+            ctx, "command/get_player_pos", lambda client: client.transport.dispatch("get_player_pos", {})
+        )
+
+    @mcp.tool()
+    def get_block(x: int, y: int, z: int, ctx: RequestContext) -> Dict[str, Any]:
+        """What block sits at these coordinates."""
+        return _call_bridge(
+            ctx,
+            "command/get_block",
+            lambda client: client.transport.dispatch("get_block", {"x": int(x), "y": int(y), "z": int(z)}),
+        )
+
+    @mcp.tool()
+    def get_dimension(ctx: RequestContext) -> Dict[str, Any]:
+        """Which dimension the bot is in (overworld / nether / end)."""
+        return _call_bridge(
+            ctx, "command/get_dimension", lambda client: client.transport.dispatch("get_dimension", {})
+        )
+
+    @mcp.tool()
+    def get_combat_snapshot(ctx: RequestContext) -> Dict[str, Any]:
+        """Combat-focused view: health, nearby hostiles, attack cooldown."""
+        return _call_bridge(
+            ctx,
+            "command/get_combat_snapshot",
+            lambda client: client.transport.dispatch("get_combat_snapshot", {}),
+        )
+
+    @mcp.tool()
+    def get_look_target(ctx: RequestContext) -> Dict[str, Any]:
+        """What the crosshair is pointing at right now (read-only).
+
+        返回 type(block/entity/miss) + 命中点坐标 + 距离 + 命中方块的完整 block_state
+        （"门开没开""拉杆朝哪"这类问题一眼能看出来）。纯读取，**不会触发右键** ——
+        以前想看这个只能调 use_item，那会真的动一下手。
+        """
+        return _call_bridge(
+            ctx, "command/get_look_target", lambda client: client.transport.dispatch("get_look_target", {})
+        )
+
+    @mcp.tool()
+    def get_recipes(ctx: RequestContext) -> Dict[str, Any]:
+        """List the crafting recipes the bot knows.
+
+        ⚠ KNOWN BROKEN on MC 1.21.4: the bridge answers
+        "Recipe listing not available on client in 1.21.4. Using defaults."
+        （上游限制 —— 新版本客户端不再暴露完整配方表。）
+        所以别指望它来查配方：`craft` 用的是 bridge 里内置的配方表，
+        直接 craft("oak_planks", 4) 就行，不需要先查。
+        """
+        return _call_bridge(
+            ctx, "command/get_recipes", lambda client: client.transport.dispatch("get_recipes", {})
+        )
+
+    #
+    # 合成与方块操作
+    #
+
+    @mcp.tool()
+    def craft(item: str, ctx: RequestContext, count: int = 1) -> Dict[str, Any]:
+        """Craft an item, e.g. craft("oak_planks", 4).
+
+        bridge 的 craft handler 认 item + count；3x3 配方（石镐之类）必须先打开
+        工作台界面，否则报 "Recipe requires crafting table but none is open"。
+        """
+        return _call_bridge(
+            ctx,
+            "command/craft",
+            lambda client: client.transport.dispatch("craft", {"item": item, "count": int(count)}),
+        )
+
+    @mcp.tool()
+    def place_block(block: str, x: int, y: int, z: int, ctx: RequestContext) -> Dict[str, Any]:
+        """Place a block at coordinates (it must be in the inventory).
+
+        bridge 的 place_block 认 `block` + `position`（对象），且**要求主手拿着那个方块**
+        ——否则报 "Main hand must contain a block item"。所以这里先自动把手持切到它
+        （只在快捷栏 0-8 里找；在背包深处的话得先自己挪出来）。
+        """
+        wanted = (block or "").strip().replace("minecraft:", "")
+
+        def _run(client):
+            inventory = client.transport.dispatch("get_inventory", {}) or {}
+            for entry in inventory.get("inventory") or []:
+                item = str(entry.get("id") or "").replace("minecraft:", "")
+                if item == wanted and int(entry.get("count") or 0) > 0:
+                    slot = int(entry.get("slot", -1))
+                    if 0 <= slot <= 8:
+                        client.transport.dispatch("select_slot", {"slot": slot})
+                        time.sleep(0.2)
+                    break
+            return client.transport.dispatch(
+                "place_block", {"block": block, "position": {"x": int(x), "y": int(y), "z": int(z)}}
+            )
+
+        return _call_bridge(ctx, "command/place_block", _run)
+
+    @mcp.tool()
+    def dig_block(x: int, y: int, z: int, ctx: RequestContext) -> Dict[str, Any]:
+        """Break a single block at coordinates."""
+        return _call_bridge(
+            ctx,
+            "command/dig_block",
+            lambda client: client.transport.dispatch("dig_block", {"x": int(x), "y": int(y), "z": int(z)}),
+        )
+
+    @mcp.tool()
+    def use_bucket(
+        operation: str,
+        x: int,
+        y: int,
+        z: int,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        """Use a bucket at coordinates.
+
+        operation is either "pickup" (fill the bucket from a water source) or
+        "place" (pour water out). The main hand must already hold the matching
+        item — empty bucket for pickup, water bucket for place.
+        """
+        op = (operation or "").strip().lower()
+        if op in ("fill", "take", "scoop"):
+            op = "pickup"
+        if op in ("empty", "pour", "dump"):
+            op = "place"
+        if op not in ("pickup", "place"):
+            raise ValueError('operation must be "pickup" or "place"')
+        return _call_bridge(
+            ctx,
+            "command/use_bucket",
+            lambda client: client.transport.dispatch(
+                "use_bucket", {"operation": op, "x": int(x), "y": int(y), "z": int(z)}
+            ),
+        )
+
+    @mcp.tool()
     def batch_command(commands: List[str], ctx: RequestContext, stop_on_error: bool = True) -> Dict[str, Any]:
         """Execute multiple Baritone commands sequentially with proper error handling."""
         results = []
@@ -572,7 +1120,14 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def thisway(blocks: int, ctx: RequestContext) -> Dict[str, Any]:
         """Go in the direction you are facing for a specified number of blocks."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"thisway {blocks}"))
+        # thisway 是 Baritone 原生命令，bridge 没有对应的 handler。
+        # 必须显式带 "#" 走 chat：否则会先进 sequence 通道，而 sequence 只认
+        # craft/goto/mine，会把它当未知命令拒掉（虽然 `run` 有回退，但多一次往返）。
+        return _call_bridge(
+            ctx,
+            "command/thisway",
+            lambda client: client.transport.dispatch("chat", {"message": f"#thisway {blocks}"}),
+        )
 
     @mcp.tool()
     def path(ctx: RequestContext) -> Dict[str, Any]:
@@ -582,30 +1137,61 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def goal_coordinates(x: Optional[int], y: Optional[int], z: Optional[int], ctx: RequestContext) -> Dict[str, Any]:
         """Set a goal to the specified coordinates. Provide at least one coordinate."""
-        parts = []
-        if x is not None: parts.append(str(x))
-        if y is not None: parts.append(str(y))
-        if z is not None: parts.append(str(z))
-        if not parts:
+        if x is None and y is None and z is None:
             return {"error": "At least one coordinate must be specified"}
-        
-        command = f"goal {' '.join(parts)}"
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(command))
+        # 注意：bridge 的 `goal` handler 要的是 type/value 两个参数，不是 x/y/z。
+        # 坐标目标在 bridge 这边对应的是 `goto`（GotoCommandHandler 认 x/y/z）。
+        params: Dict[str, Any] = {}
+        if x is not None:
+            params["x"] = int(x)
+        if y is not None:
+            params["y"] = int(y)
+        if z is not None:
+            params["z"] = int(z)
+        return _call_bridge(
+            ctx,
+            "command/goal_coordinates",
+            lambda client: client.transport.dispatch("goto", params),
+        )
 
     @mcp.tool()
     def goto_block_type(block_type: str, ctx: RequestContext) -> Dict[str, Any]:
         """Go to a block of a specific type (e.g. 'diamond_ore', 'portal', 'ender_chest')."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"goto {block_type}"))
+        # bridge 的 `goto` handler 只认坐标，没有「去某种方块」的能力；
+        # 那是 Baritone 原生命令 `#goto <block>` 的活，所以显式走 chat。
+        return _call_bridge(
+            ctx,
+            "command/goto_block_type",
+            lambda client: client.transport.dispatch(
+                "chat", {"message": f"#goto {block_type}"}
+            ),
+        )
 
     @mcp.tool()
     def follow_entity(entity_type: str, ctx: RequestContext) -> Dict[str, Any]:
         """Follow entities of a specific type (e.g. 'pig', 'cow')."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"follow entity {entity_type}"))
+        # ⚠ bridge 的 GotoCommandHandler 把 entity 原样拼进 "#follow <entity>"，
+        # 而 Baritone 的真实语法是 `#follow player <名字>` / `#follow entity <类型>`。
+        # 必须把限定词一起带上，否则发出去的是 `#follow pig` —— 无效命令，
+        # 表现为「命令返回 applied:true 但角色一动不动」（实测确认）。
+        return _call_bridge(
+            ctx,
+            "command/follow_entity",
+            lambda client: client.transport.dispatch(
+                "follow", {"action": "follow", "entity": f"entity {entity_type}"}
+            ),
+        )
 
     @mcp.tool()
     def follow_player(player_name: str, ctx: RequestContext) -> Dict[str, Any]:
         """Follow a specific player."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"follow player {player_name}"))
+        return _call_bridge(
+            ctx,
+            "command/follow_player",
+            lambda client: client.transport.dispatch(
+                "follow", {"action": "follow", "entity": f"player {player_name}"}
+            ),
+        )
 
     @mcp.tool()
     def come(ctx: RequestContext) -> Dict[str, Any]:
@@ -625,15 +1211,22 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def explore(x: Optional[int], z: Optional[int], ctx: RequestContext) -> Dict[str, Any]:
         """Explore the world from the origin of x,z (or player feet if omitted)."""
-        cmd = "explore"
-        if x is not None and z is not None:
-            cmd += f" {x} {z}"
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(cmd))
+        # bridge 有 explore handler（认 x/z），直接发结构化参数，别走字符串解析。
+        params: Dict[str, Any] = {}
+        if x is not None:
+            params["x"] = int(x)
+        if z is not None:
+            params["z"] = int(z)
+        return _call_bridge(
+            ctx, "command/explore", lambda client: client.transport.dispatch("explore", params)
+        )
 
     @mcp.tool()
     def axis(ctx: RequestContext) -> Dict[str, Any]:
         """Go to an axis or diagonal axis."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run("axis"))
+        return _call_bridge(
+            ctx, "command/axis", lambda client: client.transport.dispatch("axis", {})
+        )
 
     @mcp.tool()
     def surface(ctx: RequestContext) -> Dict[str, Any]:
@@ -647,30 +1240,117 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def build_schematic(name: str, x: Optional[int], y: Optional[int], z: Optional[int], ctx: RequestContext) -> Dict[str, Any]:
         """Build a schematic. Optionally specify origin coordinates."""
-        cmd = f"build {name}"
-        if x is not None and y is not None and z is not None:
-             cmd += f" {x} {y} {z}"
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(cmd))
+        # bridge 的 build handler 认 action/schematic/x/y/z —— 走结构化参数，
+        # 老实现发 "build <name> x y z"，解析层接不住。
+        params: Dict[str, Any] = {"action": "schematic", "schematic": name}
+        if x is not None:
+            params["x"] = int(x)
+        if y is not None:
+            params["y"] = int(y)
+        if z is not None:
+            params["z"] = int(z)
+        return _call_bridge(
+            ctx, "command/build", lambda client: client.transport.dispatch("build", params)
+        )
 
     @mcp.tool()
     def tunnel(height: int, width: int, depth: int, ctx: RequestContext) -> Dict[str, Any]:
         """Dig a tunnel with specified dimensions."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"tunnel {height} {width} {depth}"))
+        # Baritone 原生命令就是 `#tunnel <height> <width> <depth>`，而 bridge 的
+        # `tunnel` handler 收的是 radius/width/坐标，两边语义对不上。
+        # 这里按 API 文档的语义走 Baritone 原生命令。
+        return _call_bridge(
+            ctx,
+            "command/tunnel",
+            lambda client: client.transport.dispatch(
+                "chat", {"message": f"#tunnel {int(height)} {int(width)} {int(depth)}"}
+            ),
+        )
 
     @mcp.tool()
     def farm(range: Optional[int], waypoint: Optional[str], ctx: RequestContext) -> Dict[str, Any]:
         """Automatically harvest, replant, or bone meal crops."""
-        cmd = "farm"
+        # bridge 的 farm handler 认 range（还有 crop/replant/坐标），没有 waypoint。
+        params: Dict[str, Any] = {}
         if range is not None:
-            cmd += f" {range}"
-            if waypoint is not None:
-                cmd += f" {waypoint}"
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(cmd))
+            params["range"] = int(range)
+        return _call_bridge(
+            ctx, "command/farm", lambda client: client.transport.dispatch("farm", params)
+        )
 
     @mcp.tool()
     def mine_quantity(block_type: str, quantity: int, ctx: RequestContext) -> Dict[str, Any]:
-        """Mine a specific quantity of a block type."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"mine {quantity} {block_type}"))
+        """Mine a block type until `quantity` NEW ones are collected (0 = until none left).
+
+        NOTE: 走 Baritone 原生 `#mine <block>`。bridge 那个 `mine` handler 实测是坏的
+        ——它返回 applied:true 但 MineProcess 起来就静止，位置和背包都不动
+        （2026-10-13 排查确认）。Baritone 的 #mine 本身没有数量参数，会一直挖到
+        附近没有这种方块为止；所以给了 quantity 时这里盯着背包，攒够就 cancel。
+        """
+        wanted = (block_type or "").strip().replace("minecraft:", "")
+        if not wanted:
+            raise ValueError("block_type is required")
+        target = int(quantity or 0)
+
+        def _run(client):
+            def count_of(entry_list):
+                total = 0
+                for entry in entry_list or []:
+                    item = str(entry.get("id") or "").replace("minecraft:", "")
+                    if item == wanted:
+                        total += int(entry.get("count") or 0)
+                return total
+
+            before = count_of((client.transport.dispatch("get_inventory", {}) or {}).get("inventory"))
+            client.transport.dispatch("chat", {"message": f"#mine {wanted}"})
+            if target <= 0:
+                return {
+                    "started": True,
+                    "block": wanted,
+                    "had_before": before,
+                    "note": "no quantity given — will keep mining until none are left; cancel to stop",
+                }
+
+            # ⚠ 轮询上限必须**低于工具调用超时**（cordis.patch.yml 的
+            # toolCallTimeoutMs，当前 120s），否则这边还在等、那边已经报
+            # "Request timed out"（踩过：原来写了 150s）。
+            # 数量多的时候不硬等，先回一句「在挖了」，让调用方自己查背包。
+            if target > 5:
+                return {
+                    "started": True,
+                    "block": wanted,
+                    "requested": target,
+                    "had_before": before,
+                    "note": "large order — mining runs in background; poll get_inventory (or cancel) to track it",
+                }
+
+            deadline = time.time() + 90
+            gained = 0
+            while time.time() < deadline:
+                time.sleep(1.0)
+                inv = client.transport.dispatch("get_inventory", {}) or {}
+                gained = count_of(inv.get("inventory")) - before
+                if gained >= target:
+                    client.transport.dispatch("cancel", {})
+                    return {
+                        "mined": gained,
+                        "requested": target,
+                        "block": wanted,
+                        "note": "stopped after reaching the requested amount",
+                    }
+            # 超时**必须 cancel**。以前这里只是返回"还在挖"，把 Baritone 任务
+            # 留在后台跑 —— 结果 AI 被它拖着到处走，之后所有操作都被干扰
+            # （2026-10-13 实测：看上去像"挖两格→放不了→再挖两格"的死循环）。
+            # 宁可这一单挖不完，也不要留下一个看不见的活跃任务。
+            client.transport.dispatch("cancel", {})
+            return {
+                "mined": gained,
+                "requested": target,
+                "block": wanted,
+                "note": "已超时并停止（90s 没凑够）。任务已取消，需要继续就再调一次。",
+            }
+
+        return _call_bridge(ctx, "command/mine_quantity", _run)
 
     #
     # Utility & Info
@@ -689,7 +1369,13 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def find(block_type: str, ctx: RequestContext) -> Dict[str, Any]:
         """Search through Baritone's cache and attempt to find the location of the block."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"find {block_type}"))
+        # bridge 的 handler 叫 find_blocks（认 blocks/radius/limit/center），
+        # 不是 find —— 之前发 "find xxx" 会被 sequence 当未知命令拒掉。
+        return _call_bridge(
+            ctx,
+            "command/find",
+            lambda client: client.transport.dispatch("find_blocks", {"blocks": [block_type]}),
+        )
 
     @mcp.tool()
     def version(ctx: RequestContext) -> Dict[str, Any]:
@@ -773,27 +1459,51 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def set_setting(name: str, value: Any, ctx: RequestContext) -> Dict[str, Any]:
         """Set a Baritone setting. For booleans, the value is option (toggles if omitted in chat, but here we require value)."""
-        # Note: In chat "allowBreak" toggles. "allowBreak true" sets it.
-        # We will encourage explicit values.
-        # If value is string "reset", it resets.
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"{name} {value}"))
+        # bridge 的 settings handler 认 `set` + `value` 两个键。
+        # 老实现发的是裸字符串 "allowSprint true"（连命令名都没有），必挂。
+        return _call_bridge(
+            ctx,
+            "command/set_setting",
+            lambda client: client.transport.dispatch("settings", {"set": name, "value": str(value)}),
+        )
+
+    @mcp.tool()
+    def get_setting(name: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Read the current value of a Baritone setting."""
+        return _call_bridge(
+            ctx,
+            "command/get_setting",
+            lambda client: client.transport.dispatch("settings", {"get": name}),
+        )
 
     @mcp.tool()
     def reset_setting(name: str, ctx: RequestContext) -> Dict[str, Any]:
         """Reset a specific setting to its default value."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run(f"{name} reset"))
+        # 这是 Baritone 原生命令（`#<name> reset`），bridge 没有对应 handler。
+        return _call_bridge(
+            ctx,
+            "command/reset_setting",
+            lambda client: client.transport.dispatch("chat", {"message": f"#{name} reset"}),
+        )
 
     @mcp.tool()
     def reset_all_settings(ctx: RequestContext) -> Dict[str, Any]:
         """Reset all settings to their default values."""
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run("reset"))
+        return _call_bridge(
+            ctx,
+            "command/reset_all_settings",
+            lambda client: client.transport.dispatch("chat", {"message": "#reset"}),
+        )
 
     @mcp.tool()
     def get_modified_settings(ctx: RequestContext) -> Dict[str, Any]:
         """See all settings that have been modified from their default values."""
-        # Note: This prints to chat. The bridge might capture chat, or we assume the user checks chat log.
-        # Ideally we'd return them. For now, we invoke the command.
-        return _call_bridge(ctx, "command/run", lambda client: client.command.run("modified"))
+        # Baritone 原生命令，结果会打印到游戏聊天里。
+        return _call_bridge(
+            ctx,
+            "command/get_modified_settings",
+            lambda client: client.transport.dispatch("chat", {"message": "#modified"}),
+        )
 
     #
     # Miscellaneous
@@ -830,7 +1540,11 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         """Inspect a build site candidate by radius before any mutation."""
         if radius < 4 or radius > 24:
             raise ValueError("inspect_build_site radius must be between 4 and 24 blocks.")
-        return _call_bridge(ctx, "inspect_build_site", lambda client: client.command.run(f"inspect_build_site {radius}"))
+        return _call_bridge(
+            ctx,
+            "inspect_build_site",
+            lambda client: client.transport.dispatch("inspect_build_site", {"radius": int(radius)}),
+        )
 
     @mcp.tool()
     def preview_build_plan(build_plan: Any) -> Dict[str, Any]:

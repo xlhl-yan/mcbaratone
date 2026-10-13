@@ -39,10 +39,28 @@ class ClientFacadeTest(TestCase):
         self.client = Client(self.transport)
 
     def test_command_dispatch(self):
+        """不带 # 的命令走 bridge 的 sequence 通道。
+
+        老行为是把它当聊天消息发出去：bridge 的 chat handler 会把它敲进游戏聊天
+        然后报「成功」，实际什么也没做 —— `run_command("craft oak_planks 4")`
+        静默失效就是这么来的。现在先走 sequence，失败才回退 `#` 前缀的 chat。
+        """
         response = self.client.command.run("goto 1 64 1")
-        expected_payload = {"command": "chat", "params": {"message": "goto 1 64 1", "priority": "normal"}}
+        expected_payload = {
+            "command": "sequence",
+            "params": {"sequence": "goto 1 64 1", "priority": "normal"},
+        }
         self.assertIn(("command", expected_payload), self.transport.dispatched)
         self.assertEqual(expected_payload, response)
+
+    def test_explicit_baritone_command_goes_to_chat(self):
+        """带 # 前缀的仍然是原样聊天命令（bridge 的 chat handler 负责执行）。"""
+        self.client.command.run("#allowBreak true")
+        expected_payload = {
+            "command": "chat",
+            "params": {"message": "#allowBreak true", "priority": "normal"},
+        }
+        self.assertIn(("command", expected_payload), self.transport.dispatched)
 
     def test_goal_serialization_and_apply(self):
         goal = GoalFactory.goal_block(1, 2, 3)

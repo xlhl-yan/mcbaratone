@@ -504,3 +504,7 @@ tests/functional/*_test_results.txt
 # Downloaded Gradle distribution
 bridge/gradle-8.12/
 bridge/gradle-8.12-bin.zip
+
+# Local scratch backups left behind while patching upstream files
+*.bak
+*.bak-*
