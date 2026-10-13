@@ -107,7 +107,7 @@ Set-Location bridge
         transport: stdio
         command: '<venv>\Scripts\python.exe'
         args:
-          - '<这条路径>\mcp_stdio_wrapper.py'
+          - '<REPO>\scripts\mcp_stdio_wrapper.py'
           - "--host"
           - "localhost"
           - "--port"
@@ -175,6 +175,9 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 | 合成 | `craft` `craft_advanced` `auto_craft` |
 | 建造 | `build_schematic` `inspect_build_site` `preview_build_plan` |
 | 兜底 | `run_command` `batch_command` `cancel_command` `help_command` |
+
+> 仓库另带 **`scripts/mc.py`**：绕过 MCP 直接给 bridge 发命令的调试工具。
+> 出问题先用它分清「是工具层坏了还是游戏层坏了」，用法见 [`DSH-READHERE.md`](DSH-READHERE.md) §6。
 
 ---
 

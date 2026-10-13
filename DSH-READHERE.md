@@ -124,59 +124,18 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 > ⚠️ **这是「工具突然全哑」的头号原因**：两个客户端同时抢 5555，后启动的那个会**静默失败**
 > （bridge 起不来，端口没有监听，但游戏本身正常）。
 
-### 3.5 创建 MCP 包装器
+### 3.5 确认 MCP 包装器
 
-**为什么要它**：本仓库的 `mcp_server.py` 里 `BridgeConfig` 默认 `transport_type="websocket"`，
-且 CLI 没有覆盖该字段的参数 —— 按官方入口启动会去连 `ws://…:5555`，而 bridge 那个端口是**裸 TCP**，必然连不上。
+**为什么要它**：`mcp_server.py` 里 `BridgeConfig` 默认 `transport_type="websocket"`，
+而 CLI 没有覆盖该字段的参数 —— 按官方入口启动会去连 `ws://…:5555`，但那个端口是**裸 TCP**，
+必然连不上。包装器只做一件事：把它改成 `"tcp"`。
 
-把下面内容保存为 `<REPO>\mcp_stdio_wrapper.py`：
+本仓库自带 `scripts/mcp_stdio_wrapper.py`，**不用手抄**。
 
-```python
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""mcbaratone MCP server 启动包装器：把 transport_type 强制为 TCP。
-
-上游 mcp_server.py 的 BridgeConfig 默认 transport_type="websocket"，
-而 bridge 的端口是裸 TCP（WebSocket 事件服务是另一个端口），
-所以按官方方式启动会连错协议。这里显式改成 "tcp"。
-"""
-import argparse
-import logging
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-
-from baritone_client.mcp.mcp_server import BridgeConfig, create_mcp_server  # noqa: E402
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="mcbaratone MCP server (TCP transport)")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--log-level", default="INFO")
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    config = BridgeConfig(host=args.host, port=args.port, timeout=args.timeout)
-    config.transport_type = "tcp"          # ★ 关键修复
-    create_mcp_server(config).run(transport="stdio")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-**验收**：文件存在，且用 `<VENV>` 的 python 执行不报 ImportError：
+**验收**（期望打印出参数列表：`--host` / `--port` / `--mcp-transport` …）：
 
 ```powershell
-<VENV>\Scripts\python.exe <REPO>\mcp_stdio_wrapper.py --help
+<VENV>\Scripts\python.exe <REPO>\scripts\mcp_stdio_wrapper.py --help
 ```
 
 ### 3.6 写进 DSH 的配置
@@ -192,7 +151,7 @@ if __name__ == "__main__":
         transport: stdio
         command: '<VENV>\Scripts\python.exe'
         args:
-          - '<REPO>\mcp_stdio_wrapper.py'
+          - '<REPO>\scripts\mcp_stdio_wrapper.py'
           - "--host"
           - "localhost"
           - "--port"
@@ -281,6 +240,21 @@ if __name__ == "__main__":
 | **`interact_block` 报 `Target is not visible`** | 薄方块（门/按钮）瞄准擦空 | 换个方向靠近目标再试（本仓库已大幅缓解，但极端角度仍可能失手）|
 | **Gradle 下载卡住** | 网络 | 配代理，或临时换镜像（**改完改回来**）|
 | **`git push` 报 `Empty reply from server`** | HTTP/2 与代理不兼容 | `git config http.version HTTP/1.1` + `http.postBuffer 524288000` |
+
+### 先分清「工具层」还是「游戏层」
+
+排查上面任何一条之前，先用 `scripts/mc.py` **绕过 MCP 直连 bridge** 跑同一个命令：
+
+```powershell
+<VENV>\Scripts\python.exe <REPO>\scripts\mc.py 5556 get_state
+<VENV>\Scripts\python.exe <REPO>\scripts\mc.py 5556 get_entities radius=64
+<VENV>\Scripts\python.exe <REPO>\scripts\mc.py 5556 --list        # 列出全部 bridge 命令
+```
+
+- **mc.py 也失败** → 问题在 **bridge / 游戏侧**（端口、mod、角色状态），与 MCP 工具无关
+- **mc.py 成功、工具失败** → 问题在 **MCP 工具层**（参数映射、超时配置）
+
+这条捷径能省掉大量来回猜测。
 
 ---
 
