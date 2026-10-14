@@ -13,11 +13,18 @@ Usage
     python scripts/mc.py 5555 get_state
     python scripts/mc.py 5555 get_entities radius=64
     python scripts/mc.py 5555 select_slot '{"slot":0}'
+    python scripts/mc.py 5555 get_inventory --full
     python scripts/mc.py 5555 --list
 
 ``params`` are either a single JSON object or ``key=value`` tokens (values are
 coerced to int/bool where they look like one). The ``key=value`` form exists
 because PowerShell strips the double quotes out of inline JSON.
+
+Output is truncated to ``OUTPUT_LIMIT`` characters unless ``--full`` is given.
+The short default keeps interactive use readable, but the truncated text is
+**not valid JSON** -- reading a partial inventory that way makes "absent from
+the list" look like "absent from the game". Pass ``--full`` before concluding
+anything from the payload.
 
 Shorthands fill in the parameters you would otherwise have to remember::
 
@@ -32,6 +39,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from baritone_client.transport.transport import TcpTransport
+
+# Longest payload printed without --full. Kept short so interactive use stays
+# readable; see the module docstring for why parsing that text is a trap.
+OUTPUT_LIMIT = 1500
 
 # Shorthand -> (real command, params builder)
 ALIASES = {
@@ -77,22 +88,27 @@ def usage():
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help", "--list"):
+    """Parse argv, dispatch one bridge command, print the result."""
+    argv = [arg for arg in sys.argv[1:] if arg != "--full"]
+    full = len(argv) != len(sys.argv) - 1
+
+    if len(argv) < 2 or argv[0] in ("-h", "--help", "--list"):
         usage()
         return 0
 
-    port = int(sys.argv[1])
-    raw = sys.argv[2]
+    port = int(argv[0])
+    raw = argv[1]
+    rest = argv[2:]
 
     if raw in ALIASES:
-        cmd, params = ALIASES[raw](sys.argv[3:])
+        cmd, params = ALIASES[raw](rest)
     else:
         cmd = raw
-        if len(sys.argv) > 3 and sys.argv[3].strip().startswith("{"):
-            params = json.loads(sys.argv[3])
-        elif len(sys.argv) > 3:
+        if rest and rest[0].strip().startswith("{"):
+            params = json.loads(rest[0])
+        elif rest:
             params = {}
-            for token in sys.argv[3:]:
+            for token in rest:
                 if "=" not in token:
                     print(f"[warn] dropping unparseable argument: {token}")
                     continue
@@ -105,7 +121,15 @@ def main():
     print(f">>> {cmd} {json.dumps(params, ensure_ascii=False)}")
     try:
         result = transport.dispatch(cmd, params)
-        print(json.dumps(result, ensure_ascii=False, indent=2)[:1500])
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        if not full and len(text) > OUTPUT_LIMIT:
+            print(text[:OUTPUT_LIMIT])
+            print(
+                f"... [truncated at {OUTPUT_LIMIT} chars;"
+                " re-run with --full for the whole payload]"
+            )
+        else:
+            print(text)
         return 0
     except Exception as exc:  # noqa: BLE001 - CLI boundary, report and exit non-zero
         print(f"[FAIL] {type(exc).__name__}: {str(exc)[:400]}")

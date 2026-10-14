@@ -10,6 +10,7 @@ import java.net.Socket;
 import java.util.concurrent.CompletableFuture;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
@@ -20,6 +21,7 @@ import net.minecraft.world.entity.animal.cow.Cow;
 import net.minecraft.world.entity.animal.cow.MushroomCow;
 import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.npc.villager.AbstractVillager;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.EntityHitResult;
 
@@ -32,6 +34,15 @@ import net.minecraft.world.phys.EntityHitResult;
 public class EntityInteractionCommandHandler extends AsyncCommandHandler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EntityInteractionCommandHandler.class);
+
+    /**
+     * How long to wait before re-reading the held stack after an interaction.
+     * The integrated server applies the result and syncs it back within a tick
+     * or two, so this is comfortably past the round-trip while staying
+     * imperceptible to a caller that only talks to the bridge every few
+     * seconds.
+     */
+    private static final long SETTLE_DELAY_MS = 1200L;
 
     public enum InteractionType {
         ATTACK,
@@ -140,6 +151,16 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
                 return CommandResult.error(inventoryError);
             }
 
+            // Having the item somewhere in the inventory is not the same as holding
+            // it. The requirement check above only looks at the inventory, so "milk"
+            // reported success while the hand held nothing: the server had no bucket
+            // to fill and the interaction silently did nothing. Put the item in hand
+            // ourselves instead of trusting the caller to have preselected a slot.
+            String heldError = ensureRequiredItemInHand(client, validation.detectedType);
+            if (heldError != null) {
+                return CommandResult.error(heldError);
+            }
+
             // Perform the interaction
             boolean success = performInteraction(client, target, validation.detectedType);
 
@@ -162,57 +183,126 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
      */
     private CompletableFuture<CommandResult> handleDirectEntityInteraction(
             JsonObject params, Minecraft client, String action) {
-        return executeOnMainThread(client, () -> {
-            if (client.player == null || client.level == null
-                    || client.gameMode == null) {
-                return CommandResult.error("Player, world, or interaction manager not available");
+        CompletableFuture<CommandResult> future = new CompletableFuture<>();
+        client.execute(() -> {
+            try {
+                interactWithEntityDirectly(params, client, action, future);
+            } catch (Exception e) {
+                LOGGER.error("Direct entity interaction failed", e);
+                future.complete(CommandResult.error("Interaction failed: " + e.getMessage()));
             }
-            if (!params.has("entity_id")) {
-                return CommandResult.error("Missing required parameter: entity_id");
-            }
-
-            int entityId = params.get("entity_id").getAsInt();
-            Entity target = client.level.getEntity(entityId);
-            if (target == null) {
-                return CommandResult.error("Target entity not found: " + entityId);
-            }
-            if ("feed".equals(action) && !(target instanceof Animal)) {
-                return CommandResult.error("Feed target is not an animal: " + entityId);
-            }
-
-            double maxDistance = params.has("max_distance")
-                ? params.get("max_distance").getAsDouble() : 6.0;
-            double distance = distanceToPlayer(client, target);
-            if (distance > maxDistance) {
-                return CommandResult.error(
-                    "Entity too far: " + String.format("%.2f", distance)
-                        + " blocks (max " + String.format("%.2f", maxDistance) + ")");
-            }
-
-            String heldItem = BuiltInRegistries.ITEM.getKey(
-                client.player.getMainHandItem().getItem()).toString();
-            int heldCountBefore = client.player.getMainHandItem().getCount();
-            InteractionResult interactionResult = interactWithEntity(
-                client, target, InteractionHand.MAIN_HAND);
-            if (interactionResult.consumesAction()) {
-                client.player.swing(InteractionHand.MAIN_HAND);
-            }
-
-            JsonObject data = new JsonObject();
-            data.addProperty("success", interactionResult.consumesAction());
-            data.addProperty("accepted", interactionResult.consumesAction());
-            data.addProperty("result", interactionResult.toString());
-            data.addProperty("action", action);
-            data.addProperty("entity_id", target.getId());
-            data.addProperty("entity_type",
-                BuiltInRegistries.ENTITY_TYPE.getKey(target.getType()).toString());
-            data.addProperty("distance", distance);
-            data.addProperty("hand", "main_hand");
-            data.addProperty("held_item", heldItem);
-            data.addProperty("held_count_before", heldCountBefore);
-            data.addProperty("held_count_after", client.player.getMainHandItem().getCount());
-            return CommandResult.success(data);
         });
+        return future;
+    }
+
+    private void interactWithEntityDirectly(
+            JsonObject params, Minecraft client, String action, CompletableFuture<CommandResult> future) {
+        if (client.player == null || client.level == null
+                || client.gameMode == null) {
+            future.complete(CommandResult.error("Player, world, or interaction manager not available"));
+            return;
+        }
+        if (!params.has("entity_id")) {
+            future.complete(CommandResult.error("Missing required parameter: entity_id"));
+            return;
+        }
+
+        int entityId = params.get("entity_id").getAsInt();
+        Entity target = client.level.getEntity(entityId);
+        if (target == null) {
+            future.complete(CommandResult.error("Target entity not found: " + entityId));
+            return;
+        }
+        if ("feed".equals(action) && !(target instanceof Animal)) {
+            future.complete(CommandResult.error("Feed target is not an animal: " + entityId));
+            return;
+        }
+
+        double maxDistance = params.has("max_distance")
+            ? params.get("max_distance").getAsDouble() : 6.0;
+        double distance = distanceToPlayer(client, target);
+        if (distance > maxDistance) {
+            future.complete(CommandResult.error(
+                "Entity too far: " + String.format("%.2f", distance)
+                    + " blocks (max " + String.format("%.2f", maxDistance) + ")"));
+            return;
+        }
+
+        if ("feed".equals(action)) {
+            // Use whatever the animal actually eats instead of demanding the
+            // caller hand us the right item: the old check rejected the feed
+            // with "Held item is not food for this animal: minecraft:copper_sword"
+            // even while the wheat was sitting in slot 7, unused.
+            String foodError = ensureFoodInHand(client, (Animal) target);
+            if (foodError != null) {
+                future.complete(CommandResult.error(foodError));
+                return;
+            }
+        }
+
+        String heldItem = itemIdOf(client.player.getMainHandItem());
+        int heldCountBefore = client.player.getMainHandItem().getCount();
+        InteractionResult interactionResult = interactWithEntity(
+            client, target, InteractionHand.MAIN_HAND);
+        if (interactionResult.consumesAction()) {
+            client.player.swing(InteractionHand.MAIN_HAND);
+        }
+
+        JsonObject data = new JsonObject();
+        data.addProperty("success", interactionResult.consumesAction());
+        data.addProperty("accepted", interactionResult.consumesAction());
+        data.addProperty("result", interactionResult.toString());
+        data.addProperty("action", action);
+        data.addProperty("entity_id", target.getId());
+        data.addProperty("entity_type",
+            BuiltInRegistries.ENTITY_TYPE.getKey(target.getType()).toString());
+        data.addProperty("distance", distance);
+        data.addProperty("hand", "main_hand");
+        data.addProperty("held_item", heldItem);
+        data.addProperty("held_count_before", heldCountBefore);
+        settleHandAndComplete(client, data, heldItem, future);
+    }
+
+    /**
+     * Re-read the hand after the server round-trip, then complete the future.
+     *
+     * Reading it immediately after gameMode.interact() is worthless: the
+     * interaction is applied by the integrated server and only then synced
+     * back, so the instant read always returns the pre-interaction stack. That
+     * made held_count_after silently lie -- a feed that really consumed one
+     * wheat reported "held_count_before=64, held_count_after=64" -- and it cost
+     * a debugging session chasing a phantom success that never existed. Wait
+     * the round-trip out and report the settled value instead.
+     */
+    private void settleHandAndComplete(Minecraft client, JsonObject data, String heldItemBefore,
+            CompletableFuture<CommandResult> future) {
+        Thread settle = new Thread(() -> {
+            try {
+                Thread.sleep(SETTLE_DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            client.execute(() -> {
+                try {
+                    ItemStack after = client.player.getMainHandItem();
+                    String afterId = itemIdOf(after);
+                    int before = data.get("held_count_before").getAsInt();
+                    data.addProperty("held_item_after", afterId);
+                    data.addProperty("held_count_after", after.getCount());
+                    data.addProperty("held_count_delta",
+                        afterId.equals(heldItemBefore) ? after.getCount() - before : 0);
+                    data.addProperty("settled", true);
+                } catch (Exception e) {
+                    data.addProperty("held_count_after", -1);
+                    data.addProperty("settled", false);
+                    data.addProperty("settle_error", String.valueOf(e.getMessage()));
+                }
+                data.addProperty("settle_delay_ms", SETTLE_DELAY_MS);
+                future.complete(CommandResult.success(data));
+            });
+        }, "mcbaratone-hand-settle");
+        settle.setDaemon(true);
+        settle.start();
     }
 
     private CompletableFuture<CommandResult> handleLookAtEntity(JsonObject params, Minecraft client) {
@@ -439,9 +529,12 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
 
                 case SHEAR:
                 case MILK:
-                    // Use item on entity
-                    interactWithEntity(client, target, InteractionHand.MAIN_HAND);
-                    return true;
+                    // Report what the game actually said instead of an unconditional
+                    // true. ensureRequiredItemInHand() has already put the right item
+                    // in hand, so a false here means the interaction was really
+                    // rejected rather than merely unverifiable.
+                    return interactWithEntity(
+                        client, target, InteractionHand.MAIN_HAND).consumesAction();
 
                 case LOOK_AT:
                     lookAtEntity(client, target);
@@ -500,5 +593,90 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
     private double distanceToPlayer(Minecraft client, Entity target) {
         return new Vec3(client.player.getX(), client.player.getY(), client.player.getZ())
             .distanceTo(new Vec3(target.getX(), target.getY(), target.getZ()));
+    }
+
+    private static String itemIdOf(ItemStack stack) {
+        return BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    /**
+     * Select a hotbar slot the same way select_slot does, so the server sees
+     * the change too.
+     */
+    private void selectHotbarSlot(Minecraft client, int slot) {
+        client.player.getInventory().selected = slot;
+        if (client.player.connection != null) {
+            client.player.connection.send(new ServerboundSetCarriedItemPacket(slot));
+        }
+    }
+
+    /**
+     * Make sure the given item is held, selecting a hotbar slot that has it.
+     * Returns null once the item is in hand, or an error message.
+     *
+     * Only slots 0-8 can be held; moving an item out of the main inventory
+     * would need a container-click round-trip, so that case is reported rather
+     * than silently failing.
+     */
+    private String ensureItemInHand(Minecraft client, String itemId, String label) {
+        if (client.player == null) {
+            return "Player not available";
+        }
+        if (itemIdOf(client.player.getMainHandItem()).equals(itemId)) {
+            return null;
+        }
+        var inventory = client.player.getInventory();
+        for (int slot = 0; slot < 9; slot++) {
+            if (itemIdOf(inventory.getItem(slot)).equals(itemId)) {
+                selectHotbarSlot(client, slot);
+                return null;
+            }
+        }
+        for (int slot = 9; slot < inventory.getContainerSize(); slot++) {
+            if (itemIdOf(inventory.getItem(slot)).equals(itemId)) {
+                return label + " is in the inventory but not in the hotbar (slots 0-8);"
+                    + " move it to the hotbar first";
+            }
+        }
+        return label + " required in inventory";
+    }
+
+    /**
+     * Hold food this animal accepts, picking the first matching hotbar slot.
+     * Returns null when something edible is held, or an error message.
+     */
+    private String ensureFoodInHand(Minecraft client, Animal animal) {
+        if (client.player == null) {
+            return "Player not available";
+        }
+        if (animal.isFood(client.player.getMainHandItem())) {
+            return null;
+        }
+        var inventory = client.player.getInventory();
+        for (int slot = 0; slot < 9; slot++) {
+            if (animal.isFood(inventory.getItem(slot))) {
+                selectHotbarSlot(client, slot);
+                return null;
+            }
+        }
+        for (int slot = 9; slot < inventory.getContainerSize(); slot++) {
+            if (animal.isFood(inventory.getItem(slot))) {
+                return "Food for this animal is in the inventory but not in the hotbar"
+                    + " (slots 0-8); move it to the hotbar first";
+            }
+        }
+        return "No food for this animal in the inventory (held "
+            + itemIdOf(client.player.getMainHandItem()) + ")";
+    }
+
+    private String ensureRequiredItemInHand(Minecraft client, InteractionType type) {
+        switch (type) {
+            case MILK:
+                return ensureItemInHand(client, "minecraft:bucket", "Empty bucket");
+            case SHEAR:
+                return ensureItemInHand(client, "minecraft:shears", "Shears");
+            default:
+                return null;
+        }
     }
 }
