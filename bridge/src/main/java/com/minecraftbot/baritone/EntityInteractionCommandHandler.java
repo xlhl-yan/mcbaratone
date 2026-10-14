@@ -19,7 +19,7 @@ import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.animal.cow.Cow;
 import net.minecraft.world.entity.animal.cow.MushroomCow;
 import net.minecraft.world.entity.animal.sheep.Sheep;
-import net.minecraft.world.entity.npc.villager.Villager;
+import net.minecraft.world.entity.npc.villager.AbstractVillager;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.EntityHitResult;
 
@@ -81,6 +81,12 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
             case "tame":
             case "shear":
             case "milk":
+            // ATTACK / TRADE were declared in InteractionType and handled by
+            // validateInteraction()/performInteraction(), but never routed here, so
+            // they died with "Unknown interaction action". Route them through the
+            // validated path (which also accepts entity_type and does the type checks).
+            case "attack":
+            case "trade":
                 return handleEntityInteraction(params, client, action);
             case "look_at":
                 return handleLookAtEntity(params, client);
@@ -102,7 +108,9 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
                 return CommandResult.error("Missing required parameter: entity_id or entity_type");
             }
 
-            double maxDistance = params.has("max_distance") ? params.get("max_distance").getAsDouble() : 5.0;
+            // 6.0 keeps the historic reach for the entity_id path (which does not use
+            // maxDistance for lookup) now that validateInteraction() honours it.
+            double maxDistance = params.has("max_distance") ? params.get("max_distance").getAsDouble() : 6.0;
             Entity target;
             String targetDescription;
             if (params.has("entity_id")) {
@@ -121,7 +129,7 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
             }
 
             // Validate interaction
-            InteractionValidation validation = validateInteraction(client, target, action);
+            InteractionValidation validation = validateInteraction(client, target, action, maxDistance);
             if (!validation.valid) {
                 return CommandResult.error(validation.error);
             }
@@ -252,12 +260,17 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
 
             JsonArray interactions = new JsonArray();
             for (Entity entity : client.level.entitiesForRendering()) {
+                // entitiesForRendering() includes the local player; reporting "you can
+                // attack yourself" as the nearest interaction is pure noise.
+                if (entity == client.player) {
+                    continue;
+                }
                 double distance = new Vec3(client.player.getX(), client.player.getY(), client.player.getZ())
                         .distanceTo(new Vec3(entity.getX(), entity.getY(), entity.getZ()));
                 if (distance <= maxDistance) {
                     for (InteractionType type : InteractionType.values()) {
                         InteractionValidation validation = validateInteraction(client, entity,
-                                type.name().toLowerCase());
+                                type.name().toLowerCase(), maxDistance);
                         if (validation.valid) {
                             JsonObject interaction = new JsonObject();
                             interaction.addProperty("entity_id", entity.getId());
@@ -304,6 +317,11 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
                 }
                 return "Empty bucket required in inventory to milk cows";
             case "tame":
+            // attack / trade need no item either; without these the helper fell into
+            // default and rejected the interaction with "Unknown action for inventory
+            // check" even though nothing was actually required.
+            case "attack":
+            case "trade":
                 // No special items required for taming
                 return null;
             default:
@@ -311,14 +329,19 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
         }
     }
 
-    private InteractionValidation validateInteraction(Minecraft client, Entity target, String action) {
+    private InteractionValidation validateInteraction(
+            Minecraft client, Entity target, String action, double maxDistance) {
         Vec3 playerPos = new Vec3(client.player.getX(), client.player.getY(), client.player.getZ());
         Vec3 targetPos = new Vec3(target.getX(), target.getY(), target.getZ());
         double distance = playerPos.distanceTo(targetPos);
 
-        // Distance check (Minecraft interaction range)
-        if (distance > 6.0) {
-            return InteractionValidation.error("Entity too far: " + String.format("%.2f", distance) + " blocks");
+        // Distance check. This used to be a hard-coded 6.0, which silently
+        // overrode the caller's max_distance: detect with max_distance=64 still
+        // only ever saw entities within 6 blocks, and reported the player's own
+        // entity as the only reachable interaction. Callers own the limit now.
+        if (distance > maxDistance) {
+            return InteractionValidation.error("Entity too far: " + String.format("%.2f", distance)
+                    + " blocks (max " + String.format("%.2f", maxDistance) + ")");
         }
 
         // Action-specific validation
@@ -365,6 +388,19 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
                     }
                     return InteractionValidation.success(distance, InteractionType.MILK);
 
+                case TRADE:
+                    // AbstractVillager is the shared parent of Villager and
+                    // WanderingTrader -- they are siblings, not parent/child, so the
+                    // original `instanceof Villager` check silently excluded wandering
+                    // traders. Verified against the 26.2 merged jar:
+                    //   ...npc.villager.Villager             extends ...npc.villager.AbstractVillager
+                    //   ...npc.wanderingtrader.WanderingTrader extends ...npc.villager.AbstractVillager
+                    if (!(target instanceof AbstractVillager)) {
+                        return InteractionValidation.error("Entity cannot be traded with: "
+                                + BuiltInRegistries.ENTITY_TYPE.getKey(target.getType()).toString());
+                    }
+                    return InteractionValidation.success(distance, InteractionType.TRADE);
+
                 case LOOK_AT:
                     return InteractionValidation.success(distance, InteractionType.LOOK_AT);
 
@@ -394,11 +430,12 @@ public class EntityInteractionCommandHandler extends AsyncCommandHandler {
                     break;
 
                 case TRADE:
-                    if (target instanceof Villager) {
-                        interactWithEntity(client, target, InteractionHand.MAIN_HAND);
-                        return true;
-                    }
-                    break;
+                    // No instanceof Villager guard: WanderingTrader is not a Villager
+                    // subclass, so that check made trading with a wandering trader
+                    // impossible. validateInteraction() already restricted this to
+                    // villagers / wandering traders.
+                    interactWithEntity(client, target, InteractionHand.MAIN_HAND);
+                    return true;
 
                 case SHEAR:
                 case MILK:

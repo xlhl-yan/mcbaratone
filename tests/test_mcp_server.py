@@ -236,6 +236,48 @@ def test_screenshot_sends_filename_only_when_given_and_skips_metadata(
     assert calls[-1] == ("screenshot", {"include_metadata": True, "filename": "base"})
 
 
+def test_entity_interact_builds_structured_params(mock_request_context, mock_client):
+    """entity_interact 只转发 bridge 真认的参数，并在客户端拦下必然失败的组合。
+
+    bridge 侧 interact/feed 走 handleDirectEntityInteraction（硬性要求 entity_id），
+    其余动作走 handleEntityInteraction（id 或 type 都行）。提前拦下来比让 bridge 回
+    一句 "Missing required parameter: entity_id" 好读；action 大小写也不该影响结果。
+    """
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["entity_interact"].fn
+
+    calls = []
+
+    def fake_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        return {"success": True}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    tool(mock_request_context, action="detect")
+    assert calls[-1] == ("entity_interact", {"action": "detect"})
+
+    tool(mock_request_context, action="ATTACK", entity_id=2749, max_distance=10)
+    assert calls[-1] == (
+        "entity_interact",
+        {"action": "attack", "entity_id": 2749, "max_distance": 10.0},
+    )
+
+    tool(mock_request_context, action="look_at", entity_type=" minecraft:cow ")
+    assert calls[-1] == (
+        "entity_interact",
+        {"action": "look_at", "entity_type": "minecraft:cow"},
+    )
+
+    with pytest.raises(ValueError):
+        tool(mock_request_context, action="feed", entity_type="cow")
+    with pytest.raises(ValueError):
+        tool(mock_request_context, action="look_at")
+    with pytest.raises(ValueError):
+        tool(mock_request_context, action="teleport", entity_id=1)
+
+
 def test_preview_build_plan_tool_is_pure_and_serializable() -> None:
     server = create_mcp_server(BridgeConfig())
     preview_tool = server._tool_manager._tools["preview_build_plan"]

@@ -668,17 +668,16 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     ) -> Dict[str, Any]:
         """Right-click a block (open doors, press buttons, use chests).
 
-        ⚠ 两个必须知道的限制：
+        ⚠ 一个必须知道的限制：
 
-        1. bridge 的 handler **无视玩家朝向**，它自己从眼睛位置向**方块中心**做几何
-           射线，并要求命中的方块正好是目标，否则报
-           "Target is not visible on a real block ray"。所以这里先转头瞄准只是让
-           动作看起来合理，真正决定成败的是站位的几何关系。
-        2. **薄方块（门/按钮/拉杆/火把）极容易打不中**：它们的形状只占方块一角，
-           瞄准中心的射线会从旁边擦过去。实测门(关门, facing=west, 门板在 x∈[5.0,5.19])
-           **站在东侧打不中、站在西侧(门板那一侧)才能打中**。整块方块（箱子/熔炉/
-           工作台）没这个问题。
-           → 遇到这个报错时的正确做法是**换个方向靠近目标**，而不是反复重试。
+        bridge 的 handler **无视玩家朝向** —— 是它自己在目标方块周围采样一批候选点
+        （中心 + 六个面心 + 5×5×5 网格，共 132 个），逐个做几何射线，取第一个真正打在
+        这个方块上的点，然后按那个点替玩家转头。所以这里先 `look_at` 只是让动作看起来
+        合理，真正决定成败的是**站位**（别站太远，也别把自己卡进方块里）。
+
+        薄方块（门/按钮/拉杆）以前几乎必失败（旧实现死瞄方块中心，薄板只占方块一角，
+        射线从旁边擦过去），改成采样点之后实测门和按钮都能正常开关；万一仍报
+        "Target is not visible on a real block ray"，**换个方向靠近**比反复重试有效。
         """
         def _run(client):
             client.transport.dispatch(
@@ -690,6 +689,75 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             )
 
         return _call_bridge(ctx, "command/interact_block", _run)
+
+    @mcp.tool()
+    def entity_interact(
+        ctx: RequestContext,
+        action: str = "look_at",
+        entity_id: int = -1,
+        entity_type: str = "",
+        max_distance: float = 0.0,
+    ) -> Dict[str, Any]:
+        """与**实体**交互：村民交易 / 驯服 / 剪羊毛 / 挤奶 / 喂食 / 单次攻击 / 看过去。
+
+        实体 id 从 `get_entities` 拿（每条第一个字段就是 `id`），也可以直接给
+        `entity_type`（"cow" 和 "minecraft:cow" 都认）。**拿不准就先调
+        `action="detect"`** —— 它列出附近每一个 (entity_id, 类型, 动作, 距离)，
+        省得猜。自己的 id 在 `snapshot` 的 `entity_id` 里。
+
+        各 action 的硬性要求（bridge 侧分了两条代码路径，不满足会直接报错）：
+
+        - `detect` / `look_at` —— 都不用给；`look_at` 是默认动作，按类型找时搜索半径 16 格。
+        - `interact` / `feed` —— **必须给 `entity_id`**，这两条路不认 `entity_type`。
+        - `tame` / `shear` / `milk` / `attack` / `trade` —— id 或 type 都行。
+          `tame` 只能驯 wolf/cat/parrot（且不能已驯服）、`shear` 只能剪羊且背包里要有剪刀、
+          `milk` 只能挤牛/蘑菇牛且背包里要有空桶、`trade` 是右键村民**打开交易界面**
+          （之后用 `get_screen` 读报价、`select_trade` 选交易）。
+        - `attack` 只砍**一下**；要连续砍请用 `attack_nearest`。
+
+        一个坑：`detect` 会把**你自己**也列出来（bridge 遍历的是
+        `entitiesForRendering()`，含本地玩家，距离 0.0）—— 那是噪音，交互前按自己的 id 滤掉。
+        """
+        act = (action or "").strip().lower()
+        known = {
+            "detect",
+            "look_at",
+            "interact",
+            "feed",
+            "tame",
+            "shear",
+            "milk",
+            "attack",
+            "trade",
+        }
+        if act not in known:
+            raise ValueError(
+                f"unknown action: {action!r}; expected one of " + ", ".join(sorted(known))
+            )
+
+        has_id = int(entity_id) >= 0
+        etype = (entity_type or "").strip()
+        if act in ("interact", "feed") and not has_id:
+            raise ValueError(
+                f"action={act} requires entity_id (that bridge path ignores entity_type)"
+            )
+        if act != "detect" and not has_id and not etype:
+            raise ValueError(
+                "give entity_id or entity_type (or call action=detect to see what's nearby)"
+            )
+
+        params: Dict[str, Any] = {"action": act}
+        if has_id:
+            params["entity_id"] = int(entity_id)
+        if etype:
+            params["entity_type"] = etype
+        if float(max_distance) > 0:
+            params["max_distance"] = float(max_distance)
+        return _call_bridge(
+            ctx,
+            "command/entity_interact",
+            lambda client: client.transport.dispatch("entity_interact", params),
+        )
 
     @mcp.tool()
     def look_at(ctx: RequestContext, x: float, y: float, z: float) -> Dict[str, Any]:
