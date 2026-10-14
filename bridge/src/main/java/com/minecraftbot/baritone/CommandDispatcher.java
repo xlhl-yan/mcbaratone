@@ -261,7 +261,18 @@ public class CommandDispatcher {
 
             if (result == null) {
                 // Try command handler factory
-                CommandHandler handler = CommandHandlerFactory.getHandler(command);
+                CommandHandler handler;
+                try {
+                    handler = CommandHandlerFactory.getHandler(command);
+                } catch (IllegalStateException e) {
+                    // Registered but not constructible: an internal defect,
+                    // not an unknown command. Surface it, otherwise the legacy
+                    // path below answers "Unknown command or no handler found"
+                    // and hides the real cause.
+                    logger.error("Handler instantiation failed for: {}", command, e);
+                    handler = null;
+                    result = CommandResult.error(e.getMessage());
+                }
                 if (handler != null) {
                     logger.debug("Found handler for command: {}", command);
 
@@ -279,7 +290,7 @@ public class CommandDispatcher {
                         logger.warn("Command validation exception for {}: {}", command, e.getMessage());
                         result = e.toCommandResult();
                     }
-                } else {
+                } else if (result == null) {
                     // Fallback to legacy processing
                     logger.debug("No handler found, falling back to legacy processing for: {}", command);
                     if (legacyHandler != null) {
@@ -424,13 +435,20 @@ public class CommandDispatcher {
 
             if (result == null) {
                 // Try command handler factory
-                CommandHandler handler = CommandHandlerFactory.getHandler(command);
+                CommandHandler handler;
+                try {
+                    handler = CommandHandlerFactory.getHandler(command);
+                } catch (IllegalStateException e) {
+                    logger.error("Handler instantiation failed for: {}", command, e);
+                    handler = null;
+                    result = CommandResult.error(e.getMessage());
+                }
                 if (handler != null) {
                     logger.debug("Found handler for command: {}", command);
 
                     // Execute with timeout monitoring and retry logic
                     result = executeWithTimeoutAndRetry(handler, params, client, baritone, clientSocket, startTime, command);
-                } else {
+                } else if (result == null) {
                     // Fallback to legacy processing
                     logger.debug("No handler found, falling back to legacy processing for: {}", command);
                     if (legacyHandler != null) {

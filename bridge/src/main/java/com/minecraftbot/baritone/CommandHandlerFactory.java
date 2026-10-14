@@ -173,8 +173,15 @@ public class CommandHandlerFactory {
                 logger.debug("Created command handler instance: {} -> {}", commandName, handler.getClass().getSimpleName());
                 return handler;
             } catch (Exception e) {
-                logger.error("Failed to create command handler instance for: " + commandName, e);
-                return null;
+                // Do NOT return null here. Callers read null as "no handler
+                // registered" and fall through to the legacy path, which
+                // answers "Unknown command or no handler found" -- so a
+                // registered handler that merely failed to construct is
+                // indistinguishable from a command that does not exist.
+                // Throw instead: this is an internal defect, not a missing
+                // command, and the caller turns it into a structured error.
+                throw new IllegalStateException(
+                    "Command handler '" + commandName + "' failed to instantiate", e);
             }
         }
 

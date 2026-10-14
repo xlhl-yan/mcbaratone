@@ -25,7 +25,7 @@ import net.minecraft.world.phys.HitResult;
 public class UseItemCommandHandler extends AsyncCommandHandler {
 
     private static final int ACTION_SCHEDULE_TIMEOUT_SECONDS = 2;
-    
+
     private static final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
         Thread thread = new Thread(runnable, "bridge-use-item-release");
         thread.setDaemon(true);
@@ -42,7 +42,7 @@ public class UseItemCommandHandler extends AsyncCommandHandler {
         }
         final InteractionHand requestedHand;
         try {
-            requestedHand = requestedHand(params);
+            requestedHand = resolveHand(params);
         } catch (IllegalArgumentException exception) {
             return CompletableFuture.completedFuture(
                 CommandResult.error(exception.getMessage()));
@@ -52,7 +52,7 @@ public class UseItemCommandHandler extends AsyncCommandHandler {
             if (client.player == null) {
                 return CommandResult.error("Player not available");
             }
-            if (requestedHand != null && client.gameMode == null) {
+            if (client.gameMode == null) {
                 return CommandResult.error("Game mode not available");
             }
 
@@ -60,39 +60,30 @@ public class UseItemCommandHandler extends AsyncCommandHandler {
             JsonObject data = new JsonObject();
             data.add("hit", hit);
             data.addProperty("hit_type", hit.get("type").getAsString());
-            ItemStack heldItem = requestedHand == null
-                ? client.player.getMainHandItem()
-                : client.player.getItemInHand(requestedHand);
+            ItemStack heldItem = client.player.getItemInHand(requestedHand);
             data.addProperty("held_item", BuiltInRegistries.ITEM.getKey(
                 heldItem.getItem()).toString());
 
-            if (requestedHand != null) {
-                InteractionResult interaction = client.gameMode.useItem(
-                    client.player, requestedHand);
-                if (!interaction.consumesAction()) {
-                    return CommandResult.error(
-                        "Item use was rejected for " + requestedHand.name());
-                }
-                data.addProperty("hand", requestedHand.name());
-                data.addProperty("interaction_result", interaction.toString());
-                addUseState(client.player, data);
+            InteractionResult interaction = client.gameMode.useItem(
+                client.player, requestedHand);
+            if (!interaction.consumesAction()) {
+                return CommandResult.error(
+                    "Item use was rejected for " + requestedHand.name() + ": held "
+                        + BuiltInRegistries.ITEM.getKey(heldItem.getItem()));
             }
+            data.addProperty("hand", requestedHand.name());
+            data.addProperty("interaction_result", interaction.toString());
+            data.addProperty("used", true);
+            addUseState(client.player, data);
 
             if (durationMs > 0) {
+                // Long-press items (food, bows) keep going on their own once
+                // the use has started, so this only has to hold the key state
+                // and release it later.
                 client.options.keyUse.setDown(true);
                 scheduleRelease(client, durationMs);
                 data.addProperty("holding", true);
                 data.addProperty("duration_ms", durationMs);
-            } else {
-                // The explicit-hand call above already performed an instant
-                // use. Only the legacy automatic-hand route needs a key tap.
-                if (requiresKeyPulse(requestedHand, durationMs)) {
-                    client.options.keyUse.setDown(true);
-                    scheduleRelease(client, 50);
-                }
-                data.addProperty("used", true);
-                data.addProperty("action_status", "accepted");
-                data.addProperty("postcondition_verified", false);
             }
             return CommandResult.success(data);
         }).completeOnTimeout(
@@ -114,8 +105,20 @@ public class UseItemCommandHandler extends AsyncCommandHandler {
         };
     }
 
-    static boolean requiresKeyPulse(InteractionHand requestedHand, int durationMs) {
-        return requestedHand == null || durationMs > 0;
+    /**
+     * Resolve the hand to actually use, defaulting to the main hand.
+     *
+     * An absent {@code hand} used to fall through to a keyUse tap instead.
+     * That tap never worked: Minecraft drains use presses through
+     * {@code KeyMapping.consumeClick()}, and {@code setDown(true)} does not
+     * raise a click, so the handler could answer "accepted" without
+     * {@code startUseItem()} ever running. Anything that relied on the
+     * automatic hand (filling a bucket, right-clicking a block) silently did
+     * nothing.
+     */
+    static InteractionHand resolveHand(JsonObject params) {
+        InteractionHand parsed = requestedHand(params);
+        return parsed != null ? parsed : InteractionHand.MAIN_HAND;
     }
 
     static void addUseState(LocalPlayer player, JsonObject data) {

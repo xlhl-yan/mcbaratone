@@ -61,25 +61,29 @@ class BridgeContractValidationTest {
     }
 
     @Test
-    void useItemParsesExplicitHandsAndPreservesAutomaticDefault() {
+    void useItemParsesExplicitHandsAndDefaultsToMainHand() {
         assertNull(UseItemCommandHandler.requestedHand(new JsonObject()));
+        assertEquals(
+            InteractionHand.MAIN_HAND,
+            UseItemCommandHandler.resolveHand(new JsonObject()));
 
         JsonObject main = new JsonObject();
         main.addProperty("hand", "main_hand");
         assertEquals(
             InteractionHand.MAIN_HAND,
             UseItemCommandHandler.requestedHand(main));
+        assertEquals(
+            InteractionHand.MAIN_HAND,
+            UseItemCommandHandler.resolveHand(main));
 
         JsonObject offhand = new JsonObject();
         offhand.addProperty("hand", "OFF_HAND");
         assertEquals(
             InteractionHand.OFF_HAND,
             UseItemCommandHandler.requestedHand(offhand));
-        assertTrue(UseItemCommandHandler.requiresKeyPulse(null, 0));
-        assertTrue(UseItemCommandHandler.requiresKeyPulse(
-            InteractionHand.OFF_HAND, 900));
-        assertFalse(UseItemCommandHandler.requiresKeyPulse(
-            InteractionHand.MAIN_HAND, 0));
+        assertEquals(
+            InteractionHand.OFF_HAND,
+            UseItemCommandHandler.resolveHand(offhand));
     }
 
     @Test
