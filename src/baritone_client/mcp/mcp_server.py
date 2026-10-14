@@ -878,6 +878,37 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         return _call_bridge(ctx, "command/close_screen", _run)
 
     @mcp.tool()
+    def screenshot(
+        ctx: RequestContext,
+        filename: str = "",
+        include_metadata: bool = False,
+    ) -> Dict[str, Any]:
+        """Capture the game framebuffer to a PNG under <gameDir>/screenshots/.
+
+        **这是唯一能真正"看见"游戏画面的工具** —— 其余工具只给坐标和
+        block_state。返回里的 `path` 是绝对路径，直接当图片读就行；
+        需要眼见为实（找路、认地形、确认建筑、看聊天栏）时调它。
+
+        几个实测过的坑：
+        - bridge 侧是 `AsyncCommandHandler`：文件由 IO 线程写完后才回调，所以
+          以返回里的 `saved` 为准，别拿"命令返回了"当"文件已经在了"。
+        - `filename` 会被清洗成 [A-Za-z0-9_-]，再拼时间戳 + 自增序号，所以重名
+          不会覆盖；中文名会变成一串下划线，用英文短名。
+        - 只支持 PNG（传别的 format 报 Unsupported format），因此这里不给该参数。
+        - 默认不带 metadata：那一坨是玩家/世界快照（坐标、血量、维度、tick…），
+          看图时纯噪音，而且 get_state 里本来就有；需要传 include_metadata=True。
+        """
+        params: Dict[str, Any] = {"include_metadata": bool(include_metadata)}
+        name = (filename or "").strip()
+        if name:
+            params["filename"] = name
+        return _call_bridge(
+            ctx,
+            "command/screenshot",
+            lambda client: client.transport.dispatch("screenshot", params),
+        )
+
+    @mcp.tool()
     def get_events(
         ctx: RequestContext,
         event_type: str = "",

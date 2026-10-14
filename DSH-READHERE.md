@@ -66,7 +66,7 @@ Get-ChildItem "$env:USERPROFILE\.dsh\profiles" -Directory | Select-Object -Expan
 Set-Location <REPO>
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\python.exe -m pytest -q      # 应当全绿（本仓库当前 2721 passed, 1 skipped）
+.\.venv\Scripts\python.exe -m pytest -q      # 应当全绿（本仓库当前 2724 passed, 1 skipped）
 ```
 
 **验收**：pytest 没有 failed。
@@ -178,13 +178,14 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 | 1 | Python 测试 | `<VENV>\Scripts\python.exe -m pytest -q` | 全绿 |
 | 2 | bridge jar | `Test-Path <REPO>\bridge\build\libs\baritone-api-bridge-1.0.40.jar` | True |
 | 3 | 端口分离 | `netstat -ano \| Select-String ":5556\|:5558"` | 有 LISTENING |
-| 4 | MCP 已接入 | 在 DSH 里列出工具 | 出现 `mcp__baritone__*`，约 **97** 个 |
+| 4 | MCP 已接入 | 在 DSH 里列出工具 | 出现 `mcp__baritone__*`，约 **98** 个 |
 | 5 | 能读游戏状态 | 调 `mcp__baritone__snapshot` | 返回坐标 / 血量 / 维度 |
 | 6 | 能说话 | 调 `mcp__baritone__say`（参数 `message`）| 游戏聊天栏出现该句 |
 | 7 | 能听玩家说话 | 在游戏里打一句话，再读聊天事件 | 能读到该句（带玩家名）|
 | 8 | 会动 | 调 `mcp__baritone__goal_coordinates` | 角色开始寻路 |
+| 9 | 能看见画面 | 调 `mcp__baritone__screenshot`，再用图片工具读返回的 `path` | 看到真实的游戏画面 |
 
-**第 5～8 项任一失败，直接跳到 §6。**
+**第 5～9 项任一失败，直接跳到 §6。**
 
 ---
 

@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | 目标 | 自主无干预通关末影龙 | **DSH 驱动的陪玩伙伴** |
 | 驱动方式 | 检查点规划器 | **游戏内聊天 + MCP 工具调用** |
-| MCP 工具面 | 部分 bridge handler 未暴露 | **97 个工具**（bridge 共 72 个 handler）|
+| MCP 工具面 | 部分 bridge handler 未暴露 | **98 个工具**（bridge 共 72 个 handler）|
 | 主要分支 | `main` | `dsh/mcp-tooling`（`main` 保持只读）|
 
 **没打算合并回上游**，这是自用适配分支。
@@ -175,12 +175,13 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 
 ---
 
-## 五、MCP 工具速查（共 97 个，常用的）
+## 五、MCP 工具速查（共 98 个，常用的）
 
 | 分类 | 工具 |
 | --- | --- |
 | 说话 | `say` |
 | 观察 | `snapshot` `get_inventory` `get_entities` `get_player_pos` `get_block` `get_look_target` `get_combat_snapshot` `get_dimension` `find` `get_setting` `get_events`（酌情用，见 §六）|
+| 看图 | `screenshot`（**唯一能真正"看见"画面**的工具：存 PNG 到 `<gameDir>/screenshots/`，返回绝对路径，直接当图片读）|
 | 移动 | `goal_coordinates` `set_goal_block` `goto_block_type` `come` `thisway` `path` `explore` `surface` `tunnel` |
 | 采集 | `mine_quantity` `start_mining` `stop_mining` `farm` `dig_block` |
 | 战斗 | `attack_nearest` |
@@ -202,6 +203,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 - **`mine_quantity` 大单不等待** —— 数量 > 5 时只负责「启动」，由调用方轮询背包；且**超时会自动 cancel**，避免残留任务把角色拖着到处跑。
 - **`get_events` 要酌情调用** —— 聊天不用拉（插件会推）；不带 `event_type` 过滤会混进 `tick_update` 这类高频事件刷屏。**事件名一律小写**（`tick_update` / `damage` / `death` … 共 23 个，见 `EventManager.EventType`），Python 侧会 `lower()` 归一化。⚠ 早期版本误用 `upper()`，导致**带过滤的查询永远静默返回 0 条**（已修）。另外 **bridge 的 `get_events` 不带 `after_seq` 时会走 `pollEvents()`，那里有 `iterator.remove()` 会把事件从缓冲区抽走** —— 所以这个工具在实现上**永远走游标模式**，不要绕过它裸调。
 - **`close_screen` 关不掉非容器界面** —— 它调的是 `player.closeContainer()`，只能关箱子/熔炉/交易/工作台这类容器界面；PauseScreen、DeathScreen 关不掉（会返回 `closed: false` + hint），那类界面需要在 bridge 侧用 `setScreen(null)`。
+- **`screenshot` 是异步写盘、且只出 PNG** —— bridge 侧是 `AsyncCommandHandler`，文件由 IO 线程写完后才回调，所以以返回里的 `saved` 为准，别刚发完命令就去读文件；`filename` 会被清洗成 `[A-Za-z0-9_-]` 再拼时间戳和自增序号（重名不覆盖，中文名会变成一串下划线，用英文短名）；截图落在**客户端**的 `<gameDir>\screenshots\`，返回的是绝对路径。
 - **bridge 无认证层** —— 只能跑在回环地址或可信网络，别暴露到公网。
 - **工具的运行时常量**：Python 侧轮询上限必须小于 DSH 的 `toolCallTimeoutMs`（现配 120 秒），否则会先报超时。
 
@@ -213,7 +215,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-本 fork 当前实测：**2721 passed, 1 skipped**。
+本 fork 当前实测：**2724 passed, 1 skipped**。
 
 默认配置**排除**标记为 `live_readonly` / `live_mutating` 的用例 —— 那些会真的连进 Minecraft 并改动世界，
 按 `tests/functional/README.md` 的说明**逐个显式选择**，不要对着有价值的存档跑未过滤的套件。

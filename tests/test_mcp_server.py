@@ -206,6 +206,36 @@ def test_get_screen_hides_empty_slots_by_default(mock_request_context, mock_clie
     assert "empty_slots_hidden" not in full
 
 
+def test_screenshot_sends_filename_only_when_given_and_skips_metadata(
+    mock_request_context, mock_client
+):
+    """screenshot 只转发两个参数：非空的 filename + include_metadata（默认 False）。
+
+    metadata 是玩家/世界快照，看图时是噪音且 get_state 里已有，所以默认不请求；
+    filename 留空时不能往 payload 里塞空串 —— bridge 侧会当自定义名用。
+    """
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["screenshot"].fn
+
+    calls = []
+
+    def fake_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        return {"saved": True, "path": "/run/screenshots/x.png"}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    tool(mock_request_context)
+    assert calls[-1] == ("screenshot", {"include_metadata": False})
+
+    tool(mock_request_context, filename="  base  ")
+    assert calls[-1] == ("screenshot", {"include_metadata": False, "filename": "base"})
+
+    tool(mock_request_context, filename="base", include_metadata=True)
+    assert calls[-1] == ("screenshot", {"include_metadata": True, "filename": "base"})
+
+
 def test_preview_build_plan_tool_is_pure_and_serializable() -> None:
     server = create_mcp_server(BridgeConfig())
     preview_tool = server._tool_manager._tools["preview_build_plan"]
