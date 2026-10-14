@@ -48,8 +48,12 @@ public class CommandHandlerFactoryTest {
 
     @AfterEach
     void tearDown() {
-        // Clean up after each test
+        // Clean up after each test, then put the built-in handlers back.
+        // clearRegistry() wipes the static registry for the whole JVM and the
+        // static initializer only ever runs once, so without the restore every
+        // later test class that looks up a real command fails.
         CommandHandlerFactory.clearRegistry();
+        CommandHandlerFactory.registerDefaultHandlers();
     }
 
     @Test
@@ -148,12 +152,20 @@ public class CommandHandlerFactoryTest {
     }
 
     @Test
-    void testGetHandler_WithInstantiationError_ShouldReturnNull() {
+    void testGetHandler_WithInstantiationError_ShouldThrow() {
         // Create a handler class that cannot be instantiated
         CommandHandlerFactory.registerHandler("bad", BadCommandHandler.class);
 
-        CommandHandler result = CommandHandlerFactory.getHandler("bad");
-        assertNull(result);
+        // Returning null here made a registered-but-broken handler look exactly
+        // like an unregistered command, so callers answered with the legacy
+        // "Unknown command or no handler found" -- which is how three working
+        // commands appeared broken after an upgrade. It must surface as an error.
+        IllegalStateException thrown = assertThrows(
+            IllegalStateException.class,
+            () -> CommandHandlerFactory.getHandler("bad"));
+        assertTrue(thrown.getMessage().contains("bad"),
+            "message should name the failing command, was: " + thrown.getMessage());
+        assertNotNull(thrown.getCause(), "the constructor failure should be kept as the cause");
     }
 
     private static class BadCommandHandler implements CommandHandler {

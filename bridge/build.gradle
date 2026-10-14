@@ -95,6 +95,11 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach {
     it.options.release = 25
+    // The sources are UTF-8 (they contain Chinese comments and chat prefixes).
+    // Without this the compiler falls back to the platform default encoding,
+    // which is GBK on a zh-CN Windows -- see the note about file.encoding in
+    // gradle.properties for why the daemon may legitimately run as GBK here.
+    it.options.encoding = 'UTF-8'
 }
 
 java {

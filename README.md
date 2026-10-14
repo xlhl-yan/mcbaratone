@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | 目标 | 自主无干预通关末影龙 | **DSH 驱动的陪玩伙伴** |
 | 驱动方式 | 检查点规划器 | **游戏内聊天 + MCP 工具调用** |
-| MCP 工具面 | 部分 bridge handler 未暴露 | **98 个工具**（bridge 共 72 个 handler）|
+| MCP 工具面 | 部分 bridge handler 未暴露 | **99 个工具**（bridge 共 72 个 handler）|
 | 主要分支 | `main` | `dsh/mcp-tooling`（`main` 保持只读）|
 
 **没打算合并回上游**，这是自用适配分支。
@@ -175,7 +175,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 
 ---
 
-## 五、MCP 工具速查（共 98 个，常用的）
+## 五、MCP 工具速查（共 99 个，常用的）
 
 | 分类 | 工具 |
 | --- | --- |
@@ -211,14 +211,53 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 
 ## 七、测试
 
+### Python
+
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-本 fork 当前实测：**2724 passed, 1 skipped**。
+本 fork 当前实测：**2725 passed, 1 skipped**。
 
 默认配置**排除**标记为 `live_readonly` / `live_mutating` 的用例 —— 那些会真的连进 Minecraft 并改动世界，
 按 `tests/functional/README.md` 的说明**逐个显式选择**，不要对着有价值的存档跑未过滤的套件。
+
+### Java（bridge）
+
+```powershell
+cd bridge
+gradle test
+```
+
+本 fork 当前实测：**42 个测试类 / 396 tests / 0 failed（117 skipped）**。
+
+#### ⚠ 别删 `gradle.properties` 里的 `-Dfile.encoding=GBK`
+
+`bridge/gradle.properties` 的 `org.gradle.jvmargs=-Xmx1G -Dfile.encoding=GBK` 是**必需**的，
+它对应一条很长的链路：
+
+1. Gradle 把测试 worker 的 classpath 写进一个 **argfile**（`E:\repository\.tmp\gradle-worker-classpath*.txt`），
+   再以 `@argfile` 形式递给 worker JVM —— 因为 classpath 有 167 个条目，超过 Windows 命令行长度上限。
+2. **Gradle 用 daemon 的 `file.encoding` 写这个文件**，**JVM 却用 `sun.jnu.encoding` 读它**。
+3. 中文 Windows 上 `sun.jnu.encoding` 是 **GBK**，而且 **`-Dsun.jnu.encoding=…` 覆盖不了**（JDK-8321268）。
+4. 结果：daemon 按 UTF-8 写、JVM 按 GBK 读 → **classpath 里凡是含中文的条目全部乱码**（本仓库正好躺在 `…\调研AI陪玩MC\…` 下）
+   → 每个测试类都 `ClassNotFoundException`，可 `.class` 文件明明就在 `build\classes\java\test\` 里躺着。
+
+**让两边编码一致**就行：daemon 也用 GBK 写，JVM 用 GBK 读，对上了。
+这也是 `bridge/build.gradle` 里显式写 `it.options.encoding = 'UTF-8'` 的原因 ——
+daemon 现在是 GBK，源码里的中文注释和常量必须显式按 UTF-8 编译。
+（上游和 CI 上仓库路径是纯 ASCII，两处设置在那边都是 no-op。）
+
+上游 issue：[gradle#30304](https://github.com/gradle/gradle/issues/30304)、
+[gradle#30391](https://github.com/gradle/gradle/issues/30391)、
+[JDK-8321268](https://bugs.openjdk.org/browse/JDK-8321268)、
+[spring-boot#43051](https://github.com/spring-projects/spring-boot/issues/43051)。
+
+#### 测试隔离约定
+
+`CommandHandlerFactory.clearRegistry()` 清的是 **JVM 级静态注册表**，而默认注册只在静态初始化块里跑**一次**。
+所以凡是调它的测试，**必须**在 `@AfterEach` 里补一句 `CommandHandlerFactory.registerDefaultHandlers()` 复原；
+否则同一个 JVM 里后面所有查真实命令的测试都会失败（`CommandHandlerFactoryTest` 早期就漏了这一步，见它的注释）。
 
 ---
 

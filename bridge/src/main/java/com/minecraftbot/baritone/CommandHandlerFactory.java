@@ -18,6 +18,20 @@ public class CommandHandlerFactory {
     private static final Map<String, CommandHandler> handlerInstances = new ConcurrentHashMap<>();
 
     static {
+        registerDefaultHandlers();
+    }
+
+    /**
+     * Register the built-in command handlers.
+     *
+     * <p>Runs once from the static initializer. It is public on purpose:
+     * {@link #clearRegistry()} wipes the static registry for the whole JVM and
+     * the initializer never runs again, so tests -- and any future reload
+     * path -- need a way to put the standard set back. Without it, clearing
+     * the registry inside one test class silently breaks every later test that
+     * looks up a real command.
+     */
+    public static void registerDefaultHandlers() {
         // Register command handlers here as they are implemented
         // This will be expanded as individual command handlers are created
 
