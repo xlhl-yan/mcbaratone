@@ -178,7 +178,7 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 | 1 | Python 测试 | `<VENV>\Scripts\python.exe -m pytest -q` | 全绿 |
 | 2 | bridge jar | `Test-Path <REPO>\bridge\build\libs\baritone-api-bridge-1.0.40.jar` | True |
 | 3 | 端口分离 | `netstat -ano \| Select-String ":5556\|:5558"` | 有 LISTENING |
-| 4 | MCP 已接入 | 在 DSH 里列出工具 | 出现 `mcp__baritone__*`，约 **94** 个 |
+| 4 | MCP 已接入 | 在 DSH 里列出工具 | 出现 `mcp__baritone__*`，约 **96** 个 |
 | 5 | 能读游戏状态 | 调 `mcp__baritone__snapshot` | 返回坐标 / 血量 / 维度 |
 | 6 | 能说话 | 调 `mcp__baritone__say`（参数 `message`）| 游戏聊天栏出现该句 |
 | 7 | 能听玩家说话 | 在游戏里打一句话，再读聊天事件 | 能读到该句（带玩家名）|

@@ -781,6 +781,74 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
+    def get_screen(ctx: RequestContext) -> Dict[str, Any]:
+        """当前打开的容器界面里有什么（箱子 / 熔炉 / 村民交易 / 工作台…）。
+
+        一次调用给两样东西：
+          - `screen`：界面类名（取自 get_state；`"none"` 表示没开界面）
+          - `menu_type` / `slots` / `total_slots`：容器菜单的类名与每个槽位的内容；
+            村民交易还会带 `merchant_offers` 与 `merchant`。
+
+        没开任何界面时直接返回 `{"screen": "none", "open": false}` —— 不会把玩家自己
+        那 46 格的 InventoryMenu 倒出来（那个用 get_inventory 看）。
+        """
+        def _run(client):
+            state = client.transport.dispatch("get_state", {})
+            screen = state.get("screen") if isinstance(state, dict) else None
+            if not screen or screen == "none":
+                return {"screen": "none", "open": False}
+            menu = client.transport.dispatch("get_screen", {})
+            if not isinstance(menu, dict):
+                menu = {"menu_raw": menu}
+            menu["screen"] = screen
+            menu["open"] = True
+            return menu
+
+        return _call_bridge(ctx, "command/get_screen", _run)
+
+    @mcp.tool()
+    def close_screen(ctx: RequestContext) -> Dict[str, Any]:
+        """关闭当前打开的界面。
+
+        **AI 打开任何界面（箱子/熔炉/交易/工作台…）之后都应该调它** —— 界面开着的时候，
+        很多需要操作角色的命令会失败。
+
+        会**回读确认**：bridge 的 close_screen 是 fire-and-forget（只往主线程排一个
+        `player.closeContainer()`），立刻返回成功不代表已经关上。这里最多轮询 1.5 秒，
+        只有 `screen` 变回 `"none"` 才算 `closed: true`。
+
+        ⚠ 它调的是 `closeContainer()`，**只能关容器类界面**；PauseScreen / DeathScreen
+        这类非容器界面关不掉 —— 那种情况返回 `closed: false` 并附 hint。本来就没开界面
+        时视为成功。
+        """
+        def _run(client):
+            def _current_screen():
+                state = client.transport.dispatch("get_state", {})
+                value = state.get("screen") if isinstance(state, dict) else None
+                return value if value else "none"
+
+            before = _current_screen()
+            if before == "none":
+                return {"closed": True, "screen_before": "none", "screen_after": "none"}
+
+            client.transport.dispatch("close_screen", {})
+            after = before
+            for _ in range(6):
+                time.sleep(0.25)
+                after = _current_screen()
+                if after == "none":
+                    return {"closed": True, "screen_before": before, "screen_after": "none"}
+
+            return {
+                "closed": False,
+                "screen_before": before,
+                "screen_after": after,
+                "hint": "closeContainer() 关不掉非容器界面（如 PauseScreen）；这类界面要在 bridge 侧用 setScreen(null) 才能关",
+            }
+
+        return _call_bridge(ctx, "command/close_screen", _run)
+
+    @mcp.tool()
     def get_recipes(ctx: RequestContext) -> Dict[str, Any]:
         """List the crafting recipes the bot knows.
 
