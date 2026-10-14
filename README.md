@@ -184,7 +184,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 | 移动 | `goal_coordinates` `set_goal_block` `goto_block_type` `come` `thisway` `path` `explore` `surface` `tunnel` |
 | 采集 | `mine_quantity` `start_mining` `stop_mining` `farm` `dig_block` |
 | 战斗 | `attack_nearest` |
-| 界面 | `get_screen`（界面里有什么 + 是否开着）`close_screen`（关掉，带回读确认）|
+| 界面 | `get_screen`（界面里有什么 + 是否真有容器；默认只列非空格，看全布局传 `include_empty=True`）`close_screen`（关掉，带回读确认）|
 | 交互 | `interact_block` `place_block` `place_torches` `use_bucket` `eat` `equip` `throw_item` `select_slot` `look_at` `look_around` `respawn` |
 | 合成 | `craft` `craft_advanced` `auto_craft` |
 | 建造 | `build_schematic` `inspect_build_site` `preview_build_plan` |
@@ -200,7 +200,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 - **`get_recipes` 在 MC 1.21.4 不可用** —— 上游限制，客户端不再暴露配方表。别靠它查配方，`craft` 用的是内置配方表。
 - **`interact_block` 对薄方块仍然挑剔** —— 已改成采样多点，但极端角度仍可能打不中（换一侧靠近即可）。
 - **`mine_quantity` 大单不等待** —— 数量 > 5 时只负责「启动」，由调用方轮询背包；且**超时会自动 cancel**，避免残留任务把角色拖着到处跑。
-- **`get_events` 要酌情调用** —— 聊天不用拉（插件会推）；不带 `event_type` 过滤会混进 `TICK_UPDATE` 这类高频事件刷屏。另外 **bridge 的 `get_events` 不带 `after_seq` 时会走 `pollEvents()`，那里有 `iterator.remove()` 会把事件从缓冲区抽走** —— 所以这个工具在实现上**永远走游标模式**，不要绕过它裸调。
+- **`get_events` 要酌情调用** —— 聊天不用拉（插件会推）；不带 `event_type` 过滤会混进 `tick_update` 这类高频事件刷屏。**事件名一律小写**（`tick_update` / `damage` / `death` … 共 23 个，见 `EventManager.EventType`），Python 侧会 `lower()` 归一化。⚠ 早期版本误用 `upper()`，导致**带过滤的查询永远静默返回 0 条**（已修）。另外 **bridge 的 `get_events` 不带 `after_seq` 时会走 `pollEvents()`，那里有 `iterator.remove()` 会把事件从缓冲区抽走** —— 所以这个工具在实现上**永远走游标模式**，不要绕过它裸调。
 - **`close_screen` 关不掉非容器界面** —— 它调的是 `player.closeContainer()`，只能关箱子/熔炉/交易/工作台这类容器界面；PauseScreen、DeathScreen 关不掉（会返回 `closed: false` + hint），那类界面需要在 bridge 侧用 `setScreen(null)`。
 - **bridge 无认证层** —— 只能跑在回环地址或可信网络，别暴露到公网。
 - **工具的运行时常量**：Python 侧轮询上限必须小于 DSH 的 `toolCallTimeoutMs`（现配 120 秒），否则会先报超时。

@@ -152,6 +152,60 @@ def test_mcp_server_registers_read_only_tools() -> None:
     assert "preview_build_plan" in tool_names
 
 
+def test_get_events_normalizes_event_type_to_lowercase(mock_request_context, mock_client):
+    """回归：bridge 的 EventManager 用大小写敏感的 equals 过滤，缓冲里的 type 一律小写。
+
+    早先这里误用了 upper()，导致**所有带 event_type 的查询静默返回 0 条** ——
+    调用方会以为"没有死亡事件"，实际是被过滤光了。
+    """
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["get_events"].fn
+
+    calls = []
+
+    def fake_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        return {"events": [], "count": 0, "latest_seq": 100}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    tool(mock_request_context, event_type="TICK_UPDATE", after_seq=10, limit=5)
+
+    name, params = calls[-1]
+    assert name == "get_events"
+    assert params["type"] == "tick_update"
+
+
+def test_get_screen_hides_empty_slots_by_default(mock_request_context, mock_client):
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["get_screen"].fn
+
+    slots = [
+        {"slot": 0, "id": "minecraft:air", "count": 0},
+        {"slot": 1, "id": "minecraft:stone", "count": 3},
+    ]
+
+    def fake_dispatch(name, params=None):
+        if name == "get_state":
+            return {"screen": "ChestScreen"}
+        if name == "get_screen":
+            return {"type": "ChestMenu", "sync_id": 1, "slots": [dict(s) for s in slots], "total_slots": 2}
+        return {}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    result = tool(mock_request_context)
+    assert result["container"] is True
+    assert [s["slot"] for s in result["slots"]] == [1]
+    assert result["empty_slots_hidden"] == 1
+
+    full = tool(mock_request_context, include_empty=True)
+    assert [s["slot"] for s in full["slots"]] == [0, 1]
+    assert "empty_slots_hidden" not in full
+
+
 def test_preview_build_plan_tool_is_pure_and_serializable() -> None:
     server = create_mcp_server(BridgeConfig())
     preview_tool = server._tool_manager._tools["preview_build_plan"]

@@ -781,27 +781,56 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
-    def get_screen(ctx: RequestContext) -> Dict[str, Any]:
+    def get_screen(ctx: RequestContext, include_empty: bool = False) -> Dict[str, Any]:
         """当前打开的容器界面里有什么（箱子 / 熔炉 / 村民交易 / 工作台…）。
 
-        一次调用给两样东西：
-          - `screen`：界面类名（取自 get_state；`"none"` 表示没开界面）
-          - `menu_type` / `slots` / `total_slots`：容器菜单的类名与每个槽位的内容；
-            村民交易还会带 `merchant_offers` 与 `merchant`。
+        返回 `screen`（当前 GUI 类名，`"none"` = 没开界面）与 `container`（**是否真有
+        容器**）：
 
-        没开任何界面时直接返回 `{"screen": "none", "open": false}` —— 不会把玩家自己
-        那 46 格的 InventoryMenu 倒出来（那个用 get_inventory 看）。
+        - **有容器**：`container: true` + `type` / `sync_id` / `slots` / `total_slots`
+          （村民交易还会带 `merchant_offers` 与 `merchant`）
+        - **没容器**：`container: false`，**不倒 slots** —— 玩家不开界面时
+          `containerMenu` 也是有的（是他自己的 `InventoryMenu`，46 格），照搬会白刷
+          一屏；那部分内容用 `get_inventory` 看。
+
+        `slots` **默认只列非空格**（空气槽剔除，剔掉几个记在 `empty_slots_hidden`）——
+        读容器绝大多数时候只关心"里面有什么"，大箱子倒 63 格纯浪费 token。要看完整
+        布局（比如找某个空格放东西）时传 `include_empty=True`。
+
+        ⚠ `screen`（GUI，比如 `ChatScreen`）和"有没有容器"是**两件事**：开着聊天窗口
+        不代表有容器可读。
         """
         def _run(client):
             state = client.transport.dispatch("get_state", {})
             screen = state.get("screen") if isinstance(state, dict) else None
-            if not screen or screen == "none":
-                return {"screen": "none", "open": False}
+            screen = screen if screen else "none"
+
             menu = client.transport.dispatch("get_screen", {})
             if not isinstance(menu, dict):
-                menu = {"menu_raw": menu}
+                return {"screen": screen, "container": False, "menu_raw": menu}
+
+            menu_type = str(menu.get("type") or "")
+            if menu_type in ("", "InventoryMenu"):
+                # 没有容器 —— containerMenu 退回玩家自己的背包菜单
+                return {
+                    "screen": screen,
+                    "container": False,
+                    "note": "没有容器界面；玩家自己的背包菜单用 get_inventory 看",
+                }
+
+            slots = menu.get("slots")
+            if not include_empty and isinstance(slots, list):
+                kept = [
+                    s
+                    for s in slots
+                    if isinstance(s, dict)
+                    and str(s.get("id") or "") not in ("", "air", "minecraft:air")
+                ]
+                menu["empty_slots_hidden"] = len(slots) - len(kept)
+                menu["slots"] = kept
+
             menu["screen"] = screen
-            menu["open"] = True
+            menu["container"] = True
             return menu
 
         return _call_bridge(ctx, "command/get_screen", _run)
@@ -861,15 +890,20 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
 
         - **聊天不用调它**：`dsh-mc-chat-watch` 插件每 3 秒轮询 chat 并主动把消息推给你，
           你不需要自己来拉。
-        - **一定要带 `event_type`**。不带过滤时会混进 `TICK_UPDATE` / `ENTITY_MOVE` /
-          `BLOCK_UPDATE` 这类高频噪音，一次能刷几百条，很烧 token。
-        - 真正有价值的低频事件：`DEATH` / `DAMAGE` / `ENTITY_ATTACK` / `WEATHER_CHANGE` /
-          `INVENTORY_CHANGE` / `DIMENSION_CHANGE`；而且**态势快照已经把前几种并进去了**
+        - **一定要带 `event_type`**。不带过滤时会混进 `tick_update` / `entity_move` /
+          `block_update` 这类高频噪音，一次能刷几百条，很烧 token。
+        - 真正有价值的低频事件：`death` / `damage` / `entity_attack` / `weather_change` /
+          `inventory_change` / `dimension_change`；而且**态势快照已经把前几种并进去了**
           （`⚠受伤-3(僵尸)` 这种），多数时候你已经在态势行里看到了。
 
-        参数：`event_type` 是事件名（大小写不敏感，见上）；`after_seq` 是游标 ——
-        传上次返回的 `latest_seq` 就是"只看新的"；不传则默认回看最近 `limit` 条。
-        `limit` 上限 1000。
+        参数：`event_type` 是事件名，**大小写不敏感**（内部统一转小写再发给 bridge）。
+        可选值：`chat` / `block_interact` / `block_break` / `block_place` / `block_update` /
+        `entity_spawn` / `entity_move` / `entity_despawn` / `pathfinding_state` / `mission` /
+        `tick_update` / `dimension_change` / `inventory_change` / `death` / `respawn` /
+        `entity_update` / `damage` / `entity_attack` / `entity_tame` / `entity_shear` /
+        `entity_milk` / `weather_change` / `time_change`。
+        `after_seq` 是游标 —— 传上次返回的 `latest_seq` 就是"只看新的"；不传则默认回看最近
+        `limit` 条。`limit` 上限 1000。
 
         （实现上**永远走游标模式**：bridge 的 get_events 不带游标时会走 `pollEvents()`，
         那里有 `iterator.remove()` 会把事件**从缓冲区抽走** —— 那会连聊天事件一起抢掉。）
@@ -877,7 +911,10 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         def _run(client):
             params: Dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
             if event_type:
-                params["type"] = str(event_type).strip().upper()
+                # bridge 侧 EventManager 用大小写敏感的 equals 过滤（EventManager.java:327/397），
+                # 而缓冲里存的 type 一律是小写（EventType.TICK_UPDATE → "tick_update"）。
+                # 这里必须 lower()：早先写成 upper()，导致**所有带 event_type 的查询静默返回 0 条**。
+                params["type"] = str(event_type).strip().lower()
 
             cursor = int(after_seq) if after_seq is not None else -1
             if cursor < 0:
