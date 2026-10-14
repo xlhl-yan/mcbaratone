@@ -849,6 +849,50 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         return _call_bridge(ctx, "command/close_screen", _run)
 
     @mcp.tool()
+    def get_events(
+        ctx: RequestContext,
+        event_type: str = "",
+        after_seq: int = -1,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """从 bridge 的事件缓冲里读事件（只读，不消费）。
+
+        ⚠ **此工具酌情调用** —— 不是常规手段：
+
+        - **聊天不用调它**：`dsh-mc-chat-watch` 插件每 3 秒轮询 chat 并主动把消息推给你，
+          你不需要自己来拉。
+        - **一定要带 `event_type`**。不带过滤时会混进 `TICK_UPDATE` / `ENTITY_MOVE` /
+          `BLOCK_UPDATE` 这类高频噪音，一次能刷几百条，很烧 token。
+        - 真正有价值的低频事件：`DEATH` / `DAMAGE` / `ENTITY_ATTACK` / `WEATHER_CHANGE` /
+          `INVENTORY_CHANGE` / `DIMENSION_CHANGE`；而且**态势快照已经把前几种并进去了**
+          （`⚠受伤-3(僵尸)` 这种），多数时候你已经在态势行里看到了。
+
+        参数：`event_type` 是事件名（大小写不敏感，见上）；`after_seq` 是游标 ——
+        传上次返回的 `latest_seq` 就是"只看新的"；不传则默认回看最近 `limit` 条。
+        `limit` 上限 1000。
+
+        （实现上**永远走游标模式**：bridge 的 get_events 不带游标时会走 `pollEvents()`，
+        那里有 `iterator.remove()` 会把事件**从缓冲区抽走** —— 那会连聊天事件一起抢掉。）
+        """
+        def _run(client):
+            params: Dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
+            if event_type:
+                params["type"] = str(event_type).strip().upper()
+
+            cursor = int(after_seq) if after_seq is not None else -1
+            if cursor < 0:
+                # 不给游标时：先探一下当前末尾，再回看 limit 条，得到一个有意义的默认
+                probe = client.transport.dispatch("get_events", {"after_seq": 0, "limit": 1})
+                latest = 0
+                if isinstance(probe, dict):
+                    latest = int(probe.get("latest_seq") or 0)
+                cursor = max(0, latest - params["limit"])
+            params["after_seq"] = cursor
+            return client.transport.dispatch("get_events", params)
+
+        return _call_bridge(ctx, "command/get_events", _run)
+
+    @mcp.tool()
     def get_recipes(ctx: RequestContext) -> Dict[str, Any]:
         """List the crafting recipes the bot knows.
 

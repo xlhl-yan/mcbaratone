@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | 目标 | 自主无干预通关末影龙 | **DSH 驱动的陪玩伙伴** |
 | 驱动方式 | 检查点规划器 | **游戏内聊天 + MCP 工具调用** |
-| MCP 工具面 | 部分 bridge handler 未暴露 | **96 个工具**（bridge 共 72 个 handler）|
+| MCP 工具面 | 部分 bridge handler 未暴露 | **97 个工具**（bridge 共 72 个 handler）|
 | 主要分支 | `main` | `dsh/mcp-tooling`（`main` 保持只读）|
 
 **没打算合并回上游**，这是自用适配分支。
@@ -175,12 +175,12 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 
 ---
 
-## 五、MCP 工具速查（共 96 个，常用的）
+## 五、MCP 工具速查（共 97 个，常用的）
 
 | 分类 | 工具 |
 | --- | --- |
 | 说话 | `say` |
-| 观察 | `snapshot` `get_inventory` `get_entities` `get_player_pos` `get_block` `get_look_target` `get_combat_snapshot` `get_dimension` `find` `get_setting` |
+| 观察 | `snapshot` `get_inventory` `get_entities` `get_player_pos` `get_block` `get_look_target` `get_combat_snapshot` `get_dimension` `find` `get_setting` `get_events`（酌情用，见 §六）|
 | 移动 | `goal_coordinates` `set_goal_block` `goto_block_type` `come` `thisway` `path` `explore` `surface` `tunnel` |
 | 采集 | `mine_quantity` `start_mining` `stop_mining` `farm` `dig_block` |
 | 战斗 | `attack_nearest` |
@@ -200,6 +200,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 - **`get_recipes` 在 MC 1.21.4 不可用** —— 上游限制，客户端不再暴露配方表。别靠它查配方，`craft` 用的是内置配方表。
 - **`interact_block` 对薄方块仍然挑剔** —— 已改成采样多点，但极端角度仍可能打不中（换一侧靠近即可）。
 - **`mine_quantity` 大单不等待** —— 数量 > 5 时只负责「启动」，由调用方轮询背包；且**超时会自动 cancel**，避免残留任务把角色拖着到处跑。
+- **`get_events` 要酌情调用** —— 聊天不用拉（插件会推）；不带 `event_type` 过滤会混进 `TICK_UPDATE` 这类高频事件刷屏。另外 **bridge 的 `get_events` 不带 `after_seq` 时会走 `pollEvents()`，那里有 `iterator.remove()` 会把事件从缓冲区抽走** —— 所以这个工具在实现上**永远走游标模式**，不要绕过它裸调。
 - **`close_screen` 关不掉非容器界面** —— 它调的是 `player.closeContainer()`，只能关箱子/熔炉/交易/工作台这类容器界面；PauseScreen、DeathScreen 关不掉（会返回 `closed: false` + hint），那类界面需要在 bridge 侧用 `setScreen(null)`。
 - **bridge 无认证层** —— 只能跑在回环地址或可信网络，别暴露到公网。
 - **工具的运行时常量**：Python 侧轮询上限必须小于 DSH 的 `toolCallTimeoutMs`（现配 120 秒），否则会先报超时。
