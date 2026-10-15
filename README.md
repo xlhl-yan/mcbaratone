@@ -137,6 +137,27 @@ config = BridgeConfig(host=args.host, port=args.port, timeout=args.timeout)
 config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协议
 ```
 
+### 5. 装 DSH 侧的配套插件
+
+光有 MCP 工具还不够 —— 得有东西**盯着游戏内聊天**，玩家说话时把 agent 叫醒（还有游戏态势与
+空闲自主）。那就是随本仓库提供的 `plugins/dsh-mc-chat-watch`。
+
+它在 profile 的 `package.json` 里要占**两个**位置才算装载：
+
+```jsonc
+{
+  "dependencies": { "dsh-mc-chat-watch": "link:<插件目录>" },
+  "dsh": { "profile": { "bundles": [ "…", "dsh-mc-chat-watch" ] } }
+}
+```
+
+> ⚠️ **`dependencies` ≠ 装载** —— `dsh.profile.bundles` 才决定加载。这个坑真踩过：依赖在、
+> 插件没跑，日志里连一行 `[apply]` 都没有。
+
+装完**重启 DSH**，再看 `<DSH_HOME>/mc-chat-watch/watch.log` 有没有 `[apply] …` 自检行。
+说明、配置项、游戏内开关命令见 [`plugins/README.md`](plugins/README.md) 和
+[`plugins/dsh-mc-chat-watch/README.md`](plugins/dsh-mc-chat-watch/README.md)。
+
 ---
 
 ## 四、这个 fork 改了什么

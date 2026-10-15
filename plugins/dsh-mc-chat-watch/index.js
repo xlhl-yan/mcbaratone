@@ -1,0 +1,1012 @@
+/**
+ * `dsh-mc-chat-watch` · Host 半边
+ *
+ * 盯住 Minecraft 里 AI 角色所在客户端的聊天，一有新消息就把话**投进当前会话**，
+ * 把 agent 叫醒 —— 这样用户不用切到 DSH 窗口说话，AI 也能"听见"。
+ *
+ * 依据（照 dsh-selfwake 真机验过的那套）：
+ *   ctx.get('agents') → agents.get(sessionId) → handle.agent.followup(message)
+ *
+ * 与 selfwake 的区别：selfwake 是"到点主动开口"（时间驱动）；
+ * 本插件是"有人说话才醒"（事件驱动），所以轮询间隔可以很短而几乎不费 token。
+ */
+
+import { createConnection } from 'node:net';
+import { readdirSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+export const name = 'mc-chat-watch';
+/** 只声明真正需要的服务；可选的用 ctx.get() 取，取不到就降级。 */
+export const inject = ['timer', 'agents'];
+
+const DEFAULTS = {
+  enabled: true,
+  host: '127.0.0.1',
+  /** AI 客户端 bridge 的端口（用 JVM 参数 -Dbaritone.bridge.port 控制） */
+  port: 5556,
+  /** 轮询间隔（秒）。事件驱动，所以可以短；3s 对聊天够用。 */
+  tickSeconds: 3,
+  /** 这些发送者的消息不投递（AI 自己说的别把自己吵醒）。 */
+  ignoreSenders: ['DeepSeek'],
+  /** 单次 tick 最多投递几条，防刷屏。 */
+  maxPerTick: 10,
+  /** 找「最近有写入的会话」的根目录。留空 = <DSH_HOME>/sessions */
+  sessionsRoot: '',
+  /**
+   * 固定把游戏消息投给哪个会话。留空 = 自动挑「最近有写入的那个」（会猜错）。
+   * 填 session-xxxxxxxx-... 后就是零推测，游戏消息再也不会串到别的窗口。
+   */
+  sessionId: '',
+  /** 状态与日志目录。留空 = <DSH_HOME>/mc-chat-watch */
+  stateDir: '',
+  /** 日志里标注的设备名。 */
+  device: '【PC】',
+  /** 单次 TCP 超时（毫秒）。 */
+  timeoutMs: 4000,
+};
+
+export function resolveConfig(input = {}) {
+  const cfg = { ...DEFAULTS, ...input };
+  cfg.port = Number(cfg.port) || DEFAULTS.port;
+  cfg.tickSeconds = Math.max(1, Number(cfg.tickSeconds) || DEFAULTS.tickSeconds);
+  cfg.maxPerTick = Math.max(1, Number(cfg.maxPerTick) || DEFAULTS.maxPerTick);
+  cfg.timeoutMs = Math.max(500, Number(cfg.timeoutMs) || DEFAULTS.timeoutMs);
+  if (!Array.isArray(cfg.ignoreSenders)) cfg.ignoreSenders = [...DEFAULTS.ignoreSenders];
+  return cfg;
+}
+
+export function homeDir() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh');
+}
+
+function statePaths(cfg) {
+  const dir = cfg.stateDir || join(homeDir(), 'mc-chat-watch');
+  return { dir };
+}
+
+/**
+ * 把非 ASCII 字符转成 `\uXXXX` 转义。
+ *
+ * 为什么必须这么做：bridge 的 Java 端按 JVM 默认编码（中文 Windows = GB18030）
+ * 读 socket，而 Node 的 JSON.stringify 会**原样输出**中文字符 → UTF-8 字节被当
+ * GB18030 解 → 游戏里显示乱码（实测低血量播报变成一串问号）。
+ * Python 侧没这问题，是因为 json.dumps() 默认 ensure_ascii=True 已经替它转义了。
+ * 转义后整包都是 ASCII，Java 的 JSON 解析器再还原回中文，两边都不会错。
+ */
+function asciiEscape(text) {
+  return text.replace(/[^\x00-\x7F]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/**
+ * 跟 bridge 说一句话，拿回一条 JSON。
+ * bridge 是按 JVM 默认编码（中文 Windows 上是 GB18030）写字的，
+ * 所以解码先试 gb18030 再退 utf-8 —— 与 Python 侧 decode_bridge_bytes 同一套策略。
+ */
+export function bridgeCall(cfg, command, params = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const sock = createConnection({ host: cfg.host, port: cfg.port }, () => {
+      const payload = JSON.stringify({
+        id: `mcw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        request_seq: 1,
+        command,
+        params,
+      });
+      sock.write(asciiEscape(payload) + '\n');
+    });
+    let buf = '';
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      try {
+        sock.destroy();
+      } catch {
+        /* ignore */
+      }
+      fn(arg);
+    };
+    sock.on('data', (chunk) => {
+      buf += new TextDecoder('gbk').decode(chunk);
+      const nl = buf.indexOf('\n');
+      if (nl < 0) return;
+      const line = buf.slice(0, nl).trim();
+      if (!line) return;
+      try {
+        done(resolve, JSON.parse(line));
+      } catch (error) {
+        done(reject, error);
+      }
+    });
+    sock.on('error', (error) => done(reject, error));
+    sock.setTimeout(cfg.timeoutMs, () => done(reject, new Error('bridge 响应超时')));
+  });
+}
+
+/** 找最近有写入的会话目录。 */
+export function findLatestSessionId(sessionsRoot) {
+  let best = '';
+  let bestMs = -1;
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const full = join(dir, entry.name);
+      if (entry.name.startsWith('session-')) {
+        // 看目录内【文件】的 mtime —— 目录自身的 mtime 在改文件内容时不会更新，
+        // 只看它会把消息投进几十分钟前的旧会话（踩过：串台）。
+        let ms = 0;
+        try {
+          for (const f of readdirSync(full)) {
+            try {
+              const s = statSync(join(full, f));
+              if (s.mtimeMs > ms) ms = s.mtimeMs;
+            } catch {
+              /* 单个文件读不到就跳过 */
+            }
+          }
+        } catch {
+          /* 目录读不到就跳过 */
+        }
+        if (ms > bestMs) {
+          bestMs = ms;
+          best = entry.name;
+        }
+      } else {
+        walk(full, depth + 1);
+      }
+    }
+  };
+  walk(sessionsRoot, 0);
+  return best;
+}
+
+/** 把一条文本投进当下活着的那个会话，把 agent 叫醒。 */
+export function deliverToSession(ctx, sessionsRoot, text, pinnedSessionId = '') {
+  const agents = ctx.get('agents');
+  if (agents === undefined || typeof agents.get !== 'function') {
+    return { ok: false, why: '拿不到 agents 服务' };
+  }
+  // 配了 pinnedSessionId 就认它（零推测）；没配才去猜「最近写入的那个」。
+  // 必须有明确绑定的会话，否则**拒绝投递**。
+  // 以前这里会退化成「找最近有写入的那个会话」，猜错就把游戏消息送进了别的窗口
+  // （串台，2026-10-13 踩过）。宁可这条消息丢掉并记日志，也不要投错地方。
+  const sessionId = String(pinnedSessionId || '').trim();
+  if (sessionId === '') {
+    return { ok: false, why: '未绑定会话（sessionId 为空），拒绝投递以免串台' };
+  }
+  let handle;
+  try {
+    handle = agents.get(sessionId);
+  } catch (error) {
+    return { ok: false, why: 'agents.get 抛错：' + String((error && error.message) || error) };
+  }
+  if (handle === undefined || handle === null) {
+    return { ok: false, why: `会话 ${sessionId.slice(0, 20)}… 不在活跃列表（窗口没开？）` };
+  }
+  const agent = handle.agent ?? handle;
+  if (typeof agent.followup !== 'function') return { ok: false, why: '这个句柄没有 followup 方法' };
+  const message = {
+    id: `mc-chat-${Date.now()}`,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  };
+  try {
+    agent.followup(message);
+  } catch (error) {
+    return { ok: false, why: 'followup 抛错：' + String((error && error.message) || error) };
+  }
+  return { ok: true, sessionId };
+}
+
+/**
+ * 这个会话的 agent 现在是不是正在跑？（抓取不到就返回 false）
+ *
+ * 为什么要问：`followup()` 是**排队 + 唤醒**语义 —— agent 正在跑长任务时，
+ * 每投一条就多堆一个待处理轮次，等它跑完会一口气看到一串「（游戏态势）…」，
+ * 每个都要回一句「等」，白烧 token 也刷屏（用户 2026-10-15 反馈）。
+ *
+ * `agent.status` 只有两个值，见 dsh-agent-loop 的 `get status()`：
+ *   phase.kind 是 idle/maintenance → 'idle'，其余 → 'running'。
+ * 这也是 DSH 自己的用法（dsh-agent 里 `lookup(sessionId)?.status === 'running'`）。
+ *
+ * 拿不到状态时返回 false —— 宁可多投一条，也不要因为探测失败把消息吞了。
+ */
+export function isAgentRunning(ctx, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (id === '') return false;
+  try {
+    const agents = ctx.get('agents');
+    if (agents === undefined || typeof agents.get !== 'function') return false;
+    const handle = agents.get(id);
+    if (handle === undefined || handle === null) return false;
+    // handle 可能是 AgentHandle（status 挂在 agent 上），也可能自己带 status。
+    return (handle.status ?? handle.agent?.status) === 'running';
+  } catch {
+    return false;
+  }
+}
+
+/** 从 bridge 事件里抽出「谁说了什么」。 */
+export function parseChatEvent(event, ignoreSenders) {
+  const data = event?.data || {};
+  const sender = typeof data.sender === 'string' ? data.sender : '';
+  const raw = typeof data.message === 'string' ? data.message : '';
+  if (sender && ignoreSenders.includes(sender)) return null;
+  // bridge 给的 message 是**整行**（形如 `<xlhl_world> 你好`）。
+  // 有独立 sender 字段时剥掉前缀，没有就原样留着（宁可多带一点也别丢内容）。
+  let text = raw;
+  if (sender) {
+    const prefix = `<${sender}> `;
+    if (raw.startsWith(prefix)) text = raw.slice(prefix.length);
+  }
+  return { sender, raw, text };
+}
+
+/**
+ * 游戏内控制命令词表。
+ *
+ * 前缀特意用中文，不用 `!` —— `!` 会被 Baritone 抢去当命令解析，刷一屏
+ * 「未知或不完整的命令」（与 bridge 侧「唤醒会话」同一个坑）。
+ * 整串匹配（^…$），所以正常说话里的「自主」「态势」不会误触发。
+ */
+const CONTROL_PATTERNS = [
+  {
+    key: 'autonomy',
+    re: /^(?:空闲)?自主(?:任务)?\s*(?:开关)?\s*(开|打开|开启|启用|关|关闭|停|停用|禁用|状态|on|off|status)?$/i,
+  },
+  {
+    key: 'observe',
+    re: /^(?:游戏)?态势(?:提醒|播报)?\s*(?:开关)?\s*(开|打开|开启|启用|关|关闭|停|停用|禁用|状态|on|off|status)?$/i,
+  },
+];
+
+/** 命令里的动作词 → 'on' / 'off' / 'status'（没给动作词 = 查询）。 */
+function parseAction(word) {
+  const w = String(word || '').toLowerCase();
+  if (w === '') return 'status';
+  if (['关', '关闭', '停', '停用', '禁用', 'off'].includes(w)) return 'off';
+  if (['开', '打开', '开启', '启用', 'on'].includes(w)) return 'on';
+  return 'status';
+}
+
+/**
+ * 「这句话是不是控制命令？」是就返回 `{ key, action }`，不是返回 null。
+ * key：autonomy（空闲自主）| observe（态势提醒）；action：on | off | status。
+ */
+export function parseControlCommand(text) {
+  const t = String(text || '').trim();
+  for (const { key, re } of CONTROL_PATTERNS) {
+    const m = re.exec(t);
+    if (m) return { key, action: parseAction(m[1]) };
+  }
+  return null;
+}
+
+export function apply(ctx, input = {}) {
+  const cfg = resolveConfig(input);
+  const { dir } = statePaths(cfg);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    /* 建不出来就只跳过日志 */
+  }
+  const logPath = join(dir, 'watch.log');
+  const sessionsRoot = cfg.sessionsRoot || join(homeDir(), 'sessions');
+
+  const say = (line) => {
+    try {
+      appendFileSync(logPath, `${new Date().toISOString()} ${line}\r\n`);
+    } catch {
+      /* 日志写不了也不能炸 */
+    }
+  };
+
+  // ── 游戏内开关（「自主 关」「态势 开」「自主 状态」）────────────────────
+  // 为什么走游戏内聊天，而不是 DSH 插件页的配置界面：
+  //   DSH 的插件页**不会**从 cordis config 自动生成表单 —— 要由插件自己带
+  //   浏览器半边（browser half）注册 plugins.bundle.config / plugins.row.config
+  //   插槽来画控件（见 dsh-client-modules 的「配置插槽」文档）。本插件是纯 Host
+  //   插件，所以那一页永远是空的（2026-10-15 用户截图确认）。
+  //   于是把开关放到用户能触达的地方 —— MC 聊天栏，一句命令就切，不用改 YAML、
+  //   不用重启 DSH。命令由本插件拦截，不会投给 agent。
+  //
+  // 状态存在 <stateDir>/<key>-switch.txt：文件在 → 听文件的；没有文件 → 跟随
+  // cordis config 里的默认值。删掉文件即恢复配置默认。
+  const switchPaths = {
+    autonomy: join(dir, 'autonomy-switch.txt'),
+    observe: join(dir, 'observe-switch.txt'),
+  };
+  /** 运行时开关的兜底默认值（惰性读 A/O —— 调用时它们一定已经初始化）。 */
+  const switchDefaultOf = (key) => (key === 'autonomy' ? A.enabled : O.enabled);
+
+  const readSwitch = (key) => {
+    let raw;
+    try {
+      raw = readFileSync(switchPaths[key], 'utf8').trim().toLowerCase();
+    } catch {
+      return null; // 没有文件
+    }
+    if (['off', '0', 'false', '关', '关闭'].includes(raw)) return false;
+    if (['on', '1', 'true', '开', '打开'].includes(raw)) return true;
+    return null; // 内容不认 → 当没设过
+  };
+
+  const writeSwitch = (key, on) => {
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(switchPaths[key], on ? 'on' : 'off');
+      return true;
+    } catch (error) {
+      say(`[cmd] 写开关失败：${String((error && error.message) || error)}`);
+      return false;
+    }
+  };
+
+  /** 当前到底开没开：开关文件优先，其次看配置。 */
+  const switchOn = (key) => {
+    const v = readSwitch(key);
+    return v === null ? switchDefaultOf(key) : v;
+  };
+
+  /** 在游戏里回一句话（以 AI 角色身份，会出现在聊天栏）。 */
+  const replyToGame = async (text) => {
+    try {
+      await bridgeCall(cfg, 'chat', { message: text });
+    } catch {
+      /* MC 没开就算了，日志里已经记了 */
+    }
+  };
+
+  const handleControlCommand = async (cmd, parsed) => {
+    const label = cmd.key === 'autonomy' ? '空闲自主' : '态势提醒';
+    if (cmd.action === 'status') {
+      const raw = readSwitch(cmd.key);
+      const shown = raw === null ? switchDefaultOf(cmd.key) : raw;
+      say(`[cmd] ${parsed.sender} 查询「${label}」→ ${shown ? '开' : '关'}${raw === null ? '（配置默认）' : '（游戏内开关）'}`);
+      await replyToGame(`[${label}] 现在是「${shown ? '开' : '关'}」`);
+      return;
+    }
+    const on = cmd.action === 'on';
+    if (!writeSwitch(cmd.key, on)) {
+      await replyToGame(`[${label}] 切换失败，看插件日志`);
+      return;
+    }
+    say(`[cmd] ${parsed.sender} 把「${label}」改成 ${on ? '开' : '关'}（${switchPaths[cmd.key]}）`);
+    await replyToGame(`[${label}] 已${on ? '开启' : '关闭'}`);
+  };
+
+  /** null = 还没定起点（首轮先取 latest_seq，不拉历史消息）。 */
+  let cursor = null;
+  let busy = false;
+
+  // ── 主动说话引擎的状态 ──────────────────────────────────────────────
+  // 混合模式：急事（血少/天黑/饿）直接用模板播报，零 token 零延迟；
+  // 能聊的（挖到宝贝/跟丢/久无对话）才唤醒 agent 组织语言。
+  const P = {
+    enabled: input.proactive !== false,
+    seconds: Math.max(2, Number(input.proactiveSeconds) || 6),
+    maxPerHour: Math.max(1, Number(input.maxPerHour) || 8),
+    secondsPerHour: 3600_000,
+    lowHealth: Number(input.lowHealthThreshold) || 6,
+    lostDistance: Number(input.lostDistance) || 30,
+    playerName: input.watchPlayer || 'xlhl_world',
+    cooldowns: {
+      lowHealth: 120_000,
+      nightfall: 600_000,
+      hungry: 300_000,
+      valuable: 300_000,
+      lostPlayer: 180_000,
+      idleChat: 900_000,
+    },
+    valuableItems: Array.isArray(input.valuableItems) && input.valuableItems.length
+      ? input.valuableItems
+      : ['diamond', 'emerald', 'iron_ingot', 'gold_ingot', 'netherite_scrap', 'ancient_debris'],
+  };
+
+  const firedAt = {};        // 各类上次触发时刻
+  const firedLog = [];       // 最近触发的时刻，用来算每小时上限
+  let lastInventory = null;  // 上次背包计数快照
+  let lastNight = null;      // 上次是否夜晚
+  let lastHumanChatAt = Date.now(); // 玩家上次说话
+
+  const canFire = (kind) => {
+    const now = Date.now();
+    while (firedLog.length && firedLog[0] < now - P.secondsPerHour) firedLog.shift();
+    if (firedLog.length >= P.maxPerHour) return false;
+    if (firedAt[kind] && now - firedAt[kind] < P.cooldowns[kind]) return false;
+    return true;
+  };
+  const markFired = (kind) => {
+    const now = Date.now();
+    firedAt[kind] = now;
+    firedLog.push(now);
+  };
+  const speakTemplate = async (kind, lines) => {
+    const text = lines[Math.floor(Math.random() * lines.length)];
+    try {
+      await bridgeCall(cfg, 'chat', { message: text });
+      markFired(kind);
+      say(`[proactive] ${kind} → 模板播报「${text}」`);
+      return true;
+    } catch (error) {
+      say(`[proactive] ${kind} 播报失败：${String((error && error.message) || error)}`);
+      return false;
+    }
+  };
+  const wakeAgent = (situation) => {
+    const text =
+      `（游戏内事件，需要你主动开口）${situation}\n` +
+      `请用 mcp__baritone__say 工具在游戏里说一句自然、简短的话（别解释、别播报工具名）。`;
+    const r = deliverToSession(ctx, sessionsRoot, text, effectiveSessionId);
+    say(`[proactive] 唤醒 agent：${r.ok ? '已进会话' : `失败(${r.why})`}`);
+    return r;
+  };
+
+  const TEMPLATES = {
+    lowHealth: ['我快没血了！', '撑不住了，得躲一下…', '救命，血好少'],
+    nightfall: ['天黑了，小心怪物', '晚上了，别乱跑啊', '天暗了，要回屋吗'],
+    hungry: ['我饿了，得找点吃的', '肚子咕咕叫…'],
+  };
+
+  // 目标会话的优先级：游戏里 !waken 设的 > 配置文件 sessionId > 自动挑最近活跃的。
+  // 玩家能在游戏里随时改，不用回来动配置文件。
+  let effectiveSessionId = String(cfg.sessionId || '').trim();
+  let sessionSyncedAt = 0;
+  const syncSessionFromGame = async (force = false) => {
+    const now = Date.now();
+    if (!force && now - sessionSyncedAt < 10000) return;
+    sessionSyncedAt = now;
+    try {
+      const r = await bridgeCall(cfg, 'get_waken_session', {});
+      const fromGame = String((r && r.data && r.data.session_id) || '').trim();
+      if (fromGame && fromGame !== effectiveSessionId) {
+        effectiveSessionId = fromGame;
+        say(`[session] 游戏侧指定了唤醒会话：${fromGame}`);
+      }
+    } catch {
+      /* bridge 不在就沿用上一次的值 */
+    }
+  };
+
+  const tick = async () => {
+    if (!cfg.enabled) return;
+    if (busy) return; // 上一轮还没回来就跳过，别堆积
+    busy = true;
+    try {
+      // 顺手同步目标会话（游戏里可能刚被别人敲 !waken 改过）
+      await syncSessionFromGame();
+      const afterSeq = cursor === null ? 0 : cursor;
+      const result = await bridgeCall(cfg, 'get_events', {
+        after_seq: afterSeq,
+        type: 'chat',
+        limit: 50,
+      });
+      const latest = Number(result?.data?.latest_seq ?? result?.latest_seq ?? 0);
+
+      if (cursor === null) {
+        cursor = latest;
+        say(`[init] 起点 latest_seq=${cursor}（不拉历史）`);
+        return;
+      }
+
+      const events = Array.isArray(result?.data?.events)
+        ? result.data.events
+        : Array.isArray(result?.events)
+          ? result.events
+          : [];
+
+      let delivered = 0;
+      for (const event of events) {
+        const parsed = parseChatEvent(event, cfg.ignoreSenders);
+        if (!parsed || !parsed.text) continue;
+        lastHumanChatAt = Date.now(); // 有人说话 → 闲聊计时重来
+        // 游戏内控制命令：只当开关用，不投给 agent、不占投递配额。
+        const control = parseControlCommand(parsed.text);
+        if (control) {
+          await handleControlCommand(control, parsed);
+          continue;
+        }
+        if (delivered >= cfg.maxPerTick) break;
+        const line = `（游戏内聊天）${parsed.sender || '某人'}：${parsed.text}`;
+        const sent = deliverToSession(ctx, sessionsRoot, line, effectiveSessionId);
+        delivered += 1;
+        say(
+          `[fire] ${line} → 投递=${sent.ok ? `已进会话 ${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
+        );
+      }
+
+      if (latest > cursor) cursor = latest;
+    } catch (error) {
+      // bridge 没起、MC 没开，都会走到这 —— 静默跳过，等下一轮。
+      say(`[tick] bridge 不可达：${String((error && error.message) || error)}`);
+    } finally {
+      busy = false;
+    }
+  };
+
+  say(
+    `[apply] 聊天监听起来了：${cfg.host}:${cfg.port} 每 ${cfg.tickSeconds}s 一次；忽略 ${cfg.ignoreSenders.join('/')}`,
+  );
+  const stop = ctx.interval(tick, cfg.tickSeconds * 1000);
+
+  // ── 主动说话引擎主循环 ──────────────────────────────────────────────
+  let proBusy = false;
+  const proactiveTick = async () => {
+    if (!P.enabled || proBusy) return;
+    proBusy = true;
+    try {
+      const st = await bridgeCall(cfg, 'get_state', {});
+      const s = (st && st.data) || {};
+      const health = Number(s.health ?? 20);
+      const food = Number(s.food_level ?? 20);
+      const pos = s.position || {};
+
+      // ① 血少 → 模板，立刻说
+      if (health > 0 && health <= P.lowHealth && canFire('lowHealth')) {
+        await speakTemplate('lowHealth', TEMPLATES.lowHealth);
+      }
+
+      // ② 天黑 —— 只在白天→夜晚那一次转换上触发，不是整夜循环
+      const wt = Number(s.world_time ?? 0);
+      const isNight = wt % 24000 >= 13000 && wt % 24000 < 23000;
+      if (lastNight !== null && isNight && !lastNight && canFire('nightfall')) {
+        await speakTemplate('nightfall', TEMPLATES.nightfall);
+      }
+      lastNight = isNight;
+
+      // ③ 饿 → 模板
+      if (food >= 0 && food <= 6 && canFire('hungry')) {
+        await speakTemplate('hungry', TEMPLATES.hungry);
+      }
+
+      // ④ 背包新增贵重物 → 唤醒 agent 组织语言
+      try {
+        const inv = await bridgeCall(cfg, 'get_inventory', {});
+        const counts = {};
+        for (const it of (inv && inv.data && inv.data.inventory) || []) {
+          if (!it.count) continue;
+          const id = String(it.id || '').replace('minecraft:', '');
+          counts[id] = (counts[id] || 0) + it.count;
+        }
+        if (lastInventory) {
+          for (const id of P.valuableItems) {
+            const gained = (counts[id] || 0) - (lastInventory[id] || 0);
+            if (gained > 0 && canFire('valuable')) {
+              const zh =
+                {
+                  diamond: '钻石',
+                  emerald: '绿宝石',
+                  iron_ingot: '铁锭',
+                  gold_ingot: '金锭',
+                  netherite_scrap: '下界合金碎片',
+                  ancient_debris: '远古残骸',
+                }[id] || id;
+              markFired('valuable');
+              wakeAgent(`你刚挖到 ${zh} x${gained}。`);
+              break;
+            }
+          }
+        }
+        lastInventory = counts;
+      } catch (error) {
+        say(`[proactive] 查背包失败：${String((error && error.message) || error)}`);
+      }
+
+      // ⑤ 跟丢 → 唤醒 agent
+      if (canFire('lostPlayer')) {
+        try {
+          const ents = await bridgeCall(cfg, 'get_entities', { radius: 64 });
+          const list = (ents && ents.data && ents.data.entities) || [];
+          // 实测结构：{ type:"minecraft:player", name, distance, position:{x,y,z} }
+          //   · name 是显示名，不一定是账号名
+          //   · bridge 已经给了 distance，优先用
+          //   · 坐标在 position 子对象里 —— 第一版我读 e.x/e.z 得到 undefined（当 0 用），
+          //     于是人贴脸上也算出四五十格，一直误报跟丢。
+          const other = list.find((e) => {
+            const t = String(e.type || e.entity_type || '');
+            if (!t.includes('player')) return false;
+            return String(e.name || '') !== 'DeepSeek'; // 排除自己
+          });
+          if (other) {
+            let dist = Number(other.distance);
+            if (!Number.isFinite(dist)) {
+              const o = other.position || {};
+              const dx = Number(o.x ?? 0) - Number(pos.x ?? 0);
+              const dz = Number(o.z ?? 0) - Number(pos.z ?? 0);
+              dist = Math.hypot(dx, dz);
+            }
+            if (dist > P.lostDistance) {
+              markFired('lostPlayer');
+              wakeAgent(
+                `玩家 ${String(other.name || P.playerName)} 离你约 ${Math.round(dist)} 格，你可能跟丢了。`,
+              );
+            }
+          }
+        } catch {
+          /* get_entities 不可用就跳过这一条 */
+        }
+      }
+
+      // ⑥ 久无对话 → 唤醒 agent 闲聊
+      if (Date.now() - lastHumanChatAt > P.cooldowns.idleChat && canFire('idleChat')) {
+        markFired('idleChat');
+        wakeAgent('已经很久没人说话了。');
+      }
+    } catch (error) {
+      say(`[proactive] 出错：${String((error && error.message) || error)}`);
+    } finally {
+      proBusy = false;
+    }
+  };
+
+  if (P.enabled) {
+    const stopPro = ctx.interval(proactiveTick, P.seconds * 1000);
+    ctx.effect(() => () => {
+      if (typeof stopPro === 'function') stopPro();
+    });
+    say(
+      `[apply] 主动说话引擎开了：每 ${P.seconds}s 查一次，上限 ${P.maxPerHour} 次/小时；` +
+        `血<=${P.lowHealth}/天黑/饿 → 模板播报；挖到宝贝/跟丢/久无话 → 唤醒 agent`,
+    );
+  } else {
+    say('[apply] 主动说话引擎关了（proactive: false）');
+  }
+
+  // ── 观察模式：把游戏态势交给 agent，由它自己判断要不要动 ──────────
+  // 和 proactive 的分工：proactive 是「按写死的规则替你决定要不要开口」；
+  // 这里是把态势原样交出去，由 agent 判断。代价是每交一次就跑一轮 LLM。
+  const O = {
+    enabled: input.observe === true,
+    seconds: Math.max(3, Number(input.observeSeconds) || 5),
+    // changed = 态势真的变了才叫醒（站着不动时不烧钱）
+    // always  = 每轮都交（响应最全，代价最大）
+    mode: input.observeMode === 'always' ? 'always' : 'changed',
+    minWakeSeconds: Math.max(3, Number(input.minWakeSeconds) || 10),
+    maxWakePerHour: Math.max(1, Number(input.maxWakePerHour) || 120),
+  };
+
+  let lastSnapshot = '';
+  let lastWakeAt = 0;
+  const observeLog = [];
+  let obsBusy = false;
+
+  // ── 值得一提的低频事件（死亡/受伤/遭攻击/天气/维度）───────────────
+  // 为什么不让观察周期自己去拉：事件缓冲 TTL 只有 300 秒、上限 2048 条，
+  // 高频事件滚动很快，180 秒才拉一次容易漏。这里 5 秒轮一个类型，
+  // 每个类型 30 秒覆盖一次，稳稳落在 TTL 内。
+  //
+  // ⚠ 必须走游标模式（带 after_seq）。bridge 的 get_events 不带游标时走
+  //   pollEvents()，那里有 iterator.remove()，会把事件从缓冲区**抽走** ——
+  //   连聊天事件都会被抢掉。带游标才是纯读。
+  const NOTABLE = [
+    ['DEATH', (d) => `☠死了(${Math.round(Number(d.x))},${Math.round(Number(d.y))},${Math.round(Number(d.z))})`],
+    ['RESPAWN', () => '↻已重生'],
+    [
+      'DAMAGE',
+      (d) =>
+        `⚠受伤-${Math.round(Number(d.amount) || 0)}` +
+        (d.attacker_type ? `(${String(d.attacker_type).replace('minecraft:', '')})` : ''),
+    ],
+    ['ENTITY_ATTACK', () => '⚔遭攻击'],
+    ['WEATHER_CHANGE', (d) => `天气:${d.weather_type || '?'}`],
+    ['DIMENSION_CHANGE', () => '⇒换维度'],
+  ];
+  const notableCursors = new Map();
+  let notableSeeded = false;
+  let notableIdx = 0;
+  const pendingNotable = [];
+
+  const notableTick = async () => {
+    if (!O.enabled) return;
+    try {
+      // 首轮只探测"当前末尾"，避免把开启之前的陈年事件倒出来
+      if (!notableSeeded) {
+        const probe = await bridgeCall(cfg, 'get_events', { after_seq: 0, limit: 1 });
+        const latest = Number((probe && probe.data && probe.data.latest_seq) ?? 0);
+        for (const [t] of NOTABLE) notableCursors.set(t, latest);
+        notableSeeded = true;
+        return;
+      }
+      const [type, render] = NOTABLE[notableIdx % NOTABLE.length];
+      notableIdx += 1;
+      const cursor = notableCursors.get(type) ?? 0;
+      const r = await bridgeCall(cfg, 'get_events', { after_seq: cursor, type, limit: 5 });
+      const data = (r && r.data) || {};
+      const events = Array.isArray(data.events) ? data.events : [];
+      for (const ev of events) pendingNotable.push(render(ev.data || {}));
+      notableCursors.set(type, Number(data.latest_seq ?? cursor));
+      while (pendingNotable.length > 8) pendingNotable.shift();
+    } catch {
+      /* bridge 不在就下一轮再说 */
+    }
+  };
+
+  if (O.enabled) {
+    const stopNotable = ctx.interval(notableTick, 5000);
+    ctx.effect(() => () => {
+      if (typeof stopNotable === 'function') stopNotable();
+    });
+  }
+
+  /** 把当前局面压成一行紧凑文本（越短越省 token）。 */
+  const snapshotGame = async () => {
+    const st = await bridgeCall(cfg, 'get_state', {});
+    const s = (st && st.data) || {};
+    // 数据完整性校验。bridge 在玩家未加载 / 刚重生 / 连接抖动的瞬间会返回一堆
+    // 默认值——位置(0,0,0)、血0、饿 NaN。照单全收发出去只会误导判断（用户原话：
+    // 「找不到就不发，降级处理容易串台」），所以这里直接抛错，让本轮整轮跳过。
+    const pos = s.position;
+    const health = Number(s.health);
+    const food = Number(s.food_level);
+    const posOk =
+      pos &&
+      Number.isFinite(Number(pos.x)) &&
+      Number.isFinite(Number(pos.y)) &&
+      Number.isFinite(Number(pos.z)) &&
+      !(Number(pos.x) === 0 && Number(pos.y) === 0 && Number(pos.z) === 0);
+    if (!posOk || !Number.isFinite(health) || !Number.isFinite(food)) {
+      throw new Error(
+        `get_state 数据不完整，跳过本轮（health=${s.health} food=${s.food_level} pos=${JSON.stringify(pos)}）`,
+      );
+    }
+    const wt = Number(s.world_time ?? 0) % 24000;
+    const bits = [
+      `位置(${Math.round(Number(pos.x))},${Math.round(Number(pos.y))},${Math.round(Number(pos.z))})`,
+      `血${Math.round(health)}/20`,
+      `饿${food}`,
+      wt >= 13000 && wt < 23000 ? '夜晚' : '白天',
+      Number(s.is_pathing) ? '寻路中' : '待命',
+    ];
+    try {
+      const inv = await bridgeCall(cfg, 'get_inventory', {});
+      const items = ((inv && inv.data && inv.data.inventory) || [])
+        .filter((i) => i.count > 0)
+        .map((i) => `${String(i.id || '').replace('minecraft:', '')}x${i.count}`);
+      bits.push(`背包[${items.join(' ') || '空'}]`);
+    } catch {
+      /* 查不到就略过 */
+    }
+    try {
+      const ents = await bridgeCall(cfg, 'get_entities', { radius: 32 });
+      const list = (ents && ents.data && ents.data.entities) || [];
+      const players = list.filter(
+        (e) => String(e.type || '').includes('player') && String(e.name || '') !== 'DeepSeek',
+      );
+      // 只报「会动、可能有威胁」的活物，把鱼/蝙蝠这类噪音滤掉
+      const NOISE = ['cod', 'salmon', 'tropical_fish', 'bat', 'item', 'experience_orb'];
+      const mobs = list.filter((e) => {
+        const t = String(e.type || '');
+        if (!e.is_living || t.includes('player')) return false;
+        return !NOISE.some((n) => t.includes(n));
+      });
+      if (players.length) {
+        bits.push(
+          `玩家:${players.map((p) => `${p.name}(${Math.round(Number(p.distance) || 0)}格)`).join(',')}`,
+        );
+      }
+      if (mobs.length) {
+        bits.push(
+          `活物:${mobs
+            .slice(0, 4)
+            .map((m) => `${String(m.type || '').replace('minecraft:', '')}(${Math.round(Number(m.distance) || 0)}格)`)
+            .join(',')}`,
+        );
+      }
+    } catch {
+      /* 略 */
+    }
+    if (pendingNotable.length) {
+      bits.push(pendingNotable.splice(0).join(' '));
+    }
+    return bits.join(' ');
+  };
+
+  // 会话正忙时把态势攒在这里，只留最新一条（见 isAgentRunning 的注释）。
+  let pendingObserve = null;
+
+  const observeTick = async () => {
+    // 配置只是默认值，游戏内「态势 关/开」随时覆盖（关着时这里只读一个小文件就返回）。
+    if (!switchOn('observe') || obsBusy) return;
+    obsBusy = true;
+    try {
+      let snap;
+      try {
+        snap = await snapshotGame();
+      } catch {
+        return; // MC 没开 / bridge 断了，静默跳过
+      }
+      const changed = snap !== lastSnapshot;
+      lastSnapshot = snap;
+      if (O.mode === 'changed' && !changed) return;
+
+      const now = Date.now();
+      while (observeLog.length && observeLog[0] < now - 3600_000) observeLog.shift();
+      if (observeLog.length >= O.maxWakePerHour) return;
+      if (now - lastWakeAt < O.minWakeSeconds * 1000) return;
+
+      // 会话正忙：不排队、不唤醒，只把最新态势攒着（覆盖旧的）。
+      // 忙的时候投递不解决问题，只会在它跑完之后堆出一串「等」。
+      if (isAgentRunning(ctx, effectiveSessionId)) {
+        pendingObserve = { snap, count: (pendingObserve ? pendingObserve.count : 0) + 1 };
+        lastWakeAt = now; // 占住节奏位，免得 agent 一闲下来就被补投一串
+        say(`[observe] agent 正忙，暂存态势（累计 ${pendingObserve.count} 次）`);
+        return;
+      }
+
+      const carried = pendingObserve;
+      pendingObserve = null;
+      lastWakeAt = now;
+      observeLog.push(now);
+
+      const r = deliverToSession(
+        ctx,
+        sessionsRoot,
+        `（游戏态势）${snap}\n` +
+          (carried ? `（我忙的时候态势变了 ${carried.count} 次，上面这条是最新的）\n` : '') +
+          `需要操作就直接调工具去做（说话 mcp__baritone__say；血/饿低就吃东西 mcp__baritone__eat；` +
+          `跟随 mcp__baritone__follow_player；挖矿 mcp__baritone__mine_quantity）；` +
+          `不需要操作就只回一个「等」字，别多说。详细判断表在工作区 游戏态势应对手册.md。`,
+        effectiveSessionId,
+      );
+      say(`[observe] ${snap} → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
+    } finally {
+      obsBusy = false;
+    }
+  };
+
+  {
+    // interval 常驻：运行时的「态势 关/开」要能重新打开它，所以注册与否不能只看配置。
+    const stopObs = ctx.interval(observeTick, O.seconds * 1000);
+    ctx.effect(() => () => {
+      if (typeof stopObs === 'function') stopObs();
+    });
+    say(
+      `[apply] 态势观察：配置=${O.enabled ? '开' : '关'}，当前=${switchOn('observe') ? '开' : '关'}；` +
+        `每 ${O.seconds}s 采一次，mode=${O.mode}，最短 ${O.minWakeSeconds}s 交一次，` +
+        `上限 ${O.maxWakePerHour} 次/小时；游戏内打「态势 关/开/状态」切换`,
+    );
+  }
+
+  // ── 空闲自主：角色闲下来就交一次「自主时间」，goal 由 agent 自己定 ──
+  // 和 observe 的分工：observe 盯的是**世界**（态势变了才叫醒）；
+  // 这里盯的是**角色自己** —— 只要它闲着（没在寻路）超过 idleSeconds 就交一次，
+  // goal 完全交给 agent 决定（用户原话：「goal可以是任何事情，只要当前处于
+  // 空闲状态就可以，完全由 AI 自行决定」）。
+  //
+  // 时序上刻意保守：交出去之后立刻把 lastBusyAt 拉回 now，避免 agent 还在
+  // 干活（比如等 mine_quantity 挖完）时被连环叫醒。
+  const A = {
+    enabled: input.autonomy === true,
+    tickSeconds: Math.max(10, Number(input.autonomyTickSeconds) || 20),
+    idleSeconds: Math.max(30, Number(input.autonomyIdleSeconds) || 120),
+    minGapSeconds: Math.max(60, Number(input.autonomyMinGapSeconds) || 300),
+    maxPerHour: Math.max(1, Number(input.autonomyMaxPerHour) || 6),
+  };
+
+  const { dir: autonomyDir } = statePaths(cfg);
+  const autonomyGoalFile = join(autonomyDir, 'autonomy-goal.txt');
+
+  /** 读 agent 上次给自己定的 goal。空串 = 还没定过（让它自己挑一个）。 */
+  const readAutonomyGoal = () => {
+    try {
+      return readFileSync(autonomyGoalFile, 'utf8').trim();
+    } catch {
+      return '';
+    }
+  };
+
+  let lastBusyAt = Date.now();
+  let lastAutonomyAt = 0;
+  const autonomyLog = [];
+  let autoBusy = false;
+
+  const autonomyTick = async () => {
+    // 配置只是默认值，游戏内「自主 关/开」随时覆盖（用户要的就是"操作时能随手关掉"）。
+    if (!switchOn('autonomy') || autoBusy) return;
+    autoBusy = true;
+    try {
+      // 空闲判定走 get_state 的 is_pathing（bridge 直接给的布尔），
+      // 不用 snapshotGame() —— 那个是给人看的一行文本摘要，拿不到结构化字段。
+      let s;
+      try {
+        const st = await bridgeCall(cfg, 'get_state', {});
+        s = (st && st.data) || {};
+      } catch {
+        return; // bridge 不在 / MC 没开，静默跳过
+      }
+      const pos = s.position;
+      if (!pos || !Number.isFinite(Number(pos.x)) || Number(s.health) <= 0) return;
+
+      const now = Date.now();
+      if (Number(s.is_pathing)) {
+        lastBusyAt = now;
+        return;
+      }
+      // 角色静止 ≠ 会话空闲：agent 可能正在算配方、查背包、等熔炉烧完。
+      // 它正忙着就别叫 —— 它本来就在干活，再叫只会多堆一个待处理轮次。
+      if (isAgentRunning(ctx, effectiveSessionId)) {
+        lastBusyAt = now;
+        return;
+      }
+      const idleFor = now - lastBusyAt;
+      if (idleFor < A.idleSeconds * 1000) return;
+
+      while (autonomyLog.length && autonomyLog[0] < now - 3600_000) autonomyLog.shift();
+      if (autonomyLog.length >= A.maxPerHour) return;
+      if (now - lastAutonomyAt < A.minGapSeconds * 1000) return;
+      lastAutonomyAt = now;
+      lastBusyAt = now; // 交出去就重新计时，别连环叫
+      autonomyLog.push(now);
+
+      let snap = '';
+      try {
+        snap = await snapshotGame();
+      } catch {
+        snap = `位置(${Math.round(Number(pos.x))},${Math.round(Number(pos.y))},${Math.round(Number(pos.z))})`;
+      }
+      const goal = readAutonomyGoal();
+
+      const r = deliverToSession(
+        ctx,
+        sessionsRoot,
+        `（空闲自主时间）${snap}\n` +
+          (goal
+            ? `你上次给自己定的 goal：${goal}\n`
+            : '你还没有定 goal。\n') +
+          '现在角色闲着。请自己决定要做什么——继续推进上面的 goal，或者换一个。\n' +
+          '做法：直接调工具（查背包 mcp__baritone__get_inventory；挖矿 mcp__baritone__mine_quantity；' +
+          '合成 mcp__baritone__craft；熔炼 mcp__baritone__smelt_items；种地 mcp__baritone__farm；' +
+          '找玩家 mcp__baritone__get_entities；说话 mcp__baritone__say）。\n' +
+          `缺料就先向玩家要，要不到再自己去挖/烧。定好 goal 就把一句话写进 ${autonomyGoalFile}` +
+          '——换目标就覆盖，做完了就清空。这一轮什么都不想做，就只回一个「等」字。\n' +
+          '详细判断表见工作区 空闲自主行为手册.md。',
+        effectiveSessionId,
+      );
+      say(`[autonomy] 空闲 ${Math.round(idleFor / 1000)}s → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
+    } finally {
+      autoBusy = false;
+    }
+  };
+
+  {
+    // interval 常驻：运行时的「自主 开」要能把它重新打开，所以注册与否不能只看配置。
+    const stopAuto = ctx.interval(autonomyTick, A.tickSeconds * 1000);
+    ctx.effect(() => () => {
+      if (typeof stopAuto === 'function') stopAuto();
+    });
+    say(
+      `[apply] 空闲自主：配置=${A.enabled ? '开' : '关'}，当前=${switchOn('autonomy') ? '开' : '关'}；` +
+        `每 ${A.tickSeconds}s 看一次，闲 ${A.idleSeconds}s 交一次，` +
+        `间隔>=${A.minGapSeconds}s，上限 ${A.maxPerHour} 次/小时；goal 文件 ${autonomyGoalFile}；` +
+        `游戏内打「自主 关/开/状态」切换`,
+    );
+  }
+
+  // 自检：确认真的能读到 agent.status。读不到时 isAgentRunning 一律返回 false
+  // （退回"照常投递"的旧行为），那种情况必须在日志里看见，而不是悄悄失效。
+  try {
+    const agents = ctx.get('agents');
+    const id = String(effectiveSessionId || '').trim();
+    const handle = agents && typeof agents.get === 'function' ? agents.get(id) : undefined;
+    say(
+      `[apply] 忙闲探测：agents=${agents ? 'yes' : 'no'} handle=${handle ? 'yes' : 'no'} ` +
+        `status=${handle ? String(handle.status ?? handle.agent?.status) : 'n/a'}`,
+    );
+  } catch (error) {
+    say(`[apply] 忙闲探测失败：${String((error && error.message) || error)}`);
+  }
+
+  ctx.effect(() => () => {
+    if (typeof stop === 'function') stop();
+    say('[stop] 聊天监听停了');
+  });
+}

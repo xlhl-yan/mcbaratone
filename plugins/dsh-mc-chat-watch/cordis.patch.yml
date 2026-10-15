@@ -1,0 +1,77 @@
+# dsh-mc-chat-watch 的 bundle patch。
+# 带 config 的 patch 改动后要重启一次 DSH 才装载。
+- insert:
+    - id: mc-chat-watch
+      name: dsh-mc-chat-watch
+      config:
+        enabled: true
+        # AI 客户端 bridge 的端口（那个客户端用 -Dbaritone.bridge.port=5556 启动）
+        host: '127.0.0.1'
+        port: 5556
+        # 事件驱动：每 3 秒看一眼有没有新聊天，有新话才唤醒 agent。
+        tickSeconds: 3
+        # AI 自己说的话不要把自己吵醒。
+        ignoreSenders:
+          - DeepSeek
+        # 单轮最多投递几条，防刷屏。
+        maxPerTick: 10
+        # 日志目录。留空 = <DSH_HOME>/mc-chat-watch
+        stateDir: ''
+        # 找「最近有写入的会话」的根目录。留空 = <DSH_HOME>/sessions
+        sessionsRoot: ''
+        # 固定把游戏消息投给这个会话 —— 零推测，不会再串到别的窗口。
+        # 留空 = 自动挑最近有写入的那个（会猜错，2026-10-13 踩过）。
+        # 换窗口后要改这里：用 工具\查会话.cjs 列出来挑。
+        sessionId: 'session-2fb38d20-35da-4799-9950-c590b44b282b'
+        device: '【PC】'
+
+        # ── 主动说话引擎（规则版）已停用 ────────────────────────────
+        # 2026-10-13: observe 模式上线后关掉它。两套都在盯血量/天黑/跟丢，
+        # 会同一件事说两遍，而且规则不看时机（讨论到一半也插话）。
+        # 现在「要不要开口、什么时候开口」全部交给 agent 自己判断。
+        proactive: false
+        proactiveSeconds: 6
+        # 总闸：每小时最多主动开口几次（防话痨）。
+        maxPerHour: 8
+        lowHealthThreshold: 6
+        lostDistance: 30
+        # 盯着的玩家（跟丢判断用）。
+        watchPlayer: xlhl_world
+        # 哪些物品算「值得炫耀」。可以自己加。
+        valuableItems:
+          - diamond
+          - emerald
+          - iron_ingot
+          - gold_ingot
+          - netherite_scrap
+          - ancient_debris
+
+        # ── 观察模式：每 N 秒把游戏态势交给 agent，由它自己判断要不要动 ──
+        # WARNING: every hand-off runs a full LLM turn. mode: always keeps
+        # burning tokens even while you idle. Prefer 'changed'.
+        observe: true
+        # 2026-10-13: 用户反馈 5 秒太频繁，改成 3 分钟一次。
+        observeSeconds: 180
+        # changed = only hand off when the situation actually changed (default)
+        # always  = hand off every tick (fullest coverage, highest cost)
+        observeMode: changed
+        # floor between two hand-offs, and an hourly ceiling
+        minWakeSeconds: 30
+        maxWakePerHour: 40
+
+        # ── 空闲自主：角色闲下来就交一次「自主时间」，goal 由 agent 自己定 ──
+        # 用户原话（2026-10-15）：「在AI控制的角色闲置时，可以自行设定任务，
+        # 比如去烧点铁去做个铁套…… goal可以是任何事情，只要当前处于空闲状态
+        # 就可以，完全由 AI 自行决定」。
+        # 和 observe 的分工：observe 盯**世界**（态势变了才叫醒），这里盯
+        # **角色自己**（闲着超过 autonomyIdleSeconds 就叫一次）。
+        # 判断表在工作区 空闲自主行为手册.md；goal 存在 <stateDir>/autonomy-goal.txt。
+        autonomy: true
+        # 多久看一次「角色忙不忙」（秒）。
+        autonomyTickSeconds: 20
+        # 连续闲满这么久（秒）才交。太短会在玩家刚站定时就插话。
+        autonomyIdleSeconds: 120
+        # 两次自主时间之间至少隔这么久（秒）—— 花费的主要闸门。
+        autonomyMinGapSeconds: 300
+        # 每小时最多交几次。
+        autonomyMaxPerHour: 6

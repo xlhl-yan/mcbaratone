@@ -1,0 +1,33 @@
+{
+  "name": "dsh-mc-chat-watch",
+  "version": "0.1.0",
+  "description": "DSH 插件：盯住 Minecraft 游戏内聊天，一有新消息就把 agent 叫醒（事件驱动，不是定时开口）",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "minecraft",
+    "chat",
+    "wake"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

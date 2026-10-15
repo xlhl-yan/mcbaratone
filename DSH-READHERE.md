@@ -17,6 +17,7 @@
 | **Minecraft + Fabric Loader** | bridge 面向 **26.2** | 客户端侧运行环境 |
 | **Baritone（Fabric 版）** | 见 `bridge/libs/README.md` | **bridge 是 Baritone 的桥，没有它必崩** |
 | **Fabric API** | 与 MC 版本匹配 | 事件 API 依赖 |
+| **DSH 侧插件** | 随本仓库 `plugins/` 提供 | 盯游戏内聊天、叫醒 agent（少了它就只有工具面、没有陪玩 —— 见 §3.7）|
 
 **先跑这几条确认：**
 
@@ -169,6 +170,31 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 
 **然后重启 DSH。**
 
+### 3.7 装 DSH 侧的配套插件
+
+bridge 只负责"看"和"动"，**叫醒 agent** 这件事由 DSH 侧插件做：本仓库的
+`<REPO>\plugins\dsh-mc-chat-watch`（盯游戏内聊天 → 把话投进绑定的会话；另含游戏态势与空闲自主）。
+少了它就只有"工具面"、没有"陪玩"。
+
+1. 把插件目录拷到 DSH 能长期访问的位置（例如 `E:\dsh-plugins\dsh-mc-chat-watch`）；
+2. 在 `<DSH_HOME>\profiles\<profile>\package.json` 里补**两处**：`dependencies` 加
+   `"dsh-mc-chat-watch": "link:<插件目录>"`，**并且** `dsh.profile.bundles` 数组里加上
+   `dsh-mc-chat-watch`；
+3. 重启 DSH。
+
+> ⚠️ **`dependencies` ≠ 装载。** 只在 dependencies 里写了、bundles 里漏了，插件会被完全跳过，
+> 日志里连 `[apply]` 都不出现（本项目真踩过）。
+
+**验收**：`<DSH_HOME>\mc-chat-watch\watch.log` 里出现
+
+```
+[apply] 聊天监听起来了：127.0.0.1:5556 每 3s 一次；忽略 DeepSeek
+[apply] 空闲自主：配置=开，当前=开；… 游戏内打「自主 关/开/状态」切换
+```
+
+> **游戏内开关是聊天文本**（`自主 关`、`态势 关`），**不是 `/` 命令** —— 为什么、代价是什么，
+> 见 `<REPO>\plugins\dsh-mc-chat-watch\README.md` 的「一、游戏内命令」。
+
 ---
 
 ## 4. 验收清单（逐项打勾）
@@ -210,6 +236,14 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 - 值存于 `<MC_GAME_DIR>\config\mcbaratone-waken-session.txt`
 
 > **前缀特意用中文**：`!` 会被 Baritone 抢去当命令解析，刷出一屏「未知或不完整的命令」。
+
+> **为什么是聊天文本，不是 `/` 命令**：MC 的 `/` 输入走**服务端命令通道**（客户端把整串交给
+> 服务端解析），本地只剩「未知的命令」这类系统消息；而 bridge 是**客户端 mod**，只监听
+> `ClientReceiveMessageEvents` 的 GAME / CHAT 频道 —— **拿不到自己发出命令的原始参数**。
+> 要真做成 `/` 命令得注册 Fabric 客户端命令（`ClientCommandRegistrationCallback`），
+> 代价是重编译 jar + 两个客户端换包 + 重启客户端；本 fork 权衡后保留聊天文本嗅探，
+> 换「零编译、改一句话就能用」。**代价如实说清**：没有 tab 补全，手滑打成
+> `/唤醒会话 xxx` 不生效（会被服务端回一句「未知的命令」）。
 
 **⚠️ 这条命令只在 DSH 侧有配套投递插件时才有意义。** 该插件不在本仓库（属于 DSH 侧集成），
 它做两件事：轮询聊天事件 → 把消息投进指定的**活跃会话**。
@@ -272,6 +306,8 @@ netstat -ano | Select-String ":5555|:5556|:5557|:5558"
 ## 8. 参考
 
 - `README.md` —— 本 fork 的定位、改了什么、工具速查
+- `plugins/README.md` —— **DSH 侧配套插件**：是什么、怎么挂进 profile、红线
+- `plugins/dsh-mc-chat-watch/README.md` —— 那个插件自己的说明书（配置项、游戏内命令、为什么是聊天文本而不是 `/` 命令）
 - `AGENTS.md` —— 本仓库的工作约定与发布边界（**动代码前先读**）
 - `docs/architecture.md` —— 上游的组件与证据边界
 - `tests/functional/README.md` —— live 测试的分类与安全须知
