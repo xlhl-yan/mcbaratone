@@ -1,7 +1,7 @@
 # dsh-mc-chat-watch
 
-> 📍 这份是 `mc_tool/mcb/插件/` 里的**仓库副本**。DSH 实际加载的路径、以及"改哪边才生效"，
-> 见上一级的 `插件/README.md`。
+> 📍 这份是 `mc_tool/mcb/plugins/` 里的**仓库副本**。DSH 实际加载的路径、以及"改哪边才生效"，
+> 见上一级的 `plugins/README.md`。
 
 DSH 插件：盯住 Minecraft（AI 角色所在那个客户端）的游戏内聊天，一有新消息就把 agent 叫醒；
 另附「游戏态势」与「空闲自主」两套叫醒引擎。**事件驱动**，不是定时开口，闲着的时候几乎不花 token。
