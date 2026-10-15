@@ -946,6 +946,136 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         return _call_bridge(ctx, "command/close_screen", _run)
 
     @mcp.tool()
+    def smelt_items(
+        ctx: RequestContext,
+        input_slot: int = -1,
+        fuel_slot: int = -1,
+        expected_output: str = "",
+    ) -> Dict[str, Any]:
+        """往熔炉里放东西：把**背包里的**物品移到熔炉的输入槽 / 燃料槽。
+
+        ⚠ 前置条件：**熔炉界面必须是开着的**。bridge 的 handler 直接拿
+        `player.containerMenu`，不是熔炉就报 `Not in a furnace screen`。所以顺序是：
+        `place_block("furnace")` → `interact_block(x,y,z)` 打开它 →
+        `get_screen()` 读槽位布局（`sync_id` + 每个槽的 `slot` 号）→ 再调本工具。
+
+        `input_slot` / `fuel_slot` 是**这个界面里的槽位号**，不是背包槽号。
+        熔炉段固定是 0=输入、1=燃料、2=产物，玩家背包接在后面（所以矿石通常
+        在 3~38 之间，具体看 `get_screen` 的 `total_slots`）。两个至少给一个，
+        且不能相同。
+
+        `expected_output` 传产物 id（如 `minecraft:iron_ingot`）：bridge 会拿它
+        核对产物槽、并顺带判断这次转移是否真的被烧掉了一个 —— 不传也能用，
+        但要判断"烧成功没有"就得传。
+
+        返回 `input_moved` / `fuel_moved`，以及传了 `expected_output` 时的
+        `input_consumed`（真的消耗掉一个输入 = 烧起来了）。
+        """
+        # 纯参数层面的错在校验期就报，别丢给 _call_bridge 去重试三遍 ——
+        # 那儿会把 ValueError 包成 RuntimeError，错误信息也没这么直白。
+        if int(input_slot) < 0 and int(fuel_slot) < 0:
+            raise ValueError("至少要给 input_slot 或 fuel_slot 之一")
+
+        def _run(client):
+            params: Dict[str, Any] = {}
+            if int(input_slot) >= 0:
+                params["input_slot"] = int(input_slot)
+            if int(fuel_slot) >= 0:
+                params["fuel_slot"] = int(fuel_slot)
+
+            screen = client.transport.dispatch("get_screen", {})
+            if isinstance(screen, dict):
+                menu_type = str(screen.get("type") or "")
+                if menu_type and "Furnace" not in menu_type:
+                    raise ValueError(
+                        f"当前界面不是熔炉（{menu_type}）；先用 interact_block 打开熔炉"
+                    )
+                sync_id = screen.get("sync_id")
+                if isinstance(sync_id, int):
+                    params["sync_id"] = sync_id
+
+            if str(expected_output).strip():
+                params["expected_output"] = str(expected_output).strip()
+
+            return client.transport.dispatch("smelt_items", params)
+
+        return _call_bridge(ctx, "command/smelt_items", _run)
+
+    @mcp.tool()
+    def inventory_click(
+        ctx: RequestContext,
+        slot: int,
+        button: int = 0,
+        click_type: str = "PICKUP",
+        sync_id: int = -1,
+    ) -> Dict[str, Any]:
+        """在当前打开的容器界面里**点一个槽位** —— 箱子 / 熔炉 / 工作台 / 村民交易 / 自己的背包都适用。
+
+        这是"GUI 操作"的通用原语：MC 里所有容器都是同一个东西
+        (`AbstractContainerMenu`)，操作方式都是 `handleContainerInput(syncId, slot,
+        button, type)`。**按左右键是操作不了它们的** —— 按住右键一万次也拿不出熔炉里的
+        铁锭，这正是以前"能烧不能取"的原因。
+
+        前置条件：**界面必须开着**。顺序是
+        `interact_block(x,y,z)` 打开 → `get_screen()` 读布局 → 再调本工具。
+
+        `slot` 是**这个界面里的槽位号**（不是背包槽号），从 `get_screen` 返回的
+        `slots[].slot` 拿。箱子槽位从 0 开始，玩家背包接在后面。
+
+        `button`：`0` = 左键，`1` = 右键（只对 PICKUP / QUICK_CRAFT 有意义）。
+
+        `click_type` 用 MC 的 `ContainerInput` 枚举名，常用的：
+
+        - `PICKUP`（默认）—— 左键：空手=拿起整组，手上有=放下/交换；右键=拿一半/放一个
+        - `QUICK_MOVE` —— shift+左键：整组快移到对侧（箱子↔背包，方向看 `button`）
+        - `SWAP` —— 数字键：把该槽物品换到快捷栏（`button` = 0~8）
+        - `THROW` —— Q 键：丢一个（`button` 0）或丢一整组（`button` 1）
+        - `PICKUP_ALL` —— 双击：把同种物品全收过来
+        - `CLONE`（创造模式）/ `QUICK_CRAFT`（拖拽分发）
+
+        `sync_id` 默认不用传：这里会自己 `get_screen` 读当前界面的 id。**传错 id 比不传
+        更危险** —— bridge 会直接拒掉（`Stale sync_id; no click dispatched`），这是
+        "菜单已经关了/换了"的保护，防止点到别的界面上去。
+
+        返回 `before` / `after` 两份槽位快照和 `clicked`（bridge 观察到的真实变化）——
+        **`clicked: false` 不代表服务端没执行**，可能只是点了个空格子；要判断结果请再
+        `get_screen()` 读一次。
+
+        ⚠ 本工具**不做重试**（`max_retries=1`）：点槽位不是幂等操作，网络抖动时重试会
+        真的点第二下（拿起来又放下）。
+        """
+        # 纯参数层面的错在校验期就报，别丢给 _call_bridge —— 那儿会把 ValueError
+        # 包成 RuntimeError，还要白等三次退避。
+        if int(slot) < 0 and int(slot) != -999:
+            raise ValueError("slot 必须 >= 0（-999 是 bridge 的特殊值）；界面槽号从 get_screen 读")
+        if int(button) < 0:
+            raise ValueError("button 必须 >= 0（0=左键，1=右键，SWAP 时是快捷栏 0~8）")
+        if not str(click_type).strip():
+            raise ValueError("click_type 不能为空（常用值：PICKUP / QUICK_MOVE / SWAP / THROW）")
+
+        def _run(client):
+            params: Dict[str, Any] = {
+                "slot": int(slot),
+                "button": int(button),
+                "type": str(click_type).strip().upper(),
+            }
+
+            if int(sync_id) >= 0:
+                params["sync_id"] = int(sync_id)
+            else:
+                # 不传就自己读当前界面的 id —— bridge 拿它挡"菜单已过期"。
+                screen = client.transport.dispatch("get_screen", {})
+                if isinstance(screen, dict):
+                    current = screen.get("sync_id")
+                    if isinstance(current, int):
+                        params["sync_id"] = current
+
+            return client.transport.dispatch("inventory_click", params)
+
+        # 点击不是幂等操作：重试会真的点第二下（拿起来又放下），所以只许一次。
+        return _call_bridge(ctx, "command/inventory_click", _run, max_retries=1)
+
+    @mcp.tool()
     def screenshot(
         ctx: RequestContext,
         filename: str = "",

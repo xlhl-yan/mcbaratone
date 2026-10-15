@@ -278,6 +278,132 @@ def test_entity_interact_builds_structured_params(mock_request_context, mock_cli
         tool(mock_request_context, action="teleport", entity_id=1)
 
 
+def test_smelt_items_requires_a_furnace_screen_and_passes_sync_id(
+    mock_request_context, mock_client
+):
+    """smelt_items 必须确认界面真是熔炉，并把界面自己的 sync_id 一起带上。
+
+    bridge 的 handler 直接拿 player.containerMenu，不是 AbstractFurnaceMenu 就回
+    "Not in a furnace screen"；sync_id 对不上还会回 "Stale furnace sync_id"。
+    与其让它跑到 bridge 才失败，这里先用 get_screen 的 type 拦一道 —— 顺便把
+    "你现在开的是啥" 写进错误里。
+    """
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["smelt_items"].fn
+
+    calls = []
+    screen_type = {"value": "InventoryMenu"}
+
+    def fake_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        if name == "get_screen":
+            return {"type": screen_type["value"], "sync_id": 7, "total_slots": 39}
+        return {"input_moved": True, "fuel_moved": True, "input_consumed": True}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    # 一个槽都不给 → 本地拦下，连 get_screen 都不必问
+    with pytest.raises(ValueError):
+        tool(mock_request_context)
+    assert calls == []
+
+    # 不是熔炉界面 → 拦下，并说清现在开的是什么界面。
+    # ⚠ 这一层要摸 client，所以是经 _call_bridge 抛出来的，最终类型是 RuntimeError
+    #   （纯参数校验才在包装之前，仍是 ValueError）。
+    with pytest.raises(RuntimeError, match="InventoryMenu"):
+        tool(mock_request_context, input_slot=36)
+    assert calls[-1] == ("get_screen", {})
+
+    # 是熔炉 → 转发 input/fuel/sync_id/expected_output
+    screen_type["value"] = "FurnaceMenu"
+    calls.clear()
+    tool(
+        mock_request_context,
+        input_slot=36,
+        fuel_slot=37,
+        expected_output="minecraft:iron_ingot",
+    )
+    assert calls[0] == ("get_screen", {})
+    assert calls[1] == (
+        "smelt_items",
+        {
+            "input_slot": 36,
+            "fuel_slot": 37,
+            "sync_id": 7,
+            "expected_output": "minecraft:iron_ingot",
+        },
+    )
+
+
+def test_inventory_click_reads_sync_id_and_never_retries(mock_request_context, mock_client):
+    """inventory_click 自己补 sync_id，而且**绝不重试**。
+
+    bridge 拿 sync_id 挡"菜单已经过期/换掉"的点击，所以不传就自己 get_screen 读一个；
+    调用方明确传了就以它为准，不再多问一次。
+
+    重试这条更要紧：点槽位不是幂等操作，网络抖动时重试会真的点第二下（拿起来又放下），
+    所以这里 max_retries=1，失败就失败。
+    """
+    server = create_mcp_server(BridgeConfig())
+    tool = server._tool_manager._tools["inventory_click"].fn
+
+    calls = []
+
+    def fake_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        if name == "get_screen":
+            return {"type": "FurnaceMenu", "sync_id": 7, "total_slots": 39}
+        return {"clicked": True, "slot": 2}
+
+    mock_client.transport = Mock()
+    mock_client.transport.dispatch.side_effect = fake_dispatch
+
+    # 不给 sync_id → 先 get_screen 读一个，再带上
+    tool(mock_request_context, slot=2)
+    assert calls[0] == ("get_screen", {})
+    assert calls[1] == (
+        "inventory_click",
+        {"slot": 2, "button": 0, "type": "PICKUP", "sync_id": 7},
+    )
+
+    # 明确给了就照用，不再多问一次；click_type 大小写不敏感
+    calls.clear()
+    tool(mock_request_context, slot=2, button=1, click_type="quick_move", sync_id=42)
+    assert calls == [
+        ("inventory_click", {"slot": 2, "button": 1, "type": "QUICK_MOVE", "sync_id": 42})
+    ]
+
+    # -999 是 bridge 认的特殊值（点界面外），不该被本地拦下
+    calls.clear()
+    tool(mock_request_context, slot=-999)
+    assert calls[-1][1]["slot"] == -999
+
+    # 参数层面的错在本地拦下，连 bridge 都不碰
+    calls.clear()
+    with pytest.raises(ValueError):
+        tool(mock_request_context, slot=-1)
+    with pytest.raises(ValueError):
+        tool(mock_request_context, slot=2, button=-1)
+    with pytest.raises(ValueError):
+        tool(mock_request_context, slot=2, click_type="   ")
+    assert calls == []
+
+    # bridge 报错时只点一次 —— 重试会真的点第二下
+    calls.clear()
+
+    def flaky_dispatch(name, params=None):
+        calls.append((name, dict(params or {})))
+        if name == "get_screen":
+            return {"type": "FurnaceMenu", "sync_id": 7, "total_slots": 39}
+        raise RuntimeError("bridge died")
+
+    mock_client.transport.dispatch.side_effect = flaky_dispatch
+    with pytest.raises(RuntimeError):
+        tool(mock_request_context, slot=2)
+    assert [name for name, _ in calls].count("inventory_click") == 1
+
+
 def test_preview_build_plan_tool_is_pure_and_serializable() -> None:
     server = create_mcp_server(BridgeConfig())
     preview_tool = server._tool_manager._tools["preview_build_plan"]
