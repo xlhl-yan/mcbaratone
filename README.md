@@ -61,6 +61,11 @@
 | 合成 | `craft` |
 | 找方块 / 走坐标 / 回地表 | `find` / `goal_coordinates` / `surface` |
 
+> **动手前会自动换对东西**（bridge 的 `equip_best_tool`）：挖方块按原版 `mineable/*` 标签挑
+> 镐/斧/铲，打怪按 `剑 > 斧 + 材质` 排序，而放方块 / 插火把 / 用桶 / 挤奶 / 剪毛会把**指定的**
+> 那件物品从背包**任意位置**弄到手上（深处用容器点击互换）。所以调用方不用操心"手里拿的对不对" ——
+> 只有**真的没有**那件东西时才会报 `no <item> in inventory`。
+
 **观察**
 - `get_look_target`：**只读**报告准星指着什么（方块 / 实体 / 空气），带完整 `block_state`，能一眼看出「门开没开」
 - `get_entities` / `get_combat_snapshot` / `get_inventory` / `get_block` / `get_dimension` …
@@ -201,6 +206,8 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 | 6 | `InteractBlockCommandHandler.java` | **门/按钮打不中**（死瞄方块中心，薄方块必擦过）| 采样 132 个候选点逐个试射线 |
 | 7 | bridge `mine` handler | 返回 `applied:true` 但角色不动（MineProcess 起不来）| 工具改走 Baritone 原生 `#mine <方块>` |
 | 8 | follow 命令 | 发 `#follow <名>` 无效（Baritone 要 `#follow player <名>`）| 补上限定词 |
+| 9 | bridge `mine` handler | 带坐标时 `count` 被吞（要挖 3 个却挖了 56 个），且 `clearArea` 会挖穿沿途 | 有 `count` 就走 MineProcess，`count=0` 才保留 clearArea |
+| 10 | `PlaceTorchesCommandHandler.java` | **假成功**：手工拼 `BlockHitResult`、不转头、把 `result.consumesAction()`（**客户端本地预测**）当成结果 —— 实测目标在 65 格外也回 `placed:true`，而方块没出现、火把没消耗 | 距离检查 + 真实射线 + 转头 + `ObservedMutation` 后置校验（回读那格真是火把才算） |
 
 > 第 7 条特别隐蔽：工具**报成功但世界没变**。这也是本 fork 反复强调「看世界状态，不看返回值」的原因。
 
@@ -212,10 +219,15 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
   - 前缀特意用**中文**：`!` 会被 Baritone 抢去当命令解析，刷一屏「未知或不完整的命令」。
 - **`get_look_target`**（只读）：报告准星指着什么，含完整 block_state。
 - bridge 另加 `get_waken_session` / `set_waken_session` 两个 handler 供 DSH 侧读写。
+- **`equip_best_tool`**（**不**暴露成 MCP 工具，供其它工具内部调用）：把对的工具或**指定的**
+  物品弄到手上。三种 `kind` —— `dig`（按方块的原版 `mineable/*` 标签判类别）、`weapon`
+  （`剑 > 斧` + 材质排序）、`item`（把指定物品弄到手上）。换手两条路：**快捷栏直接切手持；
+  背包深处用容器点击与选中槽互换** —— 只改客户端 `Inventory` 服务端不认账，会变成
+  "本地拿上了、服务端认为空手"，攻击和挖掘全都静默不作数。
 
 ---
 
-## 五、MCP 工具速查（共 99 个，常用的）
+## 五、MCP 工具速查（共 101 个，这里是常用的）
 
 | 分类 | 工具 |
 | --- | --- |
@@ -231,6 +243,9 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 | 建造 | `build_schematic` `inspect_build_site` `preview_build_plan` |
 | 兜底 | `run_command` `batch_command` `cancel_command` `help_command` |
 
+> 上表里「插火把 / 放方块 / 用桶 / 挤奶 / 剪毛」都**自带换手**（见 §四.C 的 `equip_best_tool`）：
+> 东西躺在背包深处也会自己掏出来，只有**真的没有**时才报 `no <item> in inventory`。
+>
 > 仓库另带 **`scripts/mc.py`**：绕过 MCP 直接给 bridge 发命令的调试工具。
 > 出问题先用它分清「是工具层坏了还是游戏层坏了」，用法见 [`DSH-READHERE.md`](DSH-READHERE.md) §6。
 
@@ -244,6 +259,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 - **`get_events` 要酌情调用** —— 聊天不用拉（插件会推）；不带 `event_type` 过滤会混进 `tick_update` 这类高频事件刷屏。**事件名一律小写**（`tick_update` / `damage` / `death` … 共 23 个，见 `EventManager.EventType`），Python 侧会 `lower()` 归一化。⚠ 早期版本误用 `upper()`，导致**带过滤的查询永远静默返回 0 条**（已修）。另外 **bridge 的 `get_events` 不带 `after_seq` 时会走 `pollEvents()`，那里有 `iterator.remove()` 会把事件从缓冲区抽走** —— 所以这个工具在实现上**永远走游标模式**，不要绕过它裸调。
 - **`close_screen` 关不掉非容器界面** —— 它调的是 `player.closeContainer()`，只能关箱子/熔炉/交易/工作台这类容器界面；PauseScreen、DeathScreen 关不掉（会返回 `closed: false` + hint），那类界面需要在 bridge 侧用 `setScreen(null)`。
 - **`screenshot` 是异步写盘、且只出 PNG** —— bridge 侧是 `AsyncCommandHandler`，文件由 IO 线程写完后才回调，所以以返回里的 `saved` 为准，别刚发完命令就去读文件；`filename` 会被清洗成 `[A-Za-z0-9_-]` 再拼时间戳和自增序号（重名不覆盖，中文名会变成一串下划线，用英文短名）；截图落在**客户端**的 `<gameDir>\screenshots\`，返回的是绝对路径。
+- **`inventory_click` 的两种"槽号"别混** —— `get_inventory` 给的是**背包索引**（0-8 快捷栏、9-35 主背包、36-39 盔甲、40 副手），而 `inventory_click` 的 `slot` 是**菜单槽位号**：在玩家自带的 `InventoryMenu`（`sync_id=0`，**不用开任何界面**就能用）里，9-35 恰好等于主背包索引，但**快捷栏是 36-44**，45 是副手；`SWAP` 的 `button` 指的是"快捷栏第几格"，不是槽号。返回里带两份完整槽位快照，只想看结果请用 `get_screen`。
 - **bridge 无认证层** —— 只能跑在回环地址或可信网络，别暴露到公网。
 - **工具的运行时常量**：Python 侧轮询上限必须小于 DSH 的 `toolCallTimeoutMs`（现配 120 秒），否则会先报超时。
 
