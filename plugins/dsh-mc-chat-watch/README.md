@@ -1,8 +1,5 @@
 # dsh-mc-chat-watch
 
-> 📍 这份是 `mc_tool/mcb/plugins/` 里的**仓库副本**。DSH 实际加载的路径、以及"改哪边才生效"，
-> 见上一级的 `plugins/README.md`。
-
 DSH 插件：盯住 Minecraft（AI 角色所在那个客户端）的游戏内聊天，一有新消息就把 agent 叫醒；
 另附「游戏态势」与「空闲自主」两套叫醒引擎。**事件驱动**，不是定时开口，闲着的时候几乎不花 token。
 
@@ -21,6 +18,7 @@ DSH 插件：盯住 Minecraft（AI 角色所在那个客户端）的游戏内聊
 | `自主 关` / `自主 开` / `自主 状态` | 空闲自主任务开关 |
 | `态势 关` / `态势 开` / `态势 状态` | 游戏态势提醒开关 |
 | `唤醒会话 <sessionId>` / `唤醒会话 clear` | 游戏消息投给哪个 DSH 窗口（这条由 bridge 实现，插件读它的结果） |
+| `自主 间隔 <秒>` / `自主 空闲 <秒>` / `态势 间隔 <秒>` | **改运行节奏**；不带数字 = 查询当前值 |
 
 细节：
 
@@ -30,6 +28,12 @@ DSH 插件：盯住 Minecraft（AI 角色所在那个客户端）的游戏内聊
 - 兼容写法：`空闲自主 关`、`自主任务 状态`、`态势提醒 关`……前缀都认。
 - 开关状态落在 `<DSH_HOME>/mc-chat-watch/autonomy-switch.txt`（内容 `on` / `off`）：
   **立即生效、不用重启 DSH**；**删掉文件**即回到 `cordis.patch.yml` 里的默认值。
+- **节奏参数**落在 `<DSH_HOME>/mc-chat-watch/tuning.json`，tick 时**现读** —— 同样立即生效、
+  不用重启；删掉文件或某个键就回到配置默认值。三个参数的含义：
+  - `自主 间隔 <秒>` —— 两次「自主时间」之间至少隔多久（默认 `autonomyMinGapSeconds` = 300s，**花费的主闸门**）
+  - `自主 空闲 <秒>` —— 角色要闲满多久才交（默认 `autonomyIdleSeconds` = 120s）
+  - `态势 间隔 <秒>` —— 隔多久采一次态势（默认 `observeSeconds` = 180s）
+  - 值会被夹在 **10 秒 ~ 24 小时**，防止手滑打出 0 秒这种疯跑值
 
 ### 为什么是聊天文本，而不是 `/xxx` 命令？
 
@@ -149,13 +153,11 @@ bridge 是**客户端 mod**，只注册了 `ClientReceiveMessageEvents.GAME` 与
 
 ## 六、离线自检脚本
 
-工作区里的 `工具\测插件命令.mjs`（`工具\` 与本仓库的 `mc_tool\` 同级）：起一个假 bridge（裸 TCP），
-把本插件真跑起来喂聊天事件，验证「命令被拦截 → 写开关文件 → 回执 → 关掉后不再请求 bridge」。
-不碰真 MC、不碰真 DSH。
+`调研AI陪玩MC\工具\测插件命令.mjs`：起一个假 bridge（裸 TCP），把本插件真跑起来喂聊天事件，
+验证「命令被拦截 → 写开关文件 → 回执 → 关掉后不再请求 bridge」。不碰真 MC、不碰真 DSH。
 
 ```powershell
-# 在工作区根目录（同时含 工具\ 与 mc_tool\ 的那一层）执行
-node "工具\测插件命令.mjs"
+node "D:\DeepSeekHarnessDesktop\WorkSpace\调研AI陪玩MC\工具\测插件命令.mjs"
 ```
 
 ---

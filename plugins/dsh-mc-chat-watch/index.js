@@ -269,6 +269,38 @@ const CONTROL_PATTERNS = [
   },
 ];
 
+/**
+ * 「间隔」类命令：游戏里直接改运行节奏，不用回来动 YAML。
+ *
+ *   自主 间隔 600      → 两次「自主时间」至少隔 600 秒（花费的主闸门）
+ *   自主 空闲 60       → 角色闲满 60 秒就交（低于这个值不会提前叫）
+ *   态势 间隔 300      → 每 300 秒采一次态势
+ *   不带数字 = 查询当前值（`自主 间隔`）
+ *
+ * 值写进 <stateDir>/tuning.json，**tick 时现读**，所以改完立即生效、不用重启 DSH；
+ * 删掉文件或某个键就回到 cordis config 里的默认值。
+ */
+const TUNE_PATTERNS = [
+  {
+    key: 'autonomy',
+    field: 'autonomyMinGapSeconds',
+    label: '空闲自主间隔',
+    re: /^(?:空闲)?自主(?:任务)?\s*(?:间隔|周期|频率)\s*(\d+)?\s*(?:秒|s)?$/i,
+  },
+  {
+    key: 'autonomy',
+    field: 'autonomyIdleSeconds',
+    label: '空闲判定阈值',
+    re: /^(?:空闲)?自主(?:任务)?\s*(?:空闲|闲置)\s*(\d+)?\s*(?:秒|s)?$/i,
+  },
+  {
+    key: 'observe',
+    field: 'observeSeconds',
+    label: '态势采样间隔',
+    re: /^(?:游戏)?态势(?:提醒|播报)?\s*(?:间隔|周期|频率)\s*(\d+)?\s*(?:秒|s)?$/i,
+  },
+];
+
 /** 命令里的动作词 → 'on' / 'off' / 'status'（没给动作词 = 查询）。 */
 function parseAction(word) {
   const w = String(word || '').toLowerCase();
@@ -279,14 +311,29 @@ function parseAction(word) {
 }
 
 /**
- * 「这句话是不是控制命令？」是就返回 `{ key, action }`，不是返回 null。
- * key：autonomy（空闲自主）| observe（态势提醒）；action：on | off | status。
+ * 「这句话是不是控制命令？」是就返回命令对象，不是返回 null。
+ *
+ * - 开分类：`{ kind: 'switch', key, action }`，key：autonomy | observe，action：on | off | status
+ * - 间隔类：`{ kind: 'tune', key, field, label, seconds }`，seconds 为 null 表示查询
  */
 export function parseControlCommand(text) {
   const t = String(text || '').trim();
+  // 先试「间隔」：`自主 间隔 600` 不含开关动作词，两者不会互相误吃。
+  for (const { key, field, label, re } of TUNE_PATTERNS) {
+    const m = re.exec(t);
+    if (m) {
+      return {
+        kind: 'tune',
+        key,
+        field,
+        label,
+        seconds: m[1] === undefined ? null : Number(m[1]),
+      };
+    }
+  }
   for (const { key, re } of CONTROL_PATTERNS) {
     const m = re.exec(t);
-    if (m) return { key, action: parseAction(m[1]) };
+    if (m) return { kind: 'switch', key, action: parseAction(m[1]) };
   }
   return null;
 }
@@ -357,6 +404,39 @@ export function apply(ctx, input = {}) {
     return v === null ? switchDefaultOf(key) : v;
   };
 
+  // ── 运行时参数（游戏内「自主 间隔 600」「态势 间隔 300」）──────────────
+  // 与开关同一套思路：命令写 <stateDir>/tuning.json，tick 时**现读**，
+  // 所以改完立即生效、不用重启 DSH。删掉文件或某个键 → 回到 cordis config 默认值。
+  const tuningPath = join(dir, 'tuning.json');
+
+  const readTuning = () => {
+    try {
+      const obj = JSON.parse(readFileSync(tuningPath, 'utf8'));
+      return obj && typeof obj === 'object' ? obj : {};
+    } catch {
+      return {}; // 没文件 / 内容坏了：一律当「没设过」
+    }
+  };
+
+  const writeTuning = (field, seconds) => {
+    try {
+      mkdirSync(dir, { recursive: true });
+      const obj = readTuning();
+      obj[field] = seconds;
+      writeFileSync(tuningPath, JSON.stringify(obj, null, 2));
+      return true;
+    } catch (error) {
+      say(`[cmd] 写参数失败：${String((error && error.message) || error)}`);
+      return false;
+    }
+  };
+
+  /** 运行时值优先，没有就用调用方给的配置默认值。 */
+  const tuneValue = (field, fallback) => {
+    const v = Number(readTuning()[field]);
+    return Number.isFinite(v) && v > 0 ? v : fallback;
+  };
+
   /** 在游戏里回一句话（以 AI 角色身份，会出现在聊天栏）。 */
   const replyToGame = async (text) => {
     try {
@@ -366,7 +446,35 @@ export function apply(ctx, input = {}) {
     }
   };
 
+  /** 某个可调参数的配置默认值（惰性读 A/O —— 调用时它们一定已经初始化）。 */
+  const tuneFallback = (field) => {
+    if (field === 'autonomyMinGapSeconds') return A.minGapSeconds;
+    if (field === 'autonomyIdleSeconds') return A.idleSeconds;
+    if (field === 'observeSeconds') return O.seconds;
+    return 0;
+  };
+
   const handleControlCommand = async (cmd, parsed) => {
+    // ── 间隔类：改运行节奏 ──────────────────────────────────────────────
+    if (cmd.kind === 'tune') {
+      const current = tuneValue(cmd.field, tuneFallback(cmd.field));
+      if (cmd.seconds === null || !Number.isFinite(cmd.seconds)) {
+        say(`[cmd] ${parsed.sender} 查询「${cmd.label}」→ ${current} 秒`);
+        await replyToGame(`[${cmd.label}] 现在是 ${current} 秒`);
+        return;
+      }
+      // 10 秒 ~ 24 小时：防止手滑打出 0 秒这种疯跑值。
+      const seconds = Math.max(10, Math.min(24 * 3600, Math.round(cmd.seconds)));
+      if (!writeTuning(cmd.field, seconds)) {
+        await replyToGame(`[${cmd.label}] 写入失败，看插件日志`);
+        return;
+      }
+      say(`[cmd] ${parsed.sender} 把「${cmd.label}」改成 ${seconds} 秒（${tuningPath}）`);
+      await replyToGame(`[${cmd.label}] 已改成 ${seconds} 秒`);
+      return;
+    }
+
+    // ── 开关类 ────────────────────────────────────────────────────────
     const label = cmd.key === 'autonomy' ? '空闲自主' : '态势提醒';
     if (cmd.action === 'status') {
       const raw = readSwitch(cmd.key);
@@ -813,9 +921,17 @@ export function apply(ctx, input = {}) {
   // 会话正忙时把态势攒在这里，只留最新一条（见 isAgentRunning 的注释）。
   let pendingObserve = null;
 
+  // 采样间隔交给运行时参数（「态势 间隔 <秒>」）：interval 用固定粒度轮询，
+  // 到点了才真的采一次 —— 这样改间隔立即生效，不必重建 interval。
+  const OBSERVE_POLL_MS = 5000;
+  let lastObserveAt = 0;
+
   const observeTick = async () => {
     // 配置只是默认值，游戏内「态势 关/开」随时覆盖（关着时这里只读一个小文件就返回）。
     if (!switchOn('observe') || obsBusy) return;
+    const startedAt = Date.now();
+    if (startedAt - lastObserveAt < tuneValue('observeSeconds', O.seconds) * 1000) return;
+    lastObserveAt = startedAt;
     obsBusy = true;
     try {
       let snap;
@@ -865,14 +981,16 @@ export function apply(ctx, input = {}) {
 
   {
     // interval 常驻：运行时的「态势 关/开」要能重新打开它，所以注册与否不能只看配置。
-    const stopObs = ctx.interval(observeTick, O.seconds * 1000);
+    // 5 秒粒度轮询：真正采不采由 observeTick 里的间隔判断决定（「态势 间隔」立刻生效）。
+    const stopObs = ctx.interval(observeTick, OBSERVE_POLL_MS);
     ctx.effect(() => () => {
       if (typeof stopObs === 'function') stopObs();
     });
     say(
       `[apply] 态势观察：配置=${O.enabled ? '开' : '关'}，当前=${switchOn('observe') ? '开' : '关'}；` +
-        `每 ${O.seconds}s 采一次，mode=${O.mode}，最短 ${O.minWakeSeconds}s 交一次，` +
-        `上限 ${O.maxWakePerHour} 次/小时；游戏内打「态势 关/开/状态」切换`,
+        `每 ${tuneValue('observeSeconds', O.seconds)}s 采一次（游戏内「态势 间隔 <秒>」可改），` +
+        `mode=${O.mode}，最短 ${O.minWakeSeconds}s 交一次，` +
+        `上限 ${O.maxWakePerHour} 次/小时；开关用「态势 关/开/状态」`,
     );
   }
 
@@ -926,11 +1044,13 @@ export function apply(ctx, input = {}) {
         return;
       }
       const idleFor = now - lastBusyAt;
-      if (idleFor < A.idleSeconds * 1000) return;
+      // 两个节奏都由游戏内命令控制（现读，立即生效）：
+      //   「自主 空闲 <秒>」= 闲满多久才交；「自主 间隔 <秒>」= 两次之间至少隔多久。
+      if (idleFor < tuneValue('autonomyIdleSeconds', A.idleSeconds) * 1000) return;
 
       while (autonomyLog.length && autonomyLog[0] < now - 3600_000) autonomyLog.shift();
       if (autonomyLog.length >= A.maxPerHour) return;
-      if (now - lastAutonomyAt < A.minGapSeconds * 1000) return;
+      if (now - lastAutonomyAt < tuneValue('autonomyMinGapSeconds', A.minGapSeconds) * 1000) return;
       lastAutonomyAt = now;
       lastBusyAt = now; // 交出去就重新计时，别连环叫
       autonomyLog.push(now);
@@ -970,9 +1090,9 @@ export function apply(ctx, input = {}) {
     });
     say(
       `[apply] 空闲自主：配置=${A.enabled ? '开' : '关'}，当前=${switchOn('autonomy') ? '开' : '关'}；` +
-        `每 ${A.tickSeconds}s 看一次，闲 ${A.idleSeconds}s 交一次，` +
-        `间隔>=${A.minGapSeconds}s，上限 ${A.maxPerHour} 次/小时；` +
-        `游戏内打「自主 关/开/状态」切换`,
+        `每 ${A.tickSeconds}s 看一次，闲 ${tuneValue('autonomyIdleSeconds', A.idleSeconds)}s 交一次，` +
+        `间隔>=${tuneValue('autonomyMinGapSeconds', A.minGapSeconds)}s，上限 ${A.maxPerHour} 次/小时；` +
+        `开关「自主 关/开/状态」，节奏「自主 空闲 <秒>」「自主 间隔 <秒>」`,
     );
   }
 
