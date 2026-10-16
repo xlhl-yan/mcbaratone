@@ -5,7 +5,7 @@
  * 把 agent 叫醒 —— 这样用户不用切到 DSH 窗口说话，AI 也能"听见"。
  *
  * 依据（照 dsh-selfwake 真机验过的那套）：
- *   ctx.get('agents') → agents.get(sessionId) → handle.agent.followup(message)
+ *   ctx.get('agents') → agents.get(sessionId) → handle.agent.steer(message)（插入式；退回 followup 排队）
  *
  * 与 selfwake 的区别：selfwake 是"到点主动开口"（时间驱动）；
  * 本插件是"有人说话才醒"（事件驱动），所以轮询间隔可以很短而几乎不费 token。
@@ -192,7 +192,15 @@ export function deliverToSession(ctx, sessionsRoot, text, pinnedSessionId = '') 
     return { ok: false, why: `会话 ${sessionId.slice(0, 20)}… 不在活跃列表（窗口没开？）` };
   }
   const agent = handle.agent ?? handle;
-  if (typeof agent.followup !== 'function') return { ok: false, why: '这个句柄没有 followup 方法' };
+  // 插入式投递：`steer()` 把消息插到**当前轮的下一个 step**，而 `followup()` 是排到**下一轮**。
+  // 排队语义下 agent 正跑长任务时，游戏里说的话要等它整轮做完才看得到 —— 时效性太差
+  // （用户 2026-10-16 反馈）。两者都会唤醒（wakeup=true），所以 agent 闲着时一样好用。
+  // 万一某个版本的句柄只有 followup，就退回排队，别把消息丢了。
+  const mode =
+    typeof agent.steer === 'function' ? 'steer'
+      : typeof agent.followup === 'function' ? 'followup'
+        : '';
+  if (mode === '') return { ok: false, why: '这个句柄既没有 steer 也没有 followup 方法' };
   const message = {
     id: `mc-chat-${Date.now()}`,
     role: 'user',
@@ -200,19 +208,20 @@ export function deliverToSession(ctx, sessionsRoot, text, pinnedSessionId = '') 
     source: { kind: 'user' },
   };
   try {
-    agent.followup(message);
+    agent[mode](message);
   } catch (error) {
-    return { ok: false, why: 'followup 抛错：' + String((error && error.message) || error) };
+    return { ok: false, why: `${mode} 抛错：` + String((error && error.message) || error) };
   }
-  return { ok: true, sessionId };
+  return { ok: true, sessionId, mode };
 }
 
 /**
  * 这个会话的 agent 现在是不是正在跑？（抓取不到就返回 false）
  *
- * 为什么要问：`followup()` 是**排队 + 唤醒**语义 —— agent 正在跑长任务时，
- * 每投一条就多堆一个待处理轮次，等它跑完会一口气看到一串「（游戏态势）…」，
- * 每个都要回一句「等」，白烧 token 也刷屏（用户 2026-10-15 反馈）。
+ * 为什么要问：agent 正在跑长任务时**还有没有必要投** —— 即使改成插入式（`steer`），
+ * 插进去的态势它也得回一句「等」，白烧 token 也刷屏；而"忙时攒着、只留最新一条"
+ * 就能省掉这些无意义轮次（用户 2026-10-15 反馈）。
+ * ⚠️ 这条背压**只用在态势/自主上，聊天不走它** —— 玩家说的话必须立刻插进去。
  *
  * `agent.status` 只有两个值，见 dsh-agent-loop 的 `get status()`：
  *   phase.kind 是 idle/maintenance → 'idle'，其余 → 'running'。
@@ -628,7 +637,7 @@ export function apply(ctx, input = {}) {
         const sent = deliverToSession(ctx, sessionsRoot, line, effectiveSessionId);
         delivered += 1;
         say(
-          `[fire] ${line} → 投递=${sent.ok ? `已进会话 ${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
+          `[fire] ${line} → 投递=${sent.ok ? `已进会话（${sent.mode}）${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
         );
       }
 
