@@ -169,6 +169,24 @@ def _session_from_context(ctx: RequestContext) -> BridgeSession:
     return lifespan_ctx.session
 
 
+def _equip_best_tool(client, *, block: Optional[str] = None) -> Dict[str, Any]:
+    """动手前把最合适的工具拿到手上（bridge 的 `equip_best_tool`）。
+
+    为什么要在这一层做：Baritone 的 `autoTool` 只管**它自己挖**时选工具；bridge 的
+    `attack_entity` / `dig_block` 压根不换手 —— 于是出现过"拿着镐去砍树""空着手打怪"。
+    "该拿什么"不是猜的：挖方块看原版 `mineable/*` 标签，打怪按剑/斧+材质排序。
+
+    任何失败都**吞掉**：拿不到工具不该让动作本身失败（空手也能挖、也能打，只是慢）。
+    返回 bridge 的原样回执，方便调用方写进结果里解释"为什么没换手"。
+    """
+    try:
+        payload = {"kind": "weapon"} if block is None else {"kind": "dig", "block": block}
+        result = client.transport.dispatch("equip_best_tool", payload)
+        return result if isinstance(result, dict) else {}
+    except Exception as error:  # noqa: BLE001 —— 工具层的兜底，绝不拖垮动作
+        return {"equipped": False, "reason": f"equip_best_tool failed: {error}"}
+
+
 def _call_bridge(ctx: RequestContext, label: str, fn: Callable[[Client], T], max_retries: int = 3) -> T:
     session = _session_from_context(ctx)
     last_exc = None
@@ -561,6 +579,8 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         }
 
         def _run(client):
+            # 先把武器拿到手上（剑 > 斧），再找目标 —— 别拿手里的镐去砍人
+            tool = _equip_best_tool(client)
             wanted = (entity_type or "").strip().lower().replace("minecraft:", "")
             hits = 0
             seen = ""
@@ -598,6 +618,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             return {
                 "swings": hits,
                 "target": seen or None,
+                "weapon": tool.get("tool"),
                 "note": "0 swings usually means: nothing in range, or attack cooldown not ready",
             }
 
@@ -1217,12 +1238,33 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
 
     @mcp.tool()
     def dig_block(x: int, y: int, z: int, ctx: RequestContext) -> Dict[str, Any]:
-        """Break a single block at coordinates."""
-        return _call_bridge(
-            ctx,
-            "command/dig_block",
-            lambda client: client.transport.dispatch("dig_block", {"x": int(x), "y": int(y), "z": int(z)}),
-        )
+        """Break a single block at coordinates.
+
+        动手前先看一眼那格是什么方块，再把对的工具（镐/斧/铲）换到手上 ——
+        以前是"手里有什么就用什么"，于是拿镐砍树、空手挖矿都发生过。
+        """
+        def _run(client):
+            tool: Dict[str, Any] = {}
+            try:
+                found = client.transport.dispatch(
+                    "get_block", {"x": int(x), "y": int(y), "z": int(z)}
+                ) or {}
+                block_id = str(found.get("id") or "")
+                if block_id:
+                    tool = _equip_best_tool(client, block=block_id)
+            except Exception:  # noqa: BLE001 —— 认不出方块就照原样挖，不阻断
+                tool = {}
+            result = client.transport.dispatch(
+                "dig_block", {"x": int(x), "y": int(y), "z": int(z)}
+            )
+            if isinstance(result, dict):
+                if tool.get("tool"):
+                    result.setdefault("tool", tool.get("tool"))
+                if tool.get("equipped") is False and tool.get("reason"):
+                    result.setdefault("tool_note", tool.get("reason"))
+            return result
+
+        return _call_bridge(ctx, "command/dig_block", _run)
 
     @mcp.tool()
     def use_bucket(
@@ -1679,12 +1721,16 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                         total += int(entry.get("count") or 0)
                 return total
 
+            # 先把该用的工具拿到手上（挖树要斧、挖石头要镐）。Baritone 的 autoTool
+            # 只管它自己挖的时候选工具，手动动作和它无关 —— 这里补一刀，省得拿镐砍树。
+            tool = _equip_best_tool(client, block=wanted)
             before = count_of((client.transport.dispatch("get_inventory", {}) or {}).get("inventory"))
             client.transport.dispatch("chat", {"message": f"#mine {wanted}"})
             if target <= 0:
                 return {
                     "started": True,
                     "block": wanted,
+                    "tool": tool.get("tool"),
                     "had_before": before,
                     "note": "no quantity given — will keep mining until none are left; cancel to stop",
                 }
@@ -1697,6 +1743,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                 return {
                     "started": True,
                     "block": wanted,
+                    "tool": tool.get("tool"),
                     "requested": target,
                     "had_before": before,
                     "note": "large order — mining runs in background; poll get_inventory (or cancel) to track it",
@@ -1714,6 +1761,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                         "mined": gained,
                         "requested": target,
                         "block": wanted,
+                        "tool": tool.get("tool"),
                         "note": "stopped after reaching the requested amount",
                     }
             # 超时**必须 cancel**。以前这里只是返回"还在挖"，把 Baritone 任务
@@ -1725,6 +1773,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                 "mined": gained,
                 "requested": target,
                 "block": wanted,
+                "tool": tool.get("tool"),
                 "note": "已超时并停止（90s 没凑够）。任务已取消，需要继续就再调一次。",
             }
 

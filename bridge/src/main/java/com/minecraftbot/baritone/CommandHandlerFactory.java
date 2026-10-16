@@ -133,6 +133,9 @@ public class CommandHandlerFactory {
         registerHandler("get_waken_session", GetWakenSessionCommandHandler.class);
         registerHandler("set_waken_session", SetWakenSessionCommandHandler.class);
 
+        // 动手前把最合适的工具拿到手上（攻击 / 挖掘类命令先调它）
+        registerHandler("equip_best_tool", EquipBestToolCommandHandler.class);
+
         logger.info("Command handler registry initialized with {} handlers", handlerRegistry.size());
     }
 
