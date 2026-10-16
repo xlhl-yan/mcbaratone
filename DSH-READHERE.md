@@ -15,7 +15,7 @@
 | **Java** | **25** | bridge 用 Java 25 编译。注意 Gradle 与 JDK 有官方兼容下限（25→Gradle 9.1+）|
 | **Python** | 3.10+ | Python 控制器 / MCP server |
 | **Minecraft + Fabric Loader** | bridge 面向 **26.2** | 客户端侧运行环境 |
-| **Baritone（Fabric 版）** | 见 `bridge/libs/README.md` | **bridge 是 Baritone 的桥，没有它必崩** |
+| **Baritone（Fabric 版）** | 就用仓库里的 `bridge/libs/baritone-api-fabric-1.15.0-9-gd93f1582.jar` | **bridge 是 Baritone 的桥，没有它必崩**。这个 jar **一个文件两用**：既是编译期依赖，**也是要装进 mods 的本体** —— 别去别处下别的版本，bridge 对它是**精确匹配**（`=1.15.0-9-gd93f1582`），下错版本启动就报 `Incompatible mods found` |
 | **Fabric API** | 与 MC 版本匹配 | 事件 API 依赖 |
 | **DSH 侧插件** | 随本仓库 `plugins/` 提供 | 盯游戏内聊天、叫醒 agent（少了它就只有工具面、没有陪玩 —— 见 §3.7）|
 
@@ -94,14 +94,24 @@ Set-Location <REPO>\bridge
 
 ### 3.3 把 jar 部署进客户端
 
-把 jar 复制到**目标客户端**的 mods 目录：
+mods 目录里最终要有**三个 jar**，其中两个能直接从仓库拿：
+
+| 要装的 | 从哪来 |
+| --- | --- |
+| **Baritone 本体** | `<REPO>\bridge\libs\baritone-api-fabric-1.15.0-9-gd93f1582.jar` —— **不用去别处找，就是它**（sha256 以 `86d06fce44e8` 开头）。bridge 对它**精确匹配**，换成别的版本会报 `Incompatible mods found` |
+| **Fabric API** | 自己去下（要跟 MC 版本匹配，例如 `fabric-api-0.161.0+26.2.jar`）|
+| **bridge** | §3.2 编译出来的 `<REPO>\bridge\build\libs\baritone-api-bridge-1.0.40.jar` |
 
 ```powershell
-Copy-Item "<REPO>\bridge\build\libs\baritone-api-bridge-1.0.40.jar" `
-          "<MC_GAME_DIR>\versions\<MC_VERSION>\mods\" -Force
+$mods = "<MC_GAME_DIR>\versions\<MC_VERSION>\mods"
+Copy-Item "<REPO>\bridge\libs\baritone-api-fabric-1.15.0-9-gd93f1582.jar" $mods -Force
+Copy-Item "<REPO>\bridge\build\libs\baritone-api-bridge-1.0.40.jar" $mods -Force
+# Fabric API 自己放进去
+
+Get-ChildItem $mods -Filter *.jar | Select-Object Name   # 三个都在才算完
 ```
 
-**验收**：mods 目录里同时有 **bridge jar + Baritone jar + Fabric API jar**。
+**验收**：`Get-ChildItem $mods` 里同时有 **bridge jar + Baritone jar + Fabric API jar**。
 
 ### 3.4 分配端口（只给 AI 客户端填）
 
@@ -289,6 +299,8 @@ bridge 只负责"看"和"动"，**叫醒 agent** 这件事由 DSH 侧插件做�
 | **`craft` 报 `Recipe requires crafting table`** | 3×3 配方需要打开工作台界面 | 先打开工作台，或只用 2×2 配方 |
 | **`get_recipes` 报不可用** | MC 1.21.4 起客户端不再暴露配方表 | 上游限制，无解；`craft` 用内置配方表，不需要先查 |
 | **`interact_block` 报 `Target is not visible`** | 薄方块（门/按钮）瞄准擦空 | 换个方向靠近目标再试（本仓库已大幅缓解，但极端角度仍可能失手）|
+| **工具报 `no <item> in inventory`** | 背包里**真的没有**那件东西 | 不用自己先挪到快捷栏 —— 工具会自己从背包**任意位置**换手（`equip_best_tool`）；确实缺料就跟玩家要，或自己做一件 |
+| **`place_torches` 报 `Torch target out of reach`** | 目标超出交互距离（默认 4.5 格） | 走近再插。⚠️ 老版本这里是**假成功**（够不着也回 `placed:true`、方块却没出现），现已改成距离检查 + 后置校验 |
 | **Gradle 下载卡住** | 网络 | 配代理，或临时换镜像（**改完改回来**）|
 | **`git push` 报 `Empty reply from server`** | HTTP/2 与代理不兼容 | `git config http.version HTTP/1.1` + `http.postBuffer 524288000` |
 

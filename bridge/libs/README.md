@@ -13,7 +13,10 @@ artifact for Minecraft 26.2. Preserve the license and source reference when
 redistributing this JAR.
 
 The file is tracked so a clean or isolated worktree has the exact compile-time
-API. Its SHA-256 is
+API — and the **same JAR is what goes into the client's `mods/` directory**;
+there is no separate runtime Baritone to download. The bridge depends on this
+version exactly (`=1.15.0-9-gd93f1582`), so any other build fails at startup
+with `Incompatible mods found`. Its SHA-256 is
 `86d06fce44e8c2da1a46eb44fb7d934fe3712ce63738ecd5be5c68f03f71a9cf`.
 `scripts/check_repository_hygiene.py` verifies both the index and worktree
 copy.

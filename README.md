@@ -91,6 +91,11 @@ Set-Location bridge
 
 把 jar 放进目标客户端的 `versions/<版本>/mods/`，同时确保 **Baritone 本体**和 **Fabric API** 也在（缺 Baritone 会报 `Incompatible mods found`）。
 
+**Baritone 本体不用去别处找 —— 就在本仓库 `bridge/libs/` 里**：`baritone-api-fabric-1.15.0-9-gd93f1582.jar`
+（来自上游 [`d93f1582`](https://github.com/cabaletta/baritone/commit/d93f1582)，LGPL-3.0）。它**一个文件两用**
+——既是编译期依赖，**也是要装进 mods 的 Baritone 本体**。bridge 对它是**精确匹配**，换成别的版本会在启动时报
+`Incompatible mods found`。**Fabric API 要自己下**（跟 MC 版本匹配，如 `fabric-api-0.161.0+26.2.jar`）。
+
 ### 3. 双客户端 + 端口分离（真陪玩的关键）
 
 陪玩要的是「AI 有**自己的角色**」，所以开两个客户端、两个游戏目录：
