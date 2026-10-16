@@ -892,18 +892,6 @@ export function apply(ctx, input = {}) {
     maxPerHour: Math.max(1, Number(input.autonomyMaxPerHour) || 6),
   };
 
-  const { dir: autonomyDir } = statePaths(cfg);
-  const autonomyGoalFile = join(autonomyDir, 'autonomy-goal.txt');
-
-  /** 读 agent 上次给自己定的 goal。空串 = 还没定过（让它自己挑一个）。 */
-  const readAutonomyGoal = () => {
-    try {
-      return readFileSync(autonomyGoalFile, 'utf8').trim();
-    } catch {
-      return '';
-    }
-  };
-
   let lastBusyAt = Date.now();
   let lastAutonomyAt = 0;
   const autonomyLog = [];
@@ -953,21 +941,18 @@ export function apply(ctx, input = {}) {
       } catch {
         snap = `位置(${Math.round(Number(pos.x))},${Math.round(Number(pos.y))},${Math.round(Number(pos.z))})`;
       }
-      const goal = readAutonomyGoal();
-
       const r = deliverToSession(
         ctx,
         sessionsRoot,
         `（空闲自主时间）${snap}\n` +
-          (goal
-            ? `你上次给自己定的 goal：${goal}\n`
-            : '你还没有定 goal。\n') +
-          '现在角色闲着。请自己决定要做什么——继续推进上面的 goal，或者换一个。\n' +
+          '现在角色闲着。先 `get_goal`：有在跑的目标就推进**一步**；没有就自己 `create_goal` 立一个，' +
+          'objective 里写清目标 + 3~6 个可验证的步骤。\n' +
           '做法：直接调工具（查背包 mcp__baritone__get_inventory；挖矿 mcp__baritone__mine_quantity；' +
           '合成 mcp__baritone__craft；熔炼 mcp__baritone__smelt_items；种地 mcp__baritone__farm；' +
           '找玩家 mcp__baritone__get_entities；说话 mcp__baritone__say）。\n' +
-          `缺料就先向玩家要，要不到再自己去挖/烧。定好 goal 就把一句话写进 ${autonomyGoalFile}` +
-          '——换目标就覆盖，做完了就清空。这一轮什么都不想做，就只回一个「等」字。\n' +
+          '缺料就先向玩家要，要不到再自己去挖/烧。推进一步后先 get_goal 拿 revision，' +
+          '再 `update_goal(action="edit", objective=…)` 更新进度；做完了 `action="complete"`。' +
+          '这一轮什么都不想做，就只回一个「等」字。\n' +
           '详细判断表见工作区 空闲自主行为手册.md。',
         effectiveSessionId,
       );
@@ -986,7 +971,7 @@ export function apply(ctx, input = {}) {
     say(
       `[apply] 空闲自主：配置=${A.enabled ? '开' : '关'}，当前=${switchOn('autonomy') ? '开' : '关'}；` +
         `每 ${A.tickSeconds}s 看一次，闲 ${A.idleSeconds}s 交一次，` +
-        `间隔>=${A.minGapSeconds}s，上限 ${A.maxPerHour} 次/小时；goal 文件 ${autonomyGoalFile}；` +
+        `间隔>=${A.minGapSeconds}s，上限 ${A.maxPerHour} 次/小时；` +
         `游戏内打「自主 关/开/状态」切换`,
     );
   }
