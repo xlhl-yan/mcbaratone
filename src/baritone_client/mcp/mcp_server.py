@@ -686,6 +686,13 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             held = _hold_item(client, "minecraft:torch")
             if held.get("equipped") is not True:
                 held = _hold_item(client, "minecraft:soul_torch")
+            if held.get("equipped") is not True:
+                # bridge 只翻快捷栏、报 "No torches in hotbar"（听着像"背包里有、只是没在快捷栏"），
+                # 而这里扫的是整个背包 —— 找不到就说清楚，别再去撞三次重试。
+                raise ValueError(
+                    "no torch or soul_torch in inventory "
+                    f"({held.get('reason') or 'hold failed'})"
+                )
             if held.get("changed"):
                 # 换手包是发给服务端的，得给它一个 tick 才认账
                 time.sleep(0.2)
@@ -703,11 +710,8 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                     "z": int(pos.get("z", 0)),
                 }
             result = client.transport.dispatch("place_torches", params)
-            if isinstance(result, dict):
-                if held.get("tool"):
-                    result.setdefault("tool", held.get("tool"))
-                if held.get("equipped") is False and held.get("reason"):
-                    result.setdefault("hold_note", held.get("reason"))
+            if isinstance(result, dict) and held.get("tool"):
+                result.setdefault("tool", held.get("tool"))
             return result
 
         return _call_bridge(ctx, "command/place_torches", _run)
@@ -1270,17 +1274,20 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
 
         def _run(client):
             held = _hold_item(client, wanted)
+            if held.get("equipped") is not True:
+                # `_hold_item` 扫的是**整个背包**，比 bridge 只看主手更宽 —— 连它都找不到，
+                # 再让 bridge 去撞只会得到一句误导性的 "Main hand must contain a block item"。
+                raise ValueError(
+                    f"no {wanted} in inventory ({held.get('reason') or 'hold failed'})"
+                )
             if held.get("changed"):
                 # 换手包是发给服务端的，得给它一个 tick 才认账
                 time.sleep(0.2)
             result = client.transport.dispatch(
                 "place_block", {"block": block, "position": {"x": int(x), "y": int(y), "z": int(z)}}
             )
-            if isinstance(result, dict):
-                if held.get("tool"):
-                    result.setdefault("tool", held.get("tool"))
-                if held.get("equipped") is False and held.get("reason"):
-                    result.setdefault("hold_note", held.get("reason"))
+            if isinstance(result, dict) and held.get("tool"):
+                result.setdefault("tool", held.get("tool"))
             return result
 
         return _call_bridge(ctx, "command/place_block", _run)
@@ -1342,16 +1349,18 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
 
         def _run(client):
             held = _hold_item(client, wanted_bucket)
+            if held.get("equipped") is not True:
+                raise ValueError(
+                    f"no {wanted_bucket} in inventory "
+                    f"({held.get('reason') or 'hold failed'}) — {op} needs it in hand"
+                )
             if held.get("changed"):
                 time.sleep(0.2)  # 等一个 tick，让服务端也认这个手持
             result = client.transport.dispatch(
                 "use_bucket", {"operation": op, "x": int(x), "y": int(y), "z": int(z)}
             )
-            if isinstance(result, dict):
-                if held.get("tool"):
-                    result.setdefault("tool", held.get("tool"))
-                if held.get("equipped") is False and held.get("reason"):
-                    result.setdefault("hold_note", held.get("reason"))
+            if isinstance(result, dict) and held.get("tool"):
+                result.setdefault("tool", held.get("tool"))
             return result
 
         return _call_bridge(ctx, "command/use_bucket", _run)
