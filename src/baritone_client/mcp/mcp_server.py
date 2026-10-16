@@ -768,9 +768,9 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         - `detect` / `look_at` —— 都不用给；`look_at` 是默认动作，按类型找时搜索半径 16 格。
         - `interact` / `feed` —— **必须给 `entity_id`**，这两条路不认 `entity_type`。
         - `tame` / `shear` / `milk` / `attack` / `trade` —— id 或 type 都行。
-          `tame` 只能驯 wolf/cat/parrot（且不能已驯服）、`shear` 只能剪羊且背包里要有剪刀、
-          `milk` 只能挤牛/蘑菇牛且背包里要有空桶、`trade` 是右键村民**打开交易界面**
-          （之后用 `get_screen` 读报价、`select_trade` 选交易）。
+          `tame` 只能驯 wolf/cat/parrot（且不能已驯服）、`shear` 只能剪羊、`milk` 只能挤
+          牛/蘑菇牛 —— 后两个会**自动把剪刀/空桶从背包任意位置弄到手上**；`trade` 是右键
+          村民**打开交易界面**（之后用 `get_screen` 读报价、`select_trade` 选交易）。
         - `attack` 只砍**一下**；要连续砍请用 `attack_nearest`。
 
         一个坑：`detect` 会把**你自己**也列出来（bridge 遍历的是
@@ -811,11 +811,29 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             params["entity_type"] = etype
         if float(max_distance) > 0:
             params["max_distance"] = float(max_distance)
-        return _call_bridge(
-            ctx,
-            "command/entity_interact",
-            lambda client: client.transport.dispatch("entity_interact", params),
-        )
+
+        # milk / shear 要求特定物品在手上，而 bridge 那层只翻快捷栏 0-8（物品在主背包深处
+        # 会明确报错让你先挪出来 —— `ensureItemInHand` 的注释自己写了这一点）。这里先把它
+        # 弄到手上：全背包都找，深处用容器点击换上来。feed 不用（手上拿什么食物就喂什么）。
+        required_item = {"milk": "minecraft:bucket", "shear": "minecraft:shears"}.get(act)
+
+        def _run(client):
+            held: Dict[str, Any] = {}
+            if required_item:
+                held = _hold_item(client, required_item)
+                if held.get("equipped") is not True:
+                    raise ValueError(
+                        f"no {required_item} in inventory "
+                        f"({held.get('reason') or 'hold failed'}) — {act} needs it in hand"
+                    )
+                if held.get("changed"):
+                    time.sleep(0.2)  # 等一个 tick，让服务端也认这个手持
+            result = client.transport.dispatch("entity_interact", params)
+            if isinstance(result, dict) and held.get("tool"):
+                result.setdefault("tool", held.get("tool"))
+            return result
+
+        return _call_bridge(ctx, "command/entity_interact", _run)
 
     @mcp.tool()
     def look_at(ctx: RequestContext, x: float, y: float, z: float) -> Dict[str, Any]:
