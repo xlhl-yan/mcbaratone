@@ -104,6 +104,16 @@ class EquipBestToolCommandHandlerTest {
     }
 
     @Test
+    void everyAdvertisedKindIsAccepted() {
+        // 坑过：加 kind=item 时只改了报错文案、没改判断条件 —— 报错里写着 'item'，item 却永远被拒。
+        assertTrue(EquipBestToolCommandHandler.validKind("dig"));
+        assertTrue(EquipBestToolCommandHandler.validKind("weapon"));
+        assertTrue(EquipBestToolCommandHandler.validKind("item"));
+        assertFalse(EquipBestToolCommandHandler.validKind(""));
+        assertFalse(EquipBestToolCommandHandler.validKind("ITEM"), "kind 进来前已经 toLowerCase 过了");
+    }
+
+    @Test
     void blockIdsWithoutNamespaceGetMinecraftPrefixed() {
         assertEquals("minecraft:oak_log", EquipBestToolCommandHandler.parseBlockId("oak_log").toString());
         assertEquals("minecraft:stone",

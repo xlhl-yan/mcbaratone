@@ -79,7 +79,7 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
             ? params.get("min_durability_ratio").getAsFloat()
             : DEFAULT_MIN_DURABILITY_RATIO;
 
-        if (!kind.equals("dig") && !kind.equals("weapon")) {
+        if (!validKind(kind)) {
             return CompletableFuture.completedFuture(
                 CommandResult.error("kind must be 'dig', 'weapon' or 'item'"));
         }
@@ -247,6 +247,16 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
             CommandResult.error("Timed out before equip_best_tool reached the client thread"),
             ACTION_SCHEDULE_TIMEOUT_SECONDS,
             java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /**
+     * 认哪些 kind —— 单独抽出来、单独测：加 kind=item 那次**只改了报错文案、忘了改判断条件**，
+     * 结果报错信息里明明写着 'item'，item 却永远被拒（实机才暴露）。
+     */
+    static final java.util.Set<String> KINDS = java.util.Set.of("dig", "weapon", "item");
+
+    static boolean validKind(String kind) {
+        return KINDS.contains(kind);
     }
 
     /** 不含 namespace 的 id 补上 {@code minecraft:}（方块名、物品名通用 —— 只负责补前缀）。 */
