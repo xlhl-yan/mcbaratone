@@ -1248,8 +1248,11 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             result = client.transport.dispatch(
                 "place_block", {"block": block, "position": {"x": int(x), "y": int(y), "z": int(z)}}
             )
-            if isinstance(result, dict) and held.get("equipped") is False and held.get("reason"):
-                result.setdefault("hold_note", held.get("reason"))
+            if isinstance(result, dict):
+                if held.get("tool"):
+                    result.setdefault("tool", held.get("tool"))
+                if held.get("equipped") is False and held.get("reason"):
+                    result.setdefault("hold_note", held.get("reason"))
             return result
 
         return _call_bridge(ctx, "command/place_block", _run)
