@@ -970,7 +970,14 @@ export function apply(ctx, input = {}) {
           (carried ? `（我忙的时候态势变了 ${carried.count} 次，上面这条是最新的）\n` : '') +
           `需要操作就直接调工具去做（说话 mcp__baritone__say；血/饿低就吃东西 mcp__baritone__eat；` +
           `跟随 mcp__baritone__follow_player；挖矿 mcp__baritone__mine_quantity）；` +
-          `不需要操作就只回一个「等」字，别多说。详细判断表在工作区 游戏态势应对手册.md。`,
+          `不需要操作就只回一个「等」字，别多说。\n` +
+          // 这几条**故意贴在消息里**，而不是只写进手册/skill：手册要它主动去读，
+          // 而这些是"每轮都得照做、忘了就出事"的硬约束（2026-10-16 与用户定的 A/B 方案）。
+          `铁律：① 不需要动作就只回「等」，别解释；② 任何一步失败后**先重新查一次现状**` +
+          `（get_inventory / get_state / get_player_pos），绝不沿用旧假设继续往下跑；` +
+          `③ 用户没喊「跟上」就别 follow_player；④ 出手前先看 snapshot 的 is_pathing，` +
+          `有残留任务先 cancel_command；⑤ 说话一次一句。\n` +
+          `（判断表与工具速查：skill mc-situation，或工作区 游戏态势应对手册.md）`,
         effectiveSessionId,
       );
       say(`[observe] ${snap} → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
@@ -1073,7 +1080,11 @@ export function apply(ctx, input = {}) {
           '缺料就先向玩家要，要不到再自己去挖/烧。推进一步后先 get_goal 拿 revision，' +
           '再 `update_goal(action="edit", objective=…)` 更新进度；做完了 `action="complete"`。' +
           '这一轮什么都不想做，就只回一个「等」字。\n' +
-          '详细判断表见工作区 空闲自主行为手册.md。',
+          // 同态势那条：硬约束贴在消息里，别指望它去翻手册（A/B 方案，2026-10-16）。
+          '铁律：① 一轮只推进一步，做完汇报一句；② 不拆玩家造的东西、不在基地附近乱挖；' +
+          '③ 任何一步失败后先重新确认现状，别沿用旧假设；④ 动手前先清残留任务' +
+          '（snapshot 看 is_pathing → cancel_command）；⑤ 说话一次一句。\n' +
+          '（判断表与起步示例：skill mc-autonomy，或工作区 空闲自主行为手册.md）',
         effectiveSessionId,
       );
       say(`[autonomy] 空闲 ${Math.round(idleFor / 1000)}s → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
