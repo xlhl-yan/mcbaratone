@@ -1053,11 +1053,22 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         button, type)`。**按左右键是操作不了它们的** —— 按住右键一万次也拿不出熔炉里的
         铁锭，这正是以前"能烧不能取"的原因。
 
-        前置条件：**界面必须开着**。顺序是
-        `interact_block(x,y,z)` 打开 → `get_screen()` 读布局 → 再调本工具。
+        **不一定要开着界面**：自己的背包菜单（`InventoryMenu`，`sync_id=0`）任何时候都在 ——
+        没开任何界面时直接调它就能整理背包（实测：`inventory_click(slot=35, button=1,
+        click_type="SWAP")` 把主背包里的花岗岩换到了快捷栏第 1 格）。只有操作箱子 / 熔炉 /
+        村民交易这类**外部容器**时，才需要先 `interact_block(x,y,z)` 打开 → `get_screen()`
+        读布局 → 再调本工具。
 
         `slot` 是**这个界面里的槽位号**（不是背包槽号），从 `get_screen` 返回的
         `slots[].slot` 拿。箱子槽位从 0 开始，玩家背包接在后面。
+
+        ⚠️ **两种"槽号"别混**（踩过）：`get_inventory` 给的是**背包索引**（0-8 快捷栏、
+        9-35 主背包、36-39 盔甲、40 副手）；而这里的 `slot` 是**菜单槽位号** —— 在
+        `InventoryMenu` 里 9-35 恰好等于主背包索引，但**快捷栏是 36-44**（对应背包索引
+        0-8），45 是副手。`SWAP` 的 `button` 指的是**快捷栏第几格**（0-8），不是槽号。
+
+        ⚠️ 返回值带 `before` / `after` 两份**完整槽位快照**，很长。只想看结果就用
+        `get_screen()`（它默认只列非空的格子）。
 
         `button`：`0` = 左键，`1` = 右键（只对 PICKUP / QUICK_CRAFT 有意义）。
 
