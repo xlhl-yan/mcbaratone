@@ -676,8 +676,19 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
 
     @mcp.tool()
     def place_torches(ctx: RequestContext, x: int = 0, y: int = 0, z: int = 0) -> Dict[str, Any]:
-        """Place torches around the given spot (omit coords to use the bot's own position)."""
+        """Place torches around the given spot (omit coords to use the bot's own position).
+
+        bridge 的 handler 只会在**快捷栏 0-8** 里找火把（找不到就 `No torches in hotbar`），
+        所以这里先让 bridge 把它弄到手上 —— 躺在背包深处也能捞出来。火把和灵魂火把都认，
+        先试普通的，不行再试灵魂火把。
+        """
         def _run(client):
+            held = _hold_item(client, "minecraft:torch")
+            if held.get("equipped") is not True:
+                held = _hold_item(client, "minecraft:soul_torch")
+            if held.get("changed"):
+                # 换手包是发给服务端的，得给它一个 tick 才认账
+                time.sleep(0.2)
             params: Dict[str, Any] = {}
             if x or y or z:
                 params = {"x": int(x), "y": int(y), "z": int(z)}
@@ -691,7 +702,13 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                     "y": int(pos.get("y", 0)),
                     "z": int(pos.get("z", 0)),
                 }
-            return client.transport.dispatch("place_torches", params)
+            result = client.transport.dispatch("place_torches", params)
+            if isinstance(result, dict):
+                if held.get("tool"):
+                    result.setdefault("tool", held.get("tool"))
+                if held.get("equipped") is False and held.get("reason"):
+                    result.setdefault("hold_note", held.get("reason"))
+            return result
 
         return _call_bridge(ctx, "command/place_torches", _run)
 
@@ -1309,8 +1326,9 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         """Use a bucket at coordinates.
 
         operation is either "pickup" (fill the bucket from a water source) or
-        "place" (pour water out). The main hand must already hold the matching
-        item — empty bucket for pickup, water bucket for place.
+        "place" (pour water out). bridge 那边要求**主手已经拿着对应的桶**
+        （pickup 要空桶、place 要水桶，别的桶一律 `Wrong bucket in main hand`），
+        所以这里先把它从背包弄到手上 —— 桶躺在背包深处也能捞出来。
         """
         op = (operation or "").strip().lower()
         if op in ("fill", "take", "scoop"):
@@ -1319,13 +1337,24 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             op = "place"
         if op not in ("pickup", "place"):
             raise ValueError('operation must be "pickup" or "place"')
-        return _call_bridge(
-            ctx,
-            "command/use_bucket",
-            lambda client: client.transport.dispatch(
+
+        wanted_bucket = "minecraft:bucket" if op == "pickup" else "minecraft:water_bucket"
+
+        def _run(client):
+            held = _hold_item(client, wanted_bucket)
+            if held.get("changed"):
+                time.sleep(0.2)  # 等一个 tick，让服务端也认这个手持
+            result = client.transport.dispatch(
                 "use_bucket", {"operation": op, "x": int(x), "y": int(y), "z": int(z)}
-            ),
-        )
+            )
+            if isinstance(result, dict):
+                if held.get("tool"):
+                    result.setdefault("tool", held.get("tool"))
+                if held.get("equipped") is False and held.get("reason"):
+                    result.setdefault("hold_note", held.get("reason"))
+            return result
+
+        return _call_bridge(ctx, "command/use_bucket", _run)
 
     @mcp.tool()
     def batch_command(commands: List[str], ctx: RequestContext, stop_on_error: bool = True) -> Dict[str, Any]:
