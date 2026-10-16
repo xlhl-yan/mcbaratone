@@ -41,6 +41,10 @@ import net.minecraft.world.level.block.state.BlockState;
  * {@link EquipCommandHandler} 相同的容器点击，把**选中槽与它互换** —— 只改客户端
  * {@code Inventory} 会导致"本地以为拿上了、服务端认为空手"，攻击和挖掘都不作数。
  *
+ * <p>{@code kind=item} 是同一套搬运能力的通用形态：把**指定的**物品（方块、火把、桶……）
+ * 弄到手上，供 {@code place_block} / {@code place_torches} 这类"主手必须拿着某样东西"的动作调用。
+ * 以前它们只会在快捷栏 0-8 里找，东西躺在背包深处就直接失败。
+ *
  * <p>注意「没找到」不是错误：空手也能挖（只是慢），所以返回 {@code equipped:false}
  * 加一个 {@code reason}，让调用方自己决定要不要继续。
  */
@@ -70,21 +74,27 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
             IBaritone baritone, Socket clientSocket) {
         String kind = params.has("kind") ? params.get("kind").getAsString().trim().toLowerCase() : "";
         String blockId = params.has("block") ? params.get("block").getAsString().trim() : "";
+        String itemName = params.has("item") ? params.get("item").getAsString().trim() : "";
         float minRatio = params.has("min_durability_ratio")
             ? params.get("min_durability_ratio").getAsFloat()
             : DEFAULT_MIN_DURABILITY_RATIO;
 
         if (!kind.equals("dig") && !kind.equals("weapon")) {
             return CompletableFuture.completedFuture(
-                CommandResult.error("kind must be 'dig' or 'weapon'"));
+                CommandResult.error("kind must be 'dig', 'weapon' or 'item'"));
         }
         if (kind.equals("dig") && blockId.isEmpty()) {
             return CompletableFuture.completedFuture(
                 CommandResult.error("kind 'dig' needs a block id"));
         }
+        if (kind.equals("item") && itemName.isEmpty()) {
+            return CompletableFuture.completedFuture(
+                CommandResult.error("kind 'item' needs an item id"));
+        }
 
-        // 注册表校验放在主线程回调之外：查不到方块就直接报错，不消耗 goal_id。
+        // 注册表校验放在主线程回调之外：查不到方块/物品就直接报错，不消耗 goal_id。
         final String wantKind;
+        final String wantedItemId;
         if (kind.equals("dig")) {
             Identifier id;
             try {
@@ -99,8 +109,25 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
             }
             Block block = BuiltInRegistries.BLOCK.getValue(id);
             wantKind = toolKindFor(block.defaultBlockState());
-        } else {
+            wantedItemId = null;
+        } else if (kind.equals("weapon")) {
             wantKind = "weapon";
+            wantedItemId = null;
+        } else {
+            // kind=item：把**指定的**那件东西弄到手上（方块、火把、桶、食物……都行）
+            Identifier id;
+            try {
+                id = parseBlockId(itemName);
+            } catch (Exception e) {
+                return CompletableFuture.completedFuture(
+                    CommandResult.error("Bad item id: " + itemName));
+            }
+            if (!BuiltInRegistries.ITEM.containsKey(id)) {
+                return CompletableFuture.completedFuture(
+                    CommandResult.error("Unknown item: " + itemName));
+            }
+            wantKind = "item";
+            wantedItemId = id.toString();
         }
 
         return executeOnMainThread(client, () -> {
@@ -126,22 +153,29 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
                 }
                 data.addProperty("wants", wantKind);
 
-                // ① 选：最好的那一件
+                // ① 选：kind=item 按 id 找那件指定的；否则按用途挑最好的
                 int bestIndex = -1;
                 int bestRank = -1;
-                for (int i = 0; i < 36; i++) {
-                    ItemStack stack = inv.getItem(i);
-                    if (!usable(stack, minRatio)) continue;
-                    int rank = rankOf(stack, wantKind);
-                    if (rank > bestRank) {
-                        bestRank = rank;
-                        bestIndex = i;
+                if (wantedItemId != null) {
+                    bestIndex = indexOfItem(inv, wantedItemId);
+                } else {
+                    for (int i = 0; i < 36; i++) {
+                        ItemStack stack = inv.getItem(i);
+                        if (!usable(stack, minRatio)) continue;
+                        int rank = rankOf(stack, wantKind);
+                        if (rank > bestRank) {
+                            bestRank = rank;
+                            bestIndex = i;
+                        }
                     }
                 }
 
                 if (bestIndex < 0) {
                     data.addProperty("equipped", false);
-                    data.addProperty("reason", "no " + wantKind + " in inventory");
+                    data.addProperty("reason",
+                        wantedItemId != null
+                            ? "no " + wantedItemId + " in inventory"
+                            : "no " + wantKind + " in inventory");
                     return CommandResult.success(data);
                 }
 
@@ -215,7 +249,7 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
             java.util.concurrent.TimeUnit.SECONDS);
     }
 
-    /** 不含 namespace 的方块 id 补上 {@code minecraft:}。 */
+    /** 不含 namespace 的 id 补上 {@code minecraft:}（方块名、物品名通用 —— 只负责补前缀）。 */
     static Identifier parseBlockId(String raw) {
         String s = raw.trim();
         return Identifier.parse(s.indexOf(':') < 0 ? "minecraft:" + s : s);
@@ -239,6 +273,16 @@ public class EquipBestToolCommandHandler extends AsyncCommandHandler {
 
     private static TagKey<Block> blockTag(String path) {
         return TagKey.create(Registries.BLOCK, Identifier.parse("minecraft:" + path));
+    }
+
+    /** 背包 0-35 里第一件该 id 的物品在哪个槽；-1 = 没有。 */
+    static int indexOfItem(Inventory inv, String fullItemId) {
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            if (itemId(stack).equals(fullItemId)) return i;
+        }
+        return -1;
     }
 
     /** 能不能用：非空、且（若可损坏）还剩够用的耐久。 */

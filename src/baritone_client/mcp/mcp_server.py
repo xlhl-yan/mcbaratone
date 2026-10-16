@@ -169,6 +169,22 @@ def _session_from_context(ctx: RequestContext) -> BridgeSession:
     return lifespan_ctx.session
 
 
+def _hold_item(client, item_id: str) -> Dict[str, Any]:
+    """把**指定的**物品弄到主手上（bridge 的 `equip_best_tool kind=item`）。
+
+    给"主手必须拿着某样东西"的动作用：`place_block`（方块）、`place_torches`（火把）、
+    `use_bucket`（桶）。以前它们只会在快捷栏 0-8 里找，东西躺在背包深处就直接失败 ——
+    而 bridge 那层本来就要求主手拿着它：快捷栏里的直接切，背包深处的用容器点击换上来。
+
+    失败吞掉：拿不到就让动作自己去报错，别在这里把错吃掉。
+    """
+    try:
+        result = client.transport.dispatch("equip_best_tool", {"kind": "item", "item": item_id})
+        return result if isinstance(result, dict) else {}
+    except Exception as error:  # noqa: BLE001 —— 工具层的兜底
+        return {"equipped": False, "reason": f"equip_best_tool failed: {error}"}
+
+
 def _equip_best_tool(client, *, block: Optional[str] = None) -> Dict[str, Any]:
     """动手前把最合适的工具拿到手上（bridge 的 `equip_best_tool`）。
 
@@ -1215,24 +1231,26 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         """Place a block at coordinates (it must be in the inventory).
 
         bridge 的 place_block 认 `block` + `position`（对象），且**要求主手拿着那个方块**
-        ——否则报 "Main hand must contain a block item"。所以这里先自动把手持切到它
-        （只在快捷栏 0-8 里找；在背包深处的话得先自己挪出来）。
+        ——否则报 "Main hand must contain a block item"。所以这里先让 bridge 把它弄到手上
+        （`equip_best_tool kind=item`：在快捷栏就直接切，躺在背包深处就用容器点击换上来）。
         """
-        wanted = (block or "").strip().replace("minecraft:", "")
+        wanted = (block or "").strip()
+        if not wanted:
+            raise ValueError("block is required")
+        if ":" not in wanted:
+            wanted = f"minecraft:{wanted}"
 
         def _run(client):
-            inventory = client.transport.dispatch("get_inventory", {}) or {}
-            for entry in inventory.get("inventory") or []:
-                item = str(entry.get("id") or "").replace("minecraft:", "")
-                if item == wanted and int(entry.get("count") or 0) > 0:
-                    slot = int(entry.get("slot", -1))
-                    if 0 <= slot <= 8:
-                        client.transport.dispatch("select_slot", {"slot": slot})
-                        time.sleep(0.2)
-                    break
-            return client.transport.dispatch(
+            held = _hold_item(client, wanted)
+            if held.get("changed"):
+                # 换手包是发给服务端的，得给它一个 tick 才认账
+                time.sleep(0.2)
+            result = client.transport.dispatch(
                 "place_block", {"block": block, "position": {"x": int(x), "y": int(y), "z": int(z)}}
             )
+            if isinstance(result, dict) and held.get("equipped") is False and held.get("reason"):
+                result.setdefault("hold_note", held.get("reason"))
+            return result
 
         return _call_bridge(ctx, "command/place_block", _run)
 

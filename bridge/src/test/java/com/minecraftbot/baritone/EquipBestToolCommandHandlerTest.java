@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -119,5 +120,24 @@ class EquipBestToolCommandHandlerTest {
         assertEquals(1, EquipBestToolCommandHandler.materialRank("wooden_pickaxe"));
         assertEquals(0, EquipBestToolCommandHandler.materialRank("copper_pickaxe"),
             "铜工具不在原版层级表里 —— 排在最低但不为负");
+    }
+
+    @Test
+    void indexOfItemScansTheWholeInventoryNotJustTheHotbar() {
+        Inventory inv = mock(Inventory.class);
+        // ⚠️ 先把 ItemStack mock 建好，再 stub Inventory —— 若在 thenReturn(...) 里现造 mock，
+        // 参数求值时又开了一层 stubbing，Mockito 会抛 UnfinishedStubbingException。
+        ItemStack dirt = stackOf(Items.DIRT);
+        ItemStack granite = stackOf(Items.GRANITE);
+        for (int i = 0; i < 36; i++) {
+            when(inv.getItem(i)).thenReturn(ItemStack.EMPTY);
+        }
+        when(inv.getItem(0)).thenReturn(dirt);
+        when(inv.getItem(35)).thenReturn(granite);
+
+        assertEquals(35, EquipBestToolCommandHandler.indexOfItem(inv, "minecraft:granite"),
+            "背包深处的方块也得找得到 —— place_block 原来只翻快捷栏 0-8，就栽在这儿");
+        assertEquals(0, EquipBestToolCommandHandler.indexOfItem(inv, "minecraft:dirt"));
+        assertEquals(-1, EquipBestToolCommandHandler.indexOfItem(inv, "minecraft:gold_ingot"));
     }
 }

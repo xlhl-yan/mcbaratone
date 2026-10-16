@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import Mock, MagicMock, patch
 
 from baritone_client import TransportError, CommandResult, CacheStats
-from baritone_client.mcp.mcp_server import BridgeConfig, BridgeSession, BridgeLifespanContext, create_mcp_server, _call_bridge, _format_json, _session_from_context
+from baritone_client.mcp.mcp_server import BridgeConfig, BridgeSession, BridgeLifespanContext, create_mcp_server, _call_bridge, _format_json, _session_from_context, _hold_item
 from baritone_client.utils.upload_manager import UploadProgress
 from baritone_client.mcp.guidance import BUILD_PLAN_RESOURCE_URI, BUILDSITE_RESOURCE_URI, WORKFLOW_RESOURCE_URI, BUILD_PLAN_GUIDE_ALIAS, WORKFLOW_GUIDE_ALIAS
 from typing import List
@@ -546,6 +546,38 @@ def test_concurrent_access_thread_safety(bridge_session):
     assert len(results) == 10
     assert len(errors) == 0
     assert all(r == "ok" for r in results)
+
+
+def test_hold_item_asks_bridge_for_kind_item():
+    """place_block 这类"主手必须拿着某样东西"的动作靠它把物品弄到手上，必须原样发 kind=item。"""
+    calls = []
+
+    class Fake:
+        class transport:
+            @staticmethod
+            def dispatch(command, payload):
+                calls.append((command, payload))
+                return {"equipped": True, "tool": "minecraft:granite"}
+
+    result = _hold_item(Fake(), "minecraft:granite")
+
+    assert result["equipped"] is True
+    assert calls == [("equip_best_tool", {"kind": "item", "item": "minecraft:granite"})]
+
+
+def test_hold_item_swallows_bridge_errors():
+    """拿不到东西不能让动作本身失败 —— bridge 掉了也得乖乖返回 dict，不许抛。"""
+
+    class Boom:
+        class transport:
+            @staticmethod
+            def dispatch(*args, **kwargs):
+                raise RuntimeError("bridge down")
+
+    result = _hold_item(Boom(), "minecraft:granite")
+
+    assert result["equipped"] is False
+    assert "bridge down" in result["reason"]
 
 
 
