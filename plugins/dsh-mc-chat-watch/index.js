@@ -641,7 +641,18 @@ export function apply(ctx, input = {}) {
         );
       }
 
-      if (latest > cursor) cursor = latest;
+      // 🔴 2026-10-16 实测：**bridge（MC 客户端）重启后 event_seq 会从头开始计数**，
+      //    而插件的 cursor 还停在旧的大数值上 —— 此后 `latest > cursor` 永远为假，
+      //    游标就此卡死，玩家在游戏里说的话再也读不到（当晚用户原话：
+      //    「我发现我在聊天框输入文字他过不来了」）。证据：`[init] 起点 latest_seq=28694`
+      //    之后 bridge 的 latest_seq 只有 3507，用户那条消息是 3503，全被这个游标挡在外面。
+      //    判据：latest 比 cursor 小 → 序号回绕，把游标拉到新序号（并留一行日志，便于事后追溯）。
+      if (latest < cursor) {
+        say(`[tick] 序号回绕（cursor=${cursor} → latest=${latest}），重置游标`);
+        cursor = latest;
+      } else if (latest > cursor) {
+        cursor = latest;
+      }
     } catch (error) {
       // bridge 没起、MC 没开，都会走到这 —— 静默跳过，等下一轮。
       say(`[tick] bridge 不可达：${String((error && error.message) || error)}`);
@@ -793,17 +804,33 @@ export function apply(ctx, input = {}) {
 
   let lastSnapshot = '';
   let lastWakeAt = 0;
+  let lastUrgentWakeAt = 0;
+  // urgent 事件的唤醒节流（毫秒）——**一场战斗只叫醒 agent 一次**。
+  // 起因（2026-10-16 用户原话「第二次的间隔太短了，连续多次插入会话导致你的响应反而变慢了」）：
+  // 原来 8 秒。被连击时每 8 秒就 steer 一条"🔴 受伤"进会话，**把 agent 正在进行的回复反复打断**，
+  // 结果是"叫得越勤、反应反而越慢"。僵尸连咬 6 下一场也就 10 秒左右 —— 60 秒足够覆盖一整场
+  // 战斗，打完 agent 还醒着；60 秒后还在挨打才会再叫第二次。
+  const URGENT_GAP_MS = 60000;
   const observeLog = [];
   let obsBusy = false;
 
   // ── 值得一提的低频事件（死亡/受伤/遭攻击/天气/维度）───────────────
   // 为什么不让观察周期自己去拉：事件缓冲 TTL 只有 300 秒、上限 2048 条，
-  // 高频事件滚动很快，180 秒才拉一次容易漏。这里 5 秒轮一个类型，
-  // 每个类型 30 秒覆盖一次，稳稳落在 TTL 内。
+  // 高频事件滚动很快，180 秒才拉一次容易漏。这里 **1 秒一轮**，且 urgent 类型
+  // **每一轮都查**，既稳稳落在 TTL 内，又是秒级反应。
   //
   // ⚠ 必须走游标模式（带 after_seq）。bridge 的 get_events 不带游标时走
   //   pollEvents()，那里有 iterator.remove()，会把事件从缓冲区**抽走** ——
   //   连聊天事件都会被抢掉。带游标才是纯读。
+  // 第三列 = urgent：**立刻唤醒 agent**，不塞进 pendingNotable 等态势周期攒批。
+  // 起因（2026-10-16，用户发现「怎么没见你攻击呢」）：AI 下矿连死 5 次，因为"挨打"只当
+  // 普通事件攒着发，等态势播报把它叫醒时人已经死了 —— 请求-响应模式下没人叫它，它根本
+  // 不知道自己正在被打，自然不会还手。
+  //
+  // ⚠️ urgent **只留 DAMAGE 一个**（用户原话：「没必要检测攻击和死亡，单检测一个被攻击就行」）：
+  //    · ENTITY_ATTACK 的语义是**"我出手打人"**（`if (player == Minecraft.getInstance().player)`），
+  //      自己做了什么自己清楚、不需要被叫醒；原来还把文案写成「⚔遭攻击」，方向是反的、纯噪音。
+  //    · DEATH 是"被伤害"的终点 —— 前面那几条 DAMAGE 早就报过了，再唤醒一次没有新增信息。
   const NOTABLE = [
     ['DEATH', (d) => `☠死了(${Math.round(Number(d.x))},${Math.round(Number(d.y))},${Math.round(Number(d.z))})`],
     ['RESPAWN', () => '↻已重生'],
@@ -812,8 +839,9 @@ export function apply(ctx, input = {}) {
       (d) =>
         `⚠受伤-${Math.round(Number(d.amount) || 0)}` +
         (d.attacker_type ? `(${String(d.attacker_type).replace('minecraft:', '')})` : ''),
+      true,
     ],
-    ['ENTITY_ATTACK', () => '⚔遭攻击'],
+    ['ENTITY_ATTACK', (d) => `⚔出手攻击了${String(d.entity_type || '目标').replace('minecraft:', '')}`],
     ['WEATHER_CHANGE', (d) => `天气:${d.weather_type || '?'}`],
     ['DIMENSION_CHANGE', () => '⇒换维度'],
   ];
@@ -821,6 +849,11 @@ export function apply(ctx, input = {}) {
   let notableSeeded = false;
   let notableIdx = 0;
   const pendingNotable = [];
+  // urgent 类型（死亡/受伤/遭攻击）**每一轮都查**；其余（天气/维度/重生）轮着查。
+  // 起因（2026-10-16 用户原话「这个时间延迟有点太长了吧」）：原来单类型轮询，6 个类型
+  // 轮一圈最坏要等 18 秒才轮到 damage —— 挨打要秒级反应，不能排队。
+  const URGENT_TYPES = NOTABLE.filter(([, , u]) => u === true).map(([t]) => String(t).toLowerCase());
+  const REST_TYPES = NOTABLE.filter(([, , u]) => u !== true).map(([t]) => String(t).toLowerCase());
 
   const notableTick = async () => {
     if (!O.enabled) return;
@@ -828,19 +861,54 @@ export function apply(ctx, input = {}) {
       // 首轮只探测"当前末尾"，避免把开启之前的陈年事件倒出来
       if (!notableSeeded) {
         const probe = await bridgeCall(cfg, 'get_events', { after_seq: 0, limit: 1 });
-        const latest = Number((probe && probe.data && probe.data.latest_seq) ?? 0);
-        for (const [t] of NOTABLE) notableCursors.set(t, latest);
+        // bridge 的响应是无包装的（直接 { latest_seq, events, ... }），但历史上也见过带 data
+        // 包装的形式 —— 两种都认，别再想当然。
+        const latest = Number((probe && (probe.data?.latest_seq ?? probe.latest_seq)) ?? 0);
+        // ⚠️ 游标的键统一用**小写**（原因见 notableTick 里的说明）
+        for (const [t] of NOTABLE) notableCursors.set(String(t).toLowerCase(), latest);
         notableSeeded = true;
         return;
       }
-      const [type, render] = NOTABLE[notableIdx % NOTABLE.length];
-      notableIdx += 1;
-      const cursor = notableCursors.get(type) ?? 0;
-      const r = await bridgeCall(cfg, 'get_events', { after_seq: cursor, type, limit: 5 });
-      const data = (r && r.data) || {};
-      const events = Array.isArray(data.events) ? data.events : [];
-      for (const ev of events) pendingNotable.push(render(ev.data || {}));
-      notableCursors.set(type, Number(data.latest_seq ?? cursor));
+      // 每 3 秒一轮：urgent 类型全查一遍（秒级反应），非 urgent 才轮着来。
+      const batch = [...URGENT_TYPES];
+      if (REST_TYPES.length) {
+        batch.push(REST_TYPES[notableIdx % REST_TYPES.length]);
+        notableIdx += 1;
+      }
+      for (const key of batch) {
+        const entry = NOTABLE.find(([t]) => String(t).toLowerCase() === key);
+        if (!entry) continue;
+        const [type, render, urgent] = entry;
+        const cursor = notableCursors.get(key) ?? 0;
+        // 🔴 2026-10-16 实测：EventManager.getEventsAfter 用的是 `type.equals(event.getType())`
+        //    —— **区分大小写**，而 bridge 的事件名一律小写（publishEvent 里 name().toLowerCase()）。
+        //    表里的键写成 'DAMAGE'/'DEATH' 就永远匹配不上，notableTick 一条事件都读不到。
+        //    实测对照：type=damage ✅ 有事件、type=DAMAGE ❌ 空。所以这里一律转小写。
+        const r = await bridgeCall(cfg, 'get_events', { after_seq: cursor, type: key, limit: 5 });
+        // 🔴 2026-10-16 实测：bridge 的响应**没有 data 包装**（直接 { events, latest_seq, ... }）。
+        // 这里原来只认 r.data.events，于是 events 永远是空数组 —— notableTick 自上线起就一直
+        // 在空转：死亡/受伤/遭攻击一条都没唤醒过 agent（用户原话「怎么没见你攻击呢」）。
+        // 照 tick() 的写法两种都认。
+        const data = (r && (r.data || r)) || {};
+        const events = Array.isArray(data.events) ? data.events : [];
+        if (events.length) say(`[notable] ${type} ×${events.length}`);
+        for (const ev of events) {
+          const line = render(ev.data || {});
+          // urgent（死亡/受伤/遭攻击）：**立刻叫醒**，不攒批 —— 攒着的代价就是"醒来时人已经死了"。
+          // 8 秒节流：被连击时不至于刷爆 token / 消息。
+          if (urgent && Date.now() - lastUrgentWakeAt >= URGENT_GAP_MS) {
+            lastUrgentWakeAt = Date.now();
+            say(`[urgent] ${line} → 已立刻交 agent`);
+            wakeAgent(
+              `🔴 ${line} —— 立刻用 get_combat_snapshot 看附近威胁：` +
+                `血低就先拉开距离保命，有武器就 attack_nearest 反击。别站着挨打。`
+            );
+          } else {
+            pendingNotable.push(line);
+          }
+        }
+        notableCursors.set(key, Number(data.latest_seq ?? cursor));
+      }
       while (pendingNotable.length > 8) pendingNotable.shift();
     } catch {
       /* bridge 不在就下一轮再说 */
@@ -848,7 +916,10 @@ export function apply(ctx, input = {}) {
   };
 
   if (O.enabled) {
-    const stopNotable = ctx.interval(notableTick, 5000);
+    // 1 秒一轮：urgent 类型（受伤/遭攻击/死亡）每一轮都查，所以"挨打 → 检测到"≤1 秒。
+    // 起因（2026-10-16 用户原话「延迟还是有点高」）：3 秒一轮仍嫌钝。首轮要快、后续慢点没事
+    // —— 后续由 URGENT_GAP_MS（60 秒）兜住：一场战斗只会叫醒 agent 一次，压低轮询不会刷爆会话。
+    const stopNotable = ctx.interval(notableTick, 1000);
     ctx.effect(() => () => {
       if (typeof stopNotable === 'function') stopNotable();
     });
