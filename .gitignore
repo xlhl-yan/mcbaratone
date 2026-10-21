@@ -508,3 +508,6 @@ bridge/gradle-8.12-bin.zip
 # Local scratch backups left behind while patching upstream files
 *.bak
 *.bak-*
+
+# local pytest basetemp (see DEVP LAN: Temp dir ACL can be broken)
+.pytest-tmp/
