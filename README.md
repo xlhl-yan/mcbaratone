@@ -69,6 +69,17 @@
 **观察**
 - `get_look_target`：**只读**报告准星指着什么（方块 / 实体 / 空气），带完整 `block_state`，能一眼看出「门开没开」
 - `get_entities` / `get_combat_snapshot` / `get_inventory` / `get_block` / `get_dimension` …
+- `get_view` / `scan_biomes`：一次看一片方块（按类型聚合）、扫附近生物群系
+- `capture_frame` / `frame_stream`：**真的看见画面** —— 抓帧到固定路径，或按节奏自动刷新，
+  再用 `read_image` 读。实测读一帧约 5~6 秒（关思考模式），适合确认场景，不适合躲怪
+
+**给 agent 读的手册**（都在仓库根，配 `DSH-READHERE.md` §5.4）
+
+| 手册 | 用途 |
+| --- | --- |
+| `陪玩会话启动提示.md` | **新开陪玩会话的第一份读物**：三段链路、会被什么唤醒、条件反射表、七条铁律、工具速查、已知的坑 |
+| `游戏态势应对手册.md` | 收到「（游戏态势）…」消息时，低 token 查表判断该动不动 |
+| `空闲自主行为手册.md` | 空闲自主时怎么用 DSH 的 goal 机制立目标、拆步骤、推进 |
 
 ---
 
