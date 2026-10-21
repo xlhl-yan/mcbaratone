@@ -897,6 +897,81 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
+    def get_view(
+        ctx: RequestContext,
+        radius: int = 3,
+        detail: bool = False,
+        limit: int = 40,
+    ) -> Dict[str, Any]:
+        """周围一片方块长什么样（比逐个 get_block 快得多）。
+
+        bridge 以玩家为中心扫 (2r+1)³ 立方体，返回**所有非空气方块**的坐标和 id。
+        `radius` 默认 3（7×7×7），上限 32 —— **别开大**：radius=5 就是 1331 格，
+        非空的常有好几百条，逐条列出来既刷屏又难读。
+
+        默认返回**按方块类型聚合**的结果：`blocks` 是"id → 数量"（按数量降序）、
+        `total` 是非空方块总数 —— 回答"眼前这堆是什么材料"足够了。
+        需要具体坐标就传 `detail=True`，此时 `voxels` 会被截断到 `limit` 条（默认 40）。
+
+        ⚠️ 它扫的是**自己周围**，不是"视野里"；想知道正对着什么用 `get_look_target`。
+        """
+        r = max(1, min(int(radius), 32))
+        lim = max(1, int(limit))
+        payload = _call_bridge(
+            ctx,
+            "command/get_view",
+            lambda client: client.transport.dispatch("get_view", {"radius": r}),
+        )
+        data = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+        voxels = data.get("voxels") if isinstance(data, dict) else None
+        if not isinstance(voxels, list):
+            voxels = []
+
+        counts: Dict[str, int] = {}
+        for voxel in voxels:
+            if not isinstance(voxel, dict):
+                continue
+            block_id = str(voxel.get("id") or "unknown")
+            counts[block_id] = counts.get(block_id, 0) + 1
+
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        result: Dict[str, Any] = {
+            "radius": r,
+            "total": sum(counts.values()),
+            "distinct": len(ordered),
+            "blocks": dict(ordered),
+        }
+        if detail:
+            result["voxels"] = voxels[:lim]
+            result["voxels_truncated_from"] = len(voxels)
+        return result
+
+    @mcp.tool()
+    def scan_biomes(ctx: RequestContext, radius: int = 128, step: int = 16) -> Dict[str, Any]:
+        """扫一遍**已经加载**的区块，列出附近有哪些生物群系。
+
+        用来回答"我这边是平原还是丛林""往哪个方向走能找到别的群系"。
+        `radius` 默认 128（上限 512）、`step` 4~64（默认 16，步长越小越细也越慢）。
+
+        ⚠️ **它不会加载新地形** —— 只采客户端已经加载的区块（`hasChunk` 判断），
+        没去过的地方采不到，`unloaded_samples` 会告诉你跳过了多少。
+        所以"找丛林"的正确用法是：**往一个方向走一段，再扫一次**，而不是原地调大 radius。
+
+        返回：`current_biome`（脚下是什么）+ `biomes`（每个群系**最近的一处**采样点，
+        含 id / distance / position），按距离升序。同样的信息也可以从 `snapshot` 的
+        `biome` 字段看，但那个只有脚下这一个。
+        """
+        rad = max(0, min(int(radius), 512))
+        st = max(4, min(int(step), 64))
+        return _call_bridge(
+            ctx,
+            "command/scan_biomes",
+            lambda client: client.transport.dispatch(
+                "scan_biomes", {"radius": rad, "step": st}
+            ),
+        )
+
+    @mcp.tool()
     def get_dimension(ctx: RequestContext) -> Dict[str, Any]:
         """Which dimension the bot is in (overworld / nether / end)."""
         return _call_bridge(
