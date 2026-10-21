@@ -114,6 +114,8 @@ public class CommandHandlerFactory {
         registerHandler("tunnel_wide", TunnelWideCommandHandler.class);
         registerHandler("place_torches", PlaceTorchesCommandHandler.class);
         registerHandler("screenshot", ScreenshotCommandHandler.class);
+        registerHandler("capture_frame", CaptureFrameCommandHandler.class);
+        registerHandler("frame_stream", FrameStreamCommandHandler.class);
         registerHandler("auto_craft", AutoCraftCommandHandler.class);
         registerHandler("smelt_items", SmeltItemsCommandHandler.class);
         registerHandler("click_recipe", ClickRecipeCommandHandler.class);

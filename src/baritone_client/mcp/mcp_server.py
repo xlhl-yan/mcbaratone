@@ -1269,6 +1269,69 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
+    def capture_frame(ctx: RequestContext, downscale: int = 1) -> Dict[str, Any]:
+        """抓当前画面到**固定路径**，覆盖上一帧（比 `screenshot` 更适合连续看）。
+
+        和 `screenshot` 的区别，正是"反复看画面"需要的两点：
+        - **路径固定** `<gameDir>/screenshots/latest_frame.png` —— 不会堆一屏文件，
+          读的时候也不用先去列目录找最新的那张；
+        - **可缩放**：`downscale=2` 宽度减半、`3` 减到三分之一（1~8）。图越小，
+          读进上下文越便宜也越快，看个大概时用 2 或 3 就够了。
+
+        返回 `path` 是绝对路径，直接当图片读。⚠️ 同样是异步写盘，以返回里的
+        `saved` 为准。
+
+        什么时候用它、什么时候用数字：
+        - **要用它**：「这地方像什么」「是不是村庄/悬崖/洞穴口」「怪物在哪个方向」
+        - **别用它**：「这个方块的 id」「我在哪」—— `get_view` / `get_block` /
+          `get_player_pos` 又快又准，看图只会更慢更贵
+        """
+        level = max(1, min(int(downscale), 8))
+        return _call_bridge(
+            ctx,
+            "command/capture_frame",
+            lambda client: client.transport.dispatch("capture_frame", {"downscale": level}),
+        )
+
+    @mcp.tool()
+    def frame_stream(
+        ctx: RequestContext,
+        action: str = "status",
+        interval_ms: int = 1000,
+        downscale: int = 2,
+    ) -> Dict[str, Any]:
+        """让 bridge **自己按节奏截帧**，我要看时直接取最新那张（不用每次触发）。
+
+        `capture_frame` 的问题是：我调一次才截一帧，而我是回合制的 —— 醒来、看图、
+        想几秒、消失，等我下次再看时那张已经旧了。这里把定时器放进客户端，
+        所以 `latest_frame.png` 永远不超过一个间隔旧。
+
+        - `action="start"` 开始（`interval_ms` 默认 **1000**，最小 100；`downscale` 默认 4）
+        - `action="stop"` 停止
+        - `action="status"` 查询（running / 已截帧数 captures / 失败 failures / 跳过 skipped）
+        - 看完画面**记得 stop**
+
+        ⚠️ **代价**：一次截图约 70~124ms 主线程开销。1 秒一帧基本无感；压到 200ms
+        就会明显吃帧率（20 → 12~15 fps），所以默认 1 秒 + `downscale=4`（约 213×120）。
+        要看清细节，先 stop，再用 `capture_frame(downscale=1)` 拍一张。
+
+        ⚠️ 这是**给 AI 自己用的**开关，不是常态：需要连续盯着"有没有怪过来""玩家在
+        往哪走"时才开，看完关掉。
+        """
+        act = (action or "").strip().lower()
+        if act not in {"start", "stop", "status"}:
+            raise ValueError(f"action must be start/stop/status, got {action!r}")
+        params: Dict[str, Any] = {"action": act}
+        if act == "start":
+            params["interval_ms"] = max(100, min(int(interval_ms), 10_000))
+            params["downscale"] = max(1, min(int(downscale), 8))
+        return _call_bridge(
+            ctx,
+            "command/frame_stream",
+            lambda client: client.transport.dispatch("frame_stream", params),
+        )
+
+    @mcp.tool()
     def get_events(
         ctx: RequestContext,
         event_type: str = "",
