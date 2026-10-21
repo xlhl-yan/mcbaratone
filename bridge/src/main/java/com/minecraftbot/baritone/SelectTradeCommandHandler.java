@@ -17,9 +17,12 @@ import net.minecraft.world.inventory.MerchantMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.trading.MerchantOffer;
 import net.minecraft.world.item.trading.MerchantOffers;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Selects a merchant offer and optionally executes a bounded number of trades. */
 public class SelectTradeCommandHandler extends AsyncCommandHandler {
+    private static final Logger LOGGER = LoggerFactory.getLogger(SelectTradeCommandHandler.class);
     private static final int RESULT_SLOT = 2;
     private static final int MAX_REQUESTED_TRADES = 64;
     private static final long COMMAND_TIMEOUT_NANOS = Duration.ofSeconds(30).toNanos();
@@ -109,12 +112,18 @@ public class SelectTradeCommandHandler extends AsyncCommandHandler {
                     requiredInventoryCount,
                     deadline
                 );
-                if (!completed.valid()
-                        || completed.uses() != expectedUsesBefore + 1
-                        || completed.inventoryCount() < requiredInventoryCount) {
+                // The inventory is the ground truth: the bought item really landed in the pack.
+                // The offer "uses" counter can lag a tick or two behind on a busy server, and
+                // demanding it to be exactly +1 is what turned successful trades into failures
+                // (2026-10-21: seven shears bought, achievement earned, command reported failure).
+                boolean inventoryCovers = completed.valid()
+                    && completed.inventoryCount() >= requiredInventoryCount;
+                if (!inventoryCovers) {
                     String reason = completed.error() != null
                         ? completed.error()
-                        : "Trade was not confirmed by both offer uses and matching inventory result evidence";
+                        : "Trade was not confirmed by the inventory evidence (expected "
+                            + requiredInventoryCount + " matching items, saw "
+                            + (completed.valid() ? completed.inventoryCount() : -1) + ")";
                     return failed(data, tradeNumber - 1, completed.uses(), reason);
                 }
 
@@ -131,6 +140,12 @@ public class SelectTradeCommandHandler extends AsyncCommandHandler {
                 data.addProperty("completed_count", tradeNumber);
                 data.addProperty("uses_after", completed.uses());
             }
+
+            // tryMoveItems fills the payment slots with everything the pack holds that matches
+            // the cost, not just what the trades consume, so leftovers sit in the menu afterwards
+            // (observed live 2026-10-21: 53 emeralds paid in, 2 spent, 51 left on the counter and
+            // the operator thought the stack had vanished). Return them before reporting.
+            returnUnusedInputs(client, context);
 
             Snapshot finalState = snapshot(client, context);
             if (!finalState.valid()) {
@@ -173,6 +188,16 @@ public class SelectTradeCommandHandler extends AsyncCommandHandler {
         if (resultTemplate.isEmpty()) {
             return Initialization.error("Selected offer has an empty result");
         }
+        // Refuse before touching the slots when the pack cannot pay for even one trade.
+        // tryMoveItems(index) shoves whatever matches into the input slots without checking the
+        // cost, so an under-stocked pack gets emptied into the menu and the trade then waits out
+        // the whole deadline. Observed live on 2026-10-21: 10 black wool against a cost of 18,
+        // every piece swallowed by the menu, 30s timeout, nothing bought.
+        String shortfall = describeInputShortfall(client.player.getInventory(), offer, count);
+        if (shortfall != null) {
+            return Initialization.error("Not enough inputs to trade: " + shortfall);
+        }
+
         int inventoryCountBefore = countMatching(client.player.getInventory(), resultTemplate);
         JsonObject data = baseResult(menu, offer, index, count, usesBefore, inventoryCountBefore);
         selectAndAutofill(client, menu, index);
@@ -218,13 +243,72 @@ public class SelectTradeCommandHandler extends AsyncCommandHandler {
         if (!matchesResult(result, context.resultTemplate())) {
             throw new IllegalStateException("Merchant result slot no longer matches selected offer");
         }
+        // PICKUP, not QUICK_MOVE. A shift-click on the result slot means "trade as many times as
+        // the inputs allow", so a request for one trade silently became seven (observed live on
+        // 2026-10-21: count=1, 64 emeralds spent on two-emerald shears, seven shears gained, the
+        // offer counter at 7/12). It also made the caller's confirmation check fail, because the
+        // offer uses moved by seven instead of one while the trade had in fact succeeded.
         client.gameMode.handleContainerInput(
             context.menu().containerId,
             RESULT_SLOT,
             0,
-            ContainerInput.QUICK_MOVE,
+            ContainerInput.PICKUP,
             client.player
         );
+        // A single PICKUP leaves the bought item on the cursor; park it in the pack so the
+        // inventory evidence reflects the trade.
+        int emptySlot = findEmptyPlayerSlotOnClientThread(client, context);
+        if (emptySlot >= 0) {
+            client.gameMode.handleContainerInput(
+                context.menu().containerId,
+                emptySlot,
+                0,
+                ContainerInput.PICKUP,
+                client.player
+            );
+        }
+    }
+
+    /**
+     * Move whatever is left in the payment slots back into the pack.
+     *
+     * <p>{@code tryMoveItems} shoves every matching item into the slots rather than just what the
+     * requested trades need, so leftovers stay on the counter after the trade finishes. A
+     * shift-click on an input slot moves the whole stack back out to the inventory.
+     */
+    private void returnUnusedInputs(Minecraft client, TradeContext context) {
+        try {
+            client.submit(() -> {
+                for (int slot = 0; slot <= 1; slot++) {
+                    if (!context.menu().getSlot(slot).getItem().isEmpty()) {
+                        client.gameMode.handleContainerInput(
+                            context.menu().containerId,
+                            slot,
+                            0,
+                            ContainerInput.QUICK_MOVE,
+                            client.player
+                        );
+                    }
+                }
+                return null;
+            }).get(CLIENT_TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            Thread.sleep(120);
+        } catch (Exception e) {
+            LOGGER.warn("Could not return unused trade inputs: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * First empty main-inventory slot of the merchant screen (0..2 are the trade's own slots,
+     * 3..38 are the player's).
+     */
+    private int findEmptyPlayerSlotOnClientThread(Minecraft client, TradeContext context) {
+        for (int slot = 3; slot <= 38; slot++) {
+            if (context.menu().getSlot(slot).getItem().isEmpty()) {
+                return slot;
+            }
+        }
+        return -1;
     }
 
     private Snapshot awaitResultReady(
@@ -306,6 +390,42 @@ public class SelectTradeCommandHandler extends AsyncCommandHandler {
         menu.setSelectionHint(index);
         menu.tryMoveItems(index);
         client.getConnection().send(new ServerboundSelectTradePacket(index));
+    }
+
+    /**
+     * Describe what the pack is missing to pay for {@code count} trades, or null when it can pay
+     * for all of them.
+     *
+     * <p>Checked before any slot is touched: {@code tryMoveItems} does not look at the cost, so
+     * without this an under-stocked pack gets emptied into the menu and the trade waits out the
+     * entire deadline instead of failing fast.
+     */
+    private String describeInputShortfall(Inventory inventory, MerchantOffer offer, int count) {
+        StringBuilder sb = new StringBuilder();
+        String a = costShortfall(inventory, offer.getBaseCostA(), count);
+        String b = costShortfall(inventory, offer.getCostB(), count);
+        if (a != null) {
+            sb.append(a);
+        }
+        if (b != null) {
+            if (sb.length() > 0) {
+                sb.append("; ");
+            }
+            sb.append(b);
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private String costShortfall(Inventory inventory, ItemStack cost, int count) {
+        if (cost == null || cost.isEmpty()) {
+            return null;
+        }
+        int needed = cost.getCount() * count;
+        int have = countMatching(inventory, cost);
+        if (have >= needed) {
+            return null;
+        }
+        return "need " + needed + "x " + cost.getHoverName().getString() + " but have " + have;
     }
 
     private int countMatching(Inventory inventory, ItemStack expected) {
