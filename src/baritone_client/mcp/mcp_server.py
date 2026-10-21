@@ -1277,6 +1277,29 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
+    def select_trade(index: int, ctx: RequestContext, count: int = 1) -> Dict[str, Any]:
+        """Trade with the villager whose trading screen is currently open.
+
+        前置：先 `entity_interact(trade)` 把交易界面打开（只认村民），再 `get_screen`
+        看报价列表 —— `index` 就是那份列表里的序号（从 0 开始）。bridge 会自己选中该
+        报价、把材料填进输入格、点结果槽成交，并做**双重校验**（该报价 uses 增加
+        **且** 背包里产物数量增加）才算成功，所以它报 `completed_count` 时是真的到账了。
+
+        `count` 是连续成交几次，受"该报价剩余次数"和手上的材料数量限制。
+
+        失败会明确区分原因：没开交易界面 / 序号越界 / 该报价缺货 / 剩余次数不够 /
+        材料不足 / 等结果超时。**交易会消耗绿宝石等货币**，不确定就先 `get_screen`
+        核对报价再下单。
+        """
+        return _call_bridge(
+            ctx,
+            "command/select_trade",
+            lambda client: client.transport.dispatch(
+                "select_trade", {"index": int(index), "count": int(count)}
+            ),
+        )
+
+    @mcp.tool()
     def place_block(block: str, x: int, y: int, z: int, ctx: RequestContext) -> Dict[str, Any]:
         """Place a block at coordinates (it must be in the inventory).
 
