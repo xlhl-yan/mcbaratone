@@ -10,9 +10,14 @@
         port: 5556
         # 事件驱动：每 3 秒看一眼有没有新聊天，有新话才唤醒 agent。
         tickSeconds: 3
-        # AI 自己说的话不要把自己吵醒。
-        ignoreSenders:
-          - DeepSeek
+        # 玩家账号名（人类那侧）。用于跟丢判断和主动说话点名。
+        # 也可以在 DSH 设置页「Minecraft 陪玩」里改 —— 那里改完立即生效。
+        playerName: xlhl_world
+        # AI 自己的账号名。两处用它：排除"自己说的话"、从实体列表里排除自己。
+        aiAccount: DeepSeek
+        # AI 自己说的话不要把自己吵醒。**留空 = 自动用 [aiAccount]**，通常不用手填。
+        # 还需要忽略别人时再列出来，例如 [DeepSeek, SomeOtherBot]。
+        ignoreSenders: []
         # 单轮最多投递几条，防刷屏。
         maxPerTick: 10
         # 日志目录。留空 = <DSH_HOME>/mc-chat-watch
@@ -35,8 +40,6 @@
         maxPerHour: 8
         lowHealthThreshold: 6
         lostDistance: 30
-        # 盯着的玩家（跟丢判断用）。
-        watchPlayer: xlhl_world
         # 哪些物品算「值得炫耀」。可以自己加。
         valuableItems:
           - diamond

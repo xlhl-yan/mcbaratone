@@ -13,7 +13,7 @@
 
 import { createConnection } from 'node:net';
 import { readdirSync, statSync } from 'node:fs';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -28,8 +28,21 @@ const DEFAULTS = {
   port: 5556,
   /** 轮询间隔（秒）。事件驱动，所以可以短；3s 对聊天够用。 */
   tickSeconds: 3,
-  /** 这些发送者的消息不投递（AI 自己说的别把自己吵醒）。 */
-  ignoreSenders: ['DeepSeek'],
+  /** 玩家账号名。用于「跟丢判断」和主动说话时点名。 */
+  playerName: 'xlhl_world',
+  /**
+   * AI 自己的账号名。
+   *
+   * 两处用它：① 假装不是自己说的话（`ignoreSenders` 留空时自动取它）；
+   * ② 从 `get_entities` 的玩家列表里排除自己这个实体 —— 以前这里写死 'DeepSeek'，
+   * 换账号就得改源码。
+   */
+  aiAccount: 'DeepSeek',
+  /**
+   * 这些发送者的消息不投递（AI 自己说的别把自己吵醒）。
+   * **留空 = 自动用 [aiAccount]**，通常不用手填。
+   */
+  ignoreSenders: [],
   /** 单次 tick 最多投递几条，防刷屏。 */
   maxPerTick: 10,
   /** 找「最近有写入的会话」的根目录。留空 = <DSH_HOME>/sessions */
@@ -53,7 +66,18 @@ export function resolveConfig(input = {}) {
   cfg.tickSeconds = Math.max(1, Number(cfg.tickSeconds) || DEFAULTS.tickSeconds);
   cfg.maxPerTick = Math.max(1, Number(cfg.maxPerTick) || DEFAULTS.maxPerTick);
   cfg.timeoutMs = Math.max(500, Number(cfg.timeoutMs) || DEFAULTS.timeoutMs);
-  if (!Array.isArray(cfg.ignoreSenders)) cfg.ignoreSenders = [...DEFAULTS.ignoreSenders];
+  // 账号名。兼容早期的 watchPlayer 键（那时叫这个，老配置还能用）。
+  // 注意不能写成 `cfg.playerName || input.watchPlayer`：cfg 已经把 DEFAULTS 摊进来了，
+  // cfg.playerName 永远有值，旧键会被永远短路掉。
+  const rawPlayer = input.playerName !== undefined
+    ? input.playerName
+    : (input.watchPlayer !== undefined ? input.watchPlayer : DEFAULTS.playerName);
+  cfg.playerName = String(rawPlayer).trim() || DEFAULTS.playerName;
+  cfg.aiAccount = String(cfg.aiAccount || DEFAULTS.aiAccount).trim() || DEFAULTS.aiAccount;
+  // 留空 = 只忽略 AI 自己说的（这也是历史默认行为）
+  if (!Array.isArray(cfg.ignoreSenders) || cfg.ignoreSenders.length === 0) {
+    cfg.ignoreSenders = [cfg.aiAccount];
+  }
   return cfg;
 }
 
@@ -347,8 +371,59 @@ export function parseControlCommand(text) {
   return null;
 }
 
+/** 设置页与 Host 半的配对键：两半必须用同一个字符串。 */
+export const SETTINGS_NS = 'mc-chat-watch';
+
 export function apply(ctx, input = {}) {
   const cfg = resolveConfig(input);
+
+  // ── 设置页（Host 半）───────────────────────────────────────────────
+  // 只注册命名空间与"配置变了"的回调；表单由 ./client.js 那一半画。
+  //
+  // 🔴 绝对不要用 ctx.inject(['settings'], ...)：cordis 的 inject 语义是"声明的服务
+  // 一直不出现就永久 pending"，而 pending 的插件会让整个 web boot 失败 —— 2026-10-21
+  // 实测白屏："web boot: 1 entry did not activate"。这里全部走软获取：拿不到就跳过，
+  // 插件本体照常工作，只是没有设置页。
+  try {
+    const settingsSvc = typeof ctx.get === 'function' ? ctx.get('settings') : ctx.settings;
+    if (settingsSvc && typeof settingsSvc.installSection === 'function') {
+      settingsSvc.installSection(ctx, SETTINGS_NS, null, cfg, {
+        // 设置页写入后，把新值同步回运行期 —— cfg 是本地对象，直接改它
+        setSource: (get) => {
+          try {
+            const next = typeof get === 'function' ? get() : null;
+            if (next && typeof next === 'object') Object.assign(cfg, resolveConfig(next));
+          } catch {
+            /* 取不到就继续用旧的 */
+          }
+        },
+        // 改完立刻重建后续要用到的派生值（账号名等），不用重启 DSH
+        onChange: () => {
+          try {
+            Object.assign(cfg, resolveConfig(cfg));
+          } catch {
+            /* 同上 */
+          }
+          // 🧹 设置页已成为"态势/自主"的唯一真源：把这几个**运行时覆盖文件**清掉。
+          // 它们优先级高于 config（游戏内命令写进来的），留着会让页面上的改动不生效。
+          // 代价是"以前用游戏内命令调过的值"会被重置成 config 里的值 —— 这正是把
+          // 所有开关集中到设置页的目的。
+          try {
+            const { dir: stateDir } = statePaths(cfg);
+            for (const name of ['observe-switch.txt', 'autonomy-switch.txt', 'tuning.json']) {
+              const target = join(stateDir, name);
+              if (existsSync(target)) rmSync(target, { force: true });
+            }
+          } catch {
+            /* 删不掉就下次 tick 现读时仍按文件走，不影响主流程 */
+          }
+        },
+      });
+    }
+  } catch {
+    /* 设置服务不可用：功能照旧，只是没有页面 */
+  }
+
   const { dir } = statePaths(cfg);
   try {
     mkdirSync(dir, { recursive: true });
@@ -515,7 +590,7 @@ export function apply(ctx, input = {}) {
     secondsPerHour: 3600_000,
     lowHealth: Number(input.lowHealthThreshold) || 6,
     lostDistance: Number(input.lostDistance) || 30,
-    playerName: input.watchPlayer || 'xlhl_world',
+    playerName: cfg.playerName,
     cooldowns: {
       lowHealth: 120_000,
       nightfall: 600_000,
@@ -742,7 +817,7 @@ export function apply(ctx, input = {}) {
           const other = list.find((e) => {
             const t = String(e.type || e.entity_type || '');
             if (!t.includes('player')) return false;
-            return String(e.name || '') !== 'DeepSeek'; // 排除自己
+            return String(e.name || '') !== cfg.aiAccount; // 排除自己
           });
           if (other) {
             let dist = Number(other.distance);
@@ -967,7 +1042,7 @@ export function apply(ctx, input = {}) {
       const ents = await bridgeCall(cfg, 'get_entities', { radius: 32 });
       const list = (ents && ents.data && ents.data.entities) || [];
       const players = list.filter(
-        (e) => String(e.type || '').includes('player') && String(e.name || '') !== 'DeepSeek',
+        (e) => String(e.type || '').includes('player') && String(e.name || '') !== cfg.aiAccount,
       );
       // 只报「会动、可能有威胁」的活物，把鱼/蝙蝠这类噪音滤掉
       const NOISE = ['cod', 'salmon', 'tropical_fish', 'bat', 'item', 'experience_orb'];
