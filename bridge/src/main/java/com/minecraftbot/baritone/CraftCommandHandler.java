@@ -90,15 +90,45 @@ public class CraftCommandHandler implements CommandHandler {
                     return CompletableFuture.completedFuture(CommandResult.error("Failed to place ingredients: " + result));
                 }
                 Thread.sleep(150); // Increased delay
-                
-                // Click output slot (slot 0) to craft
+
+                // Verify the grid actually holds what the recipe asked for. Each PUT only gets
+                // 60ms, so a late one silently changes the recipe: stone_pickaxe minus one
+                // cobblestone is exactly the shape of a stone hoe, and Minecraft happily crafts
+                // that. The old code never looked, so it reported success for the wrong item.
+                String gridError = verifyCraftingGrid(client, syncId, recipe, hasCraftingTable);
+                if (gridError != null) {
+                    if (crafted > 0) {
+                        break;
+                    }
+                    return CompletableFuture.completedFuture(CommandResult.error(
+                        "Crafting grid does not match " + recipeId + ": " + gridError));
+                }
+
+                // Click output slot (slot 0) to craft. Count the result before and after
+                // instead of trusting the click: a QUICK_MOVE on an empty/unfilled output
+                // does nothing at all, and the old code booked it as a craft anyway.
+                int before = countItemInInventory(client, recipeId);
                 client.execute(() -> {
                     client.gameMode.handleContainerInput(syncId, 0, 0, ContainerInput.QUICK_MOVE, client.player);
                 });
-                Thread.sleep(150); // Increased delay
-                
-                crafted += recipe.outputCount;
-            } catch (Exception e) {
+                Thread.sleep(200); // Increased delay
+
+                // QUICK_MOVE on the output slot sometimes leaves the crafted item on the cursor
+                // instead of putting it into the inventory (confirmed live on 2026-10-16). Clear
+                // the cursor first: otherwise the inventory shows "nothing gained" and a
+                // successful craft is reported as a failure.
+                clearCursorIntoInventory(client, syncId, hasCraftingTable);
+
+                int gained = countItemInInventory(client, recipeId) - before;
+                if (gained <= 0) {
+                    if (crafted > 0) {
+                        break;
+                    }
+                    return CompletableFuture.completedFuture(CommandResult.error(
+                        "Craft produced no " + recipeId + " (grid held the right items, but the"
+                            + " output slot did not yield; expected " + recipe.outputCount + ")"));
+                }
+                crafted += gained;            } catch (Exception e) {
                 LOGGER.error("Crafting error", e);
                 if (crafted == 0) {
                     return CompletableFuture.completedFuture(CommandResult.error("Crafting failed: " + e.getMessage()));
@@ -595,8 +625,7 @@ public class CraftCommandHandler implements CommandHandler {
     }
     
     private String placeIngredients(Minecraft client, int syncId, CraftRecipe recipe, boolean isTable) {
-        int gridStart = 1; // Output is slot 0
-        // isTable is now passed in based on actual screen type, not recipe.requiresTable
+        // isTable is passed in based on the actual screen type, not recipe.requiresTable
         
         for (int i = 0; i < recipe.grid.length; i++) {
             String item = recipe.grid[i];
@@ -608,15 +637,9 @@ public class CraftCommandHandler implements CommandHandler {
             //            2 3               4 5 6
             //                              7 8 9
             // So 2x2 index 0→slot 1, 1→slot 2, 2→slot 4, 3→slot 5
-            int gridSlot;
-            if (isTable && recipe.grid.length == 4) {
-                // 2x2 recipe on 3x3 table - map row/col correctly
-                int row = i / 2;
-                int col = i % 2;
-                gridSlot = gridStart + (row * 3) + col; // row * 3 because 3x3 grid
-            } else {
-                gridSlot = gridStart + i;
-            }
+            // Same mapping the post-placement verification uses - keep it in one place so the
+            // two can never drift apart.
+            int gridSlot = gridSlotFor(i, recipe, isTable);
             
             // Re-find slot every time to handle moving items (inefficient but safe)
             int sourceSlot = findItemSlot(client, item, syncId, isTable);
@@ -668,5 +691,106 @@ public class CraftCommandHandler implements CommandHandler {
         }
         
         return null; // success
+    }
+
+    /**
+     * Recipe index to screen slot. Output is slot 0, so the grid starts at 1.
+     *
+     * <p>A 2x2 recipe placed on a 3x3 table has to be laid out row/column-wise; putting it at
+     * slots 1,2,3,4 instead would leave the bottom row of the "2x2" in the wrong cells and
+     * distort the shape. Everything else is a straight {@code 1 + i}.
+     */
+    private static int gridSlotFor(int index, CraftRecipe recipe, boolean isTable) {
+        final int gridStart = 1;
+        if (isTable && recipe.grid.length == 4) {
+            int row = index / 2;
+            int col = index % 2;
+            return gridStart + (row * 3) + col;
+        }
+        return gridStart + index;
+    }
+
+    /**
+     * Check that the crafting grid holds exactly what the recipe asked for, before the output
+     * slot is clicked.
+     *
+     * <p>Ingredients go in one PUT at a time with only 60ms between them. When one of those
+     * lands late (or not at all), the grid ends up holding a *different* valid shape and
+     * Minecraft crafts that instead: a stone pickaxe missing one cobblestone is exactly a
+     * stone hoe. That is how the bot came back with a hoe when asked for a pickaxe, and why the
+     * failure was invisible - the output click still "succeeded" and nothing was ever re-read.
+     *
+     * @return null when the grid matches, otherwise a description of the first mismatch
+     */
+    private String verifyCraftingGrid(Minecraft client, int syncId, CraftRecipe recipe, boolean isTable) {
+        for (int i = 0; i < recipe.grid.length; i++) {
+            String expected = recipe.grid[i];
+            int gridSlot = gridSlotFor(i, recipe, isTable);
+            ItemStack actual = client.player.containerMenu.getSlot(gridSlot).getItem();
+            String actualId = actual.isEmpty()
+                ? ""
+                : BuiltInRegistries.ITEM.getKey(actual.getItem()).toString();
+
+            boolean wantsEmpty = expected == null || expected.isEmpty();
+            if (wantsEmpty) {
+                if (!actual.isEmpty()) {
+                    return "slot " + gridSlot + " should be empty but holds " + actualId;
+                }
+            } else if (!matchesSelector(expected, actualId)) {
+                return "slot " + gridSlot + " should be " + expected
+                    + " but holds " + (actualId.isEmpty() ? "nothing" : actualId);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Put whatever is on the cursor back into the player's inventory.
+     *
+     * <p>{@code QUICK_MOVE} on a crafting output slot does not always move the result into the
+     * inventory - it can land on the cursor instead (confirmed live on 2026-10-16). Anything
+     * that reads the inventory afterwards then sees nothing, which is how a real craft got
+     * reported as "no product". If there is no room we leave the item on the cursor rather than
+     * dropping it into the world.
+     */
+    private void clearCursorIntoInventory(Minecraft client, int syncId, boolean isTable) {
+        if (client.player == null) {
+            return;
+        }
+        ItemStack cursor = client.player.containerMenu.getCarried();
+        if (cursor.isEmpty()) {
+            return;
+        }
+        int emptySlot = findEmptyPlayerSlot(client, syncId, isTable);
+        if (emptySlot < 0) {
+            LOGGER.warn("Cursor holds {} but the inventory has no empty slot to take it", cursor);
+            return;
+        }
+        final int target = emptySlot;
+        client.execute(() -> {
+            client.gameMode.handleContainerInput(syncId, target, 0, ContainerInput.PICKUP, client.player);
+        });
+        try {
+            Thread.sleep(80);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * First empty player-inventory slot, as a screen slot id.
+     *
+     * <p>The layout differs per screen: a 3x3 crafting table keeps the player inventory at
+     * 10..45, while the 2x2 inventory screen keeps it at 1..36.
+     */
+    private int findEmptyPlayerSlot(Minecraft client, int syncId, boolean isTable) {
+        int first = isTable ? 10 : 1;
+        int last = isTable ? 45 : 36;
+        for (int slot = first; slot <= last; slot++) {
+            if (client.player.containerMenu.getSlot(slot).getItem().isEmpty()) {
+                return slot;
+            }
+        }
+        return -1;
     }
 }
