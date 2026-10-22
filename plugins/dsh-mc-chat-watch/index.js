@@ -13,7 +13,7 @@
 
 import { createConnection } from 'node:net';
 import { readdirSync, statSync } from 'node:fs';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -59,7 +59,62 @@ const DEFAULTS = {
   device: '【PC】',
   /** 单次 TCP 超时（毫秒）。 */
   timeoutMs: 4000,
+  /**
+   * 受伤回应：挨打时是否立刻叫醒 agent 让它反击/逃命。
+   * 关掉后受伤只当普通事件攒进态势，不再单独唤醒。
+   */
+  hurtResponse: true,
+  /**
+   * 受伤后延迟几秒才叫醒（0 = 立即）。
+   *
+   * 为什么留这个：检测是 1 秒一轮、立刻唤醒，但"立刻"有时反而帮倒忙 ——
+   * 被连击时 agent 刚开口就被打断。给一个可调的缓冲，自己权衡"反应快"与"别打断"。
+   */
+  hurtResponseDelaySeconds: 0,
+  /**
+   * 被**玩家**打时是否回击。
+   *
+   * 默认 true（保持原有行为：谁打我都还手）。在双人世界里把它关掉，
+   * AI 就只在挨 NPC 打时反击，被玩家误伤时不会反过来打你。
+   */
+  retaliateOnPlayerHurt: true,
+  /** 同一场战斗的唤醒节流（秒）—— 一场战斗只叫醒一次，避免反复打断。 */
+  hurtWakeGapSeconds: 60,
 };
+
+/**
+ * 环境伤害类型 → 中文名 + 精确处置。
+ *
+ * 键来自 bridge 的 `DamageSource.getMsgId()`（原版 MsgId，不带 `minecraft:`）。
+ * 让 AI 直接知道"你溺水了 / 你在岩浆里"，比它自己去翻 air_supply / eyes_in_water
+ * 猜一遍快得多，也省一轮工具调用 —— 这几秒常常就是生死线。
+ */
+const HAZARD_TYPES = {
+  drown: ['溺水', '立刻上浮换气：往水面游，或挖开头顶那块方块'],
+  lava: ['掉进岩浆', '立刻退离岩浆（别在原地打转）；有抗火药水就喝，没有就往最近的岸上跑'],
+  on_fire: ['身上着火', '跳进水里或跑进雨里；没有水源就跑开远离火源'],
+  in_fire: ['站在火焰里', '立刻退出火焰方块'],
+  hot_floor: ['踩到岩浆块', '立刻离开岩浆块上方'],
+  in_wall: ['卡在方块里窒息', '立刻往后退或往上，挖开卡住你的那块方块'],
+  cramming: ['被 mob 挤住', '立刻走开，别卡在怪堆里'],
+  starve: ['饿到掉血', '立刻吃东西'],
+  fall: ['摔落', '先确认高度、别再往边上走；血低先吃东西回血'],
+  fly_into_wall: ['鞘翅撞墙', '停止滑翔，先落地'],
+  cactus: ['碰到仙人掌', '立刻离开仙人掌旁边'],
+  sweet_berry_bush: ['走进甜浆果丛', '立刻走出浆果丛'],
+  freeze: ['冰冻', '立刻离开细雪/冰面，靠近热源'],
+  out_of_world: ['掉出世界', '基本已经救不回来了，准备重生'],
+  generic: ['不明原因伤害', '看 get_state 的 health / last_damage_source 再判断'],
+};
+
+/** 把 `damage_type` 翻成「中文名 + 处置」。认不出来的类型原样展示。 */
+function describeHazard(damageType) {
+  const key = String(damageType || '').replace(/^minecraft:/i, '').trim().toLowerCase();
+  if (!key) return null;
+  const hit = HAZARD_TYPES[key];
+  if (hit) return { key, zh: hit[0], fix: hit[1] };
+  return { key, zh: `${key}（未收录的环境伤害）`, fix: '看 get_state 的 health / on_fire / air_supply 判断' };
+}
 
 export function resolveConfig(input = {}) {
   const cfg = { ...DEFAULTS, ...input };
@@ -122,6 +177,18 @@ export function bridgeCall(cfg, command, params = {}) {
       sock.write(asciiEscape(payload) + '\n');
     });
     let buf = '';
+    // 🔴 2026-10-22 用户报「你的游戏内回复变成乱码了」→ 排查后发现**是插件这边解错**：
+    //
+    // · 原来写的是 `new TextDecoder('gbk').decode(chunk)`。bridge 历史上确实用 GBK
+    //   （Java 的 `InputStreamReader` 没指定字符集，走中文 Windows 的平台默认），
+    //   但 2026-10-22 已把 bridge 两侧钉死成 UTF-8（`ConnectionHandler` 的
+    //   InputStreamReader / OutputStreamWriter 都显式传 StandardCharsets.UTF_8）。
+    //   于是 UTF-8 字节被插件当 GBK 解 → 「编码修好了」变成「缂栫爜淇ソ浜」。
+    //
+    // · 第二个坑：`decode(chunk)` 默认 `{stream:false}`，把每个 TCP 分片当独立文本解。
+    //   一个汉字 3 字节，一旦跨分片就两边都解坏 —— 必须开 `{stream:true}` 让解码器
+    //   自己缓存半个字符。实例复用，别每次 new。
+    const decoder = new TextDecoder('utf-8');
     const done = (fn, arg) => {
       if (settled) return;
       settled = true;
@@ -133,7 +200,7 @@ export function bridgeCall(cfg, command, params = {}) {
       fn(arg);
     };
     sock.on('data', (chunk) => {
-      buf += new TextDecoder('gbk').decode(chunk);
+      buf += decoder.decode(chunk, { stream: true });
       const nl = buf.indexOf('\n');
       if (nl < 0) return;
       const line = buf.slice(0, nl).trim();
@@ -285,92 +352,6 @@ export function parseChatEvent(event, ignoreSenders) {
   return { sender, raw, text };
 }
 
-/**
- * 游戏内控制命令词表。
- *
- * 前缀特意用中文，不用 `!` —— `!` 会被 Baritone 抢去当命令解析，刷一屏
- * 「未知或不完整的命令」（与 bridge 侧「唤醒会话」同一个坑）。
- * 整串匹配（^…$），所以正常说话里的「自主」「态势」不会误触发。
- */
-const CONTROL_PATTERNS = [
-  {
-    key: 'autonomy',
-    re: /^(?:空闲)?自主(?:任务)?\s*(?:开关)?\s*(开|打开|开启|启用|关|关闭|停|停用|禁用|状态|on|off|status)?$/i,
-  },
-  {
-    key: 'observe',
-    re: /^(?:游戏)?态势(?:提醒|播报)?\s*(?:开关)?\s*(开|打开|开启|启用|关|关闭|停|停用|禁用|状态|on|off|status)?$/i,
-  },
-];
-
-/**
- * 「间隔」类命令：游戏里直接改运行节奏，不用回来动 YAML。
- *
- *   自主 间隔 600      → 两次「自主时间」至少隔 600 秒（花费的主闸门）
- *   自主 空闲 60       → 角色闲满 60 秒就交（低于这个值不会提前叫）
- *   态势 间隔 300      → 每 300 秒采一次态势
- *   不带数字 = 查询当前值（`自主 间隔`）
- *
- * 值写进 <stateDir>/tuning.json，**tick 时现读**，所以改完立即生效、不用重启 DSH；
- * 删掉文件或某个键就回到 cordis config 里的默认值。
- */
-const TUNE_PATTERNS = [
-  {
-    key: 'autonomy',
-    field: 'autonomyMinGapSeconds',
-    label: '空闲自主间隔',
-    re: /^(?:空闲)?自主(?:任务)?\s*(?:间隔|周期|频率)\s*(\d+)?\s*(?:秒|s)?$/i,
-  },
-  {
-    key: 'autonomy',
-    field: 'autonomyIdleSeconds',
-    label: '空闲判定阈值',
-    re: /^(?:空闲)?自主(?:任务)?\s*(?:空闲|闲置)\s*(\d+)?\s*(?:秒|s)?$/i,
-  },
-  {
-    key: 'observe',
-    field: 'observeSeconds',
-    label: '态势采样间隔',
-    re: /^(?:游戏)?态势(?:提醒|播报)?\s*(?:间隔|周期|频率)\s*(\d+)?\s*(?:秒|s)?$/i,
-  },
-];
-
-/** 命令里的动作词 → 'on' / 'off' / 'status'（没给动作词 = 查询）。 */
-function parseAction(word) {
-  const w = String(word || '').toLowerCase();
-  if (w === '') return 'status';
-  if (['关', '关闭', '停', '停用', '禁用', 'off'].includes(w)) return 'off';
-  if (['开', '打开', '开启', '启用', 'on'].includes(w)) return 'on';
-  return 'status';
-}
-
-/**
- * 「这句话是不是控制命令？」是就返回命令对象，不是返回 null。
- *
- * - 开分类：`{ kind: 'switch', key, action }`，key：autonomy | observe，action：on | off | status
- * - 间隔类：`{ kind: 'tune', key, field, label, seconds }`，seconds 为 null 表示查询
- */
-export function parseControlCommand(text) {
-  const t = String(text || '').trim();
-  // 先试「间隔」：`自主 间隔 600` 不含开关动作词，两者不会互相误吃。
-  for (const { key, field, label, re } of TUNE_PATTERNS) {
-    const m = re.exec(t);
-    if (m) {
-      return {
-        kind: 'tune',
-        key,
-        field,
-        label,
-        seconds: m[1] === undefined ? null : Number(m[1]),
-      };
-    }
-  }
-  for (const { key, re } of CONTROL_PATTERNS) {
-    const m = re.exec(t);
-    if (m) return { kind: 'switch', key, action: parseAction(m[1]) };
-  }
-  return null;
-}
 
 /** 设置页与 Host 半的配对键：两半必须用同一个字符串。 */
 export const SETTINGS_NS = 'mc-chat-watch';
@@ -444,7 +425,17 @@ function sendJson(res, status, payload) {
 }
 
 export function apply(ctx, input = {}) {
-  const cfg = resolveConfig(input);
+  // 优先级：settings.json（页面改的） > cordis config > 代码默认值。
+  //
+  // 🔴 2026-10-22 踩的坑：这里原本只写 `resolveConfig(input)`，于是**启动时根本不读
+  // settings.json** —— 页面存的值只在当次 POST 里生效，一重启 DSH 就退回 cordis.yml
+  // 里硬编码的旧值（用户实测"配置页改的 session-id 没生效"，根因就是这句）。
+  // 现在两步走：先按 cordis 配置算出状态目录 → 再把 settings.json 叠上去。
+  const bootCfg = resolveConfig(input);
+  const bootSaved = readSettingsFile(bootCfg);
+  const cfg = Object.keys(bootSaved).length
+    ? resolveConfig({ ...input, ...bootSaved })
+    : bootCfg;
 
   // ── 设置页的读写接口（HTTP，不依赖 DSH 的 settings 服务）─────────────────
   //
@@ -538,148 +529,70 @@ export function apply(ctx, input = {}) {
   const logPath = join(dir, 'watch.log');
   const sessionsRoot = cfg.sessionsRoot || join(homeDir(), 'sessions');
 
+  // ── 日志轮转（2026-10-22）────────────────────────────────────────────
+  //
+  // 原来只 append 不轮转，跑一天就 10.5 MB —— 大头是每次 observe 都把整包背包铺出来，
+  // 一行 500+ 字符。三处一起改：
+  //   C. **大小上限**：超过 8 MB 把 watch.log 轮转成 watch.prev.log（只留一份）；
+  //   A. **bridge 长时间连不上**（MC 关了）：同样视为"这一轮结束"，轮转一次；
+  //   D. 背包只打关键项（见 formatInventory）。
+  // 留 .prev 而不是直接删：日志是排障的唯一线索，刚才"session 投不出去"就是靠它查出来的。
+  const LOG_MAX_BYTES = 8 * 1024 * 1024;
+  let logBytes = -1;              // -1 = 还没统计过，首次写入时现算
+  let bridgeDownSince = 0;        // bridge 从什么时候开始连不上（0 = 正常）
+  let bridgeDownLogged = false;   // 这轮断开是否已经报过 —— tick 每 3 秒一次，
+                                  // 用时间窗判断会连报 2~3 条，改成布尔标志只报一次
+
+  const rotateLog = (why) => {
+    try {
+      renameSync(logPath, `${logPath}.prev`);
+      logBytes = 0;
+      appendFileSync(logPath, `${new Date().toISOString()} [log] 已轮转（${why}），上一轮见 watch.log.prev\r\n`);
+    } catch {
+      /* 轮转失败就算了，不能因为日志炸掉插件 */
+    }
+  };
+
+  /** bridge 连续异常超过 90 秒 → MC 大概已经关了，轮转一次并清空状态。 */
+  const noteBridgeDown = () => {
+    const now = Date.now();
+    if (!bridgeDownSince) {
+      bridgeDownSince = now;
+      return;
+    }
+    if (now - bridgeDownSince > 90_000) {
+      bridgeDownSince = 0;
+      bridgeDownLogged = false;
+      rotateLog('bridge 断开超过 90 秒（MC 客户端可能已关闭）');
+    }
+  };
+  const noteBridgeUp = () => {
+    bridgeDownSince = 0;
+    bridgeDownLogged = false;
+  };
+  /** 断开时只在第一次记一条日志（tick 每 3 秒跑一次，用时间窗判断会连报好几条）。 */
+  const shouldLogBridgeDown = () => {
+    if (bridgeDownLogged) return false;
+    bridgeDownLogged = true;
+    return true;
+  };
+
   const say = (line) => {
     try {
-      appendFileSync(logPath, `${new Date().toISOString()} ${line}\r\n`);
+      const text = `${new Date().toISOString()} ${line}\r\n`;
+      if (logBytes < 0) {
+        try { logBytes = statSync(logPath).size; } catch { logBytes = 0; }
+      }
+      logBytes += Buffer.byteLength(text, 'utf8');
+      if (logBytes > LOG_MAX_BYTES) {
+        rotateLog(`超过 ${Math.round(LOG_MAX_BYTES / 1024 / 1024)}MB`);
+      }
+      appendFileSync(logPath, text);
     } catch {
       /* 日志写不了也不能炸 */
     }
   };
 
-  // ── 游戏内开关（「自主 关」「态势 开」「自主 状态」）────────────────────
-  // 为什么走游戏内聊天，而不是 DSH 插件页的配置界面：
-  //   DSH 的插件页**不会**从 cordis config 自动生成表单 —— 要由插件自己带
-  //   浏览器半边（browser half）注册 plugins.bundle.config / plugins.row.config
-  //   插槽来画控件（见 dsh-client-modules 的「配置插槽」文档）。本插件是纯 Host
-  //   插件，所以那一页永远是空的（2026-10-15 用户截图确认）。
-  //   于是把开关放到用户能触达的地方 —— MC 聊天栏，一句命令就切，不用改 YAML、
-  //   不用重启 DSH。命令由本插件拦截，不会投给 agent。
-  //
-  // 状态存在 <stateDir>/<key>-switch.txt：文件在 → 听文件的；没有文件 → 跟随
-  // cordis config 里的默认值。删掉文件即恢复配置默认。
-  const switchPaths = {
-    autonomy: join(dir, 'autonomy-switch.txt'),
-    observe: join(dir, 'observe-switch.txt'),
-  };
-  /** 运行时开关的兜底默认值（惰性读 A/O —— 调用时它们一定已经初始化）。 */
-  const switchDefaultOf = (key) => (key === 'autonomy' ? A.enabled : O.enabled);
-
-  const readSwitch = (key) => {
-    let raw;
-    try {
-      raw = readFileSync(switchPaths[key], 'utf8').trim().toLowerCase();
-    } catch {
-      return null; // 没有文件
-    }
-    if (['off', '0', 'false', '关', '关闭'].includes(raw)) return false;
-    if (['on', '1', 'true', '开', '打开'].includes(raw)) return true;
-    return null; // 内容不认 → 当没设过
-  };
-
-  const writeSwitch = (key, on) => {
-    try {
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(switchPaths[key], on ? 'on' : 'off');
-      return true;
-    } catch (error) {
-      say(`[cmd] 写开关失败：${String((error && error.message) || error)}`);
-      return false;
-    }
-  };
-
-  /** 当前到底开没开：开关文件优先，其次看配置。 */
-  const switchOn = (key) => {
-    const v = readSwitch(key);
-    return v === null ? switchDefaultOf(key) : v;
-  };
-
-  // ── 运行时参数（游戏内「自主 间隔 600」「态势 间隔 300」）──────────────
-  // 与开关同一套思路：命令写 <stateDir>/tuning.json，tick 时**现读**，
-  // 所以改完立即生效、不用重启 DSH。删掉文件或某个键 → 回到 cordis config 默认值。
-  const tuningPath = join(dir, 'tuning.json');
-
-  const readTuning = () => {
-    try {
-      const obj = JSON.parse(readFileSync(tuningPath, 'utf8'));
-      return obj && typeof obj === 'object' ? obj : {};
-    } catch {
-      return {}; // 没文件 / 内容坏了：一律当「没设过」
-    }
-  };
-
-  const writeTuning = (field, seconds) => {
-    try {
-      mkdirSync(dir, { recursive: true });
-      const obj = readTuning();
-      obj[field] = seconds;
-      writeFileSync(tuningPath, JSON.stringify(obj, null, 2));
-      return true;
-    } catch (error) {
-      say(`[cmd] 写参数失败：${String((error && error.message) || error)}`);
-      return false;
-    }
-  };
-
-  /** 运行时值优先，没有就用调用方给的配置默认值。 */
-  const tuneValue = (field, fallback) => {
-    const v = Number(readTuning()[field]);
-    return Number.isFinite(v) && v > 0 ? v : fallback;
-  };
-
-  /** 在游戏里回一句话（以 AI 角色身份，会出现在聊天栏）。 */
-  const replyToGame = async (text) => {
-    try {
-      await bridgeCall(cfg, 'chat', { message: text });
-    } catch {
-      /* MC 没开就算了，日志里已经记了 */
-    }
-  };
-
-  /** 某个可调参数的配置默认值（惰性读 A/O —— 调用时它们一定已经初始化）。 */
-  const tuneFallback = (field) => {
-    if (field === 'autonomyMinGapSeconds') return A.minGapSeconds;
-    if (field === 'autonomyIdleSeconds') return A.idleSeconds;
-    if (field === 'observeSeconds') return O.seconds;
-    return 0;
-  };
-
-  const handleControlCommand = async (cmd, parsed) => {
-    // ── 间隔类：改运行节奏 ──────────────────────────────────────────────
-    if (cmd.kind === 'tune') {
-      const current = tuneValue(cmd.field, tuneFallback(cmd.field));
-      if (cmd.seconds === null || !Number.isFinite(cmd.seconds)) {
-        say(`[cmd] ${parsed.sender} 查询「${cmd.label}」→ ${current} 秒`);
-        await replyToGame(`[${cmd.label}] 现在是 ${current} 秒`);
-        return;
-      }
-      // 10 秒 ~ 24 小时：防止手滑打出 0 秒这种疯跑值。
-      const seconds = Math.max(10, Math.min(24 * 3600, Math.round(cmd.seconds)));
-      if (!writeTuning(cmd.field, seconds)) {
-        await replyToGame(`[${cmd.label}] 写入失败，看插件日志`);
-        return;
-      }
-      say(`[cmd] ${parsed.sender} 把「${cmd.label}」改成 ${seconds} 秒（${tuningPath}）`);
-      await replyToGame(`[${cmd.label}] 已改成 ${seconds} 秒`);
-      return;
-    }
-
-    // ── 开关类 ────────────────────────────────────────────────────────
-    const label = cmd.key === 'autonomy' ? '空闲自主' : '态势提醒';
-    if (cmd.action === 'status') {
-      const raw = readSwitch(cmd.key);
-      const shown = raw === null ? switchDefaultOf(cmd.key) : raw;
-      say(`[cmd] ${parsed.sender} 查询「${label}」→ ${shown ? '开' : '关'}${raw === null ? '（配置默认）' : '（游戏内开关）'}`);
-      await replyToGame(`[${label}] 现在是「${shown ? '开' : '关'}」`);
-      return;
-    }
-    const on = cmd.action === 'on';
-    if (!writeSwitch(cmd.key, on)) {
-      await replyToGame(`[${label}] 切换失败，看插件日志`);
-      return;
-    }
-    say(`[cmd] ${parsed.sender} 把「${label}」改成 ${on ? '开' : '关'}（${switchPaths[cmd.key]}）`);
-    await replyToGame(`[${label}] 已${on ? '开启' : '关闭'}`);
-  };
 
   /** null = 还没定起点（首轮先取 latest_seq，不拉历史消息）。 */
   let cursor = null;
@@ -743,7 +656,7 @@ export function apply(ctx, input = {}) {
     const text =
       `（游戏内事件，需要你主动开口）${situation}\n` +
       `请用 mcp__baritone__say 工具在游戏里说一句自然、简短的话（别解释、别播报工具名）。`;
-    const r = deliverToSession(ctx, sessionsRoot, text, effectiveSessionId);
+    const r = deliverToSession(ctx, sessionsRoot, text, currentSessionId());
     say(`[proactive] 唤醒 agent：${r.ok ? '已进会话' : `失败(${r.why})`}`);
     return r;
   };
@@ -754,39 +667,40 @@ export function apply(ctx, input = {}) {
     hungry: ['我饿了，得找点吃的', '肚子咕咕叫…'],
   };
 
-  // 目标会话的优先级：游戏里 !waken 设的 > 配置文件 sessionId > 自动挑最近活跃的。
-  // 玩家能在游戏里随时改，不用回来动配置文件。
-  let effectiveSessionId = String(cfg.sessionId || '').trim();
-  let sessionSyncedAt = 0;
-  const syncSessionFromGame = async (force = false) => {
-    const now = Date.now();
-    if (!force && now - sessionSyncedAt < 10000) return;
-    sessionSyncedAt = now;
-    try {
-      const r = await bridgeCall(cfg, 'get_waken_session', {});
-      const fromGame = String((r && r.data && r.data.session_id) || '').trim();
-      if (fromGame && fromGame !== effectiveSessionId) {
-        effectiveSessionId = fromGame;
-        say(`[session] 游戏侧指定了唤醒会话：${fromGame}`);
-      }
-    } catch {
-      /* bridge 不在就沿用上一次的值 */
-    }
-  };
+  // 目标会话来源：只认配置 / 设置页里的 sessionId。
+  // 曾经还有一条"游戏里 !waken 改会话、插件每 10 秒问一次 bridge"的路径
+  // （syncSessionFromGame → get_waken_session），2026-10-22 用户拍板：
+  // **唤醒会话已经统一搬到插件设置页，那条路毫无意义** —— 每 10 秒一次
+  // bridge 往返、返回的永远是同一个值，纯浪费。已删除。
+  //
+  // ⚠️ 必须是**函数**而不是 const 快照：设置页改 sessionId 时只更新 cfg，
+  // 早先写成 `const effectiveSessionId = ...` 会让它永远停在 apply 那一刻的值
+  // （2026-10-22 用户实测"配置页改的 session-id 没生效"）。每次调用现读。
+  const currentSessionId = () => String(cfg.sessionId || '').trim();
+
+  /**
+   * 总开关。
+   *
+   * 🔴 2026-10-22 用户报「我在设置页把总开关关掉了，为什么还是有提示」：
+   * 原来只有 `tick`（聊天监听）检查 `cfg.enabled`，而 proactive / notable / observe /
+   * autonomy 四个引擎各自只看自己的小开关 —— 于是「总开关」实际上只管聊天，
+   * 态势播报和空闲自主照常在跑。总开关的语义必须是**一键全停**。
+   */
+  const masterOn = () => boolOf(cfg.enabled, true);
 
   const tick = async () => {
-    if (!cfg.enabled) return;
+    if (!masterOn()) return;
     if (busy) return; // 上一轮还没回来就跳过，别堆积
     busy = true;
     try {
-      // 顺手同步目标会话（游戏里可能刚被别人敲 !waken 改过）
-      await syncSessionFromGame();
       const afterSeq = cursor === null ? 0 : cursor;
       const result = await bridgeCall(cfg, 'get_events', {
         after_seq: afterSeq,
         type: 'chat',
         limit: 50,
       });
+      // 连上了 → 复位断线状态，下一次断开才会重新报一条（见 shouldLogBridgeDown）
+      noteBridgeUp();
       const latest = Number(result?.data?.latest_seq ?? result?.latest_seq ?? 0);
 
       if (cursor === null) {
@@ -806,15 +720,9 @@ export function apply(ctx, input = {}) {
         const parsed = parseChatEvent(event, cfg.ignoreSenders);
         if (!parsed || !parsed.text) continue;
         lastHumanChatAt = Date.now(); // 有人说话 → 闲聊计时重来
-        // 游戏内控制命令：只当开关用，不投给 agent、不占投递配额。
-        const control = parseControlCommand(parsed.text);
-        if (control) {
-          await handleControlCommand(control, parsed);
-          continue;
-        }
         if (delivered >= cfg.maxPerTick) break;
         const line = `（游戏内聊天）${parsed.sender || '某人'}：${parsed.text}`;
-        const sent = deliverToSession(ctx, sessionsRoot, line, effectiveSessionId);
+        const sent = deliverToSession(ctx, sessionsRoot, line, currentSessionId());
         delivered += 1;
         say(
           `[fire] ${line} → 投递=${sent.ok ? `已进会话（${sent.mode}）${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
@@ -835,7 +743,12 @@ export function apply(ctx, input = {}) {
       }
     } catch (error) {
       // bridge 没起、MC 没开，都会走到这 —— 静默跳过，等下一轮。
-      say(`[tick] bridge 不可达：${String((error && error.message) || error)}`);
+      noteBridgeDown();
+      // tick 每 3 秒一次，用时间窗判断会连报 2~3 条；改成布尔标志，只在
+      // 从"正常"转"断开"的那一刻打一条，恢复时（noteBridgeUp）复位。
+      if (shouldLogBridgeDown()) {
+        say(`[tick] bridge 不可达：${String((error && error.message) || error)}（之后静默，恢复时会再报）`);
+      }
     } finally {
       busy = false;
     }
@@ -849,11 +762,10 @@ export function apply(ctx, input = {}) {
   // ── 主动说话引擎主循环 ──────────────────────────────────────────────
   let proBusy = false;
   const proactiveTick = async () => {
-    if (!P.enabled || proBusy) return;
+    if (!masterOn() || !P.enabled || proBusy) return;
     proBusy = true;
     try {
-      const st = await bridgeCall(cfg, 'get_state', {});
-      const s = (st && st.data) || {};
+      const s = await getStateCached();
       const health = Number(s.health ?? 20);
       const food = Number(s.food_level ?? 20);
       const pos = s.position || {};
@@ -972,14 +884,18 @@ export function apply(ctx, input = {}) {
   // ── 观察模式：把游戏态势交给 agent，由它自己判断要不要动 ──────────
   // 和 proactive 的分工：proactive 是「按写死的规则替你决定要不要开口」；
   // 这里是把态势原样交出去，由 agent 判断。代价是每交一次就跑一轮 LLM。
+  // ⚠️ 全部字段都是 **getter**，每次访问现读 `cfg` —— 否则设置页改了也不会生效。
+  // 这里踩过：原来写 `input.observe === true`（读的是 apply 时的 cordis config），
+  // 于是页面上改「态势播报」开关完全没反应（2026-10-22 用户实测"开不回去"）。
+  const boolOf = (value, fallback) => (value === undefined ? fallback : value === true || value === 'true');
   const O = {
-    enabled: input.observe === true,
-    seconds: Math.max(3, Number(input.observeSeconds) || 5),
+    get enabled() { return boolOf(cfg.observe, true); },
+    get seconds() { return Math.max(3, Number(cfg.observeSeconds) || 180); },
     // changed = 态势真的变了才叫醒（站着不动时不烧钱）
     // always  = 每轮都交（响应最全，代价最大）
-    mode: input.observeMode === 'always' ? 'always' : 'changed',
-    minWakeSeconds: Math.max(3, Number(input.minWakeSeconds) || 10),
-    maxWakePerHour: Math.max(1, Number(input.maxWakePerHour) || 120),
+    get mode() { return cfg.observeMode === 'always' ? 'always' : 'changed'; },
+    get minWakeSeconds() { return Math.max(3, Number(cfg.minWakeSeconds) || 30); },
+    get maxWakePerHour() { return Math.max(1, Number(cfg.maxWakePerHour) || 40); },
   };
 
   let lastSnapshot = '';
@@ -990,7 +906,6 @@ export function apply(ctx, input = {}) {
   // 原来 8 秒。被连击时每 8 秒就 steer 一条"🔴 受伤"进会话，**把 agent 正在进行的回复反复打断**，
   // 结果是"叫得越勤、反应反而越慢"。僵尸连咬 6 下一场也就 10 秒左右 —— 60 秒足够覆盖一整场
   // 战斗，打完 agent 还醒着；60 秒后还在挨打才会再叫第二次。
-  const URGENT_GAP_MS = 60000;
   const observeLog = [];
   let obsBusy = false;
 
@@ -1029,6 +944,18 @@ export function apply(ctx, input = {}) {
   let notableSeeded = false;
   let notableIdx = 0;
   const pendingNotable = [];
+  /**
+   * 往待播队列里塞一条，重复内容不重复塞。
+   *
+   * 2026-10-22 实测踩到：持续下雨时 bridge 一直发 `weather_change`，每条都被 render 成
+   * `天气:rain` 塞进队列，最后态势行里出现「天气:rain 天气:rain 天气:rain ×7」。
+   * 同类还有"悬浮/维度"这种状态型事件 —— 状态没变就没必要重复播。
+   */
+  const pushPending = (line) => {
+    if (pendingNotable.includes(line)) return;
+    pendingNotable.push(line);
+    while (pendingNotable.length > 6) pendingNotable.shift();
+  };
   // urgent 类型（死亡/受伤/遭攻击）**每一轮都查**；其余（天气/维度/重生）轮着查。
   // 起因（2026-10-16 用户原话「这个时间延迟有点太长了吧」）：原来单类型轮询，6 个类型
   // 轮一圈最坏要等 18 秒才轮到 damage —— 挨打要秒级反应，不能排队。
@@ -1036,7 +963,7 @@ export function apply(ctx, input = {}) {
   const REST_TYPES = NOTABLE.filter(([, , u]) => u !== true).map(([t]) => String(t).toLowerCase());
 
   const notableTick = async () => {
-    if (!O.enabled) return;
+    if (!masterOn() || !O.enabled) return;
     try {
       // 首轮只探测"当前末尾"，避免把开启之前的陈年事件倒出来
       if (!notableSeeded) {
@@ -1071,44 +998,174 @@ export function apply(ctx, input = {}) {
         // 照 tick() 的写法两种都认。
         const data = (r && (r.data || r)) || {};
         const events = Array.isArray(data.events) ? data.events : [];
-        if (events.length) say(`[notable] ${type} ×${events.length}`);
+        if (events.length) {
+          // 有事件 → 进入"战斗窗口"，接下来 30 秒按 1 秒一轮盯紧
+          markCombat();
+          say(`[notable] ${type} ×${events.length}`);
+        }
         for (const ev of events) {
           const line = render(ev.data || {});
-          // urgent（死亡/受伤/遭攻击）：**立刻叫醒**，不攒批 —— 攒着的代价就是"醒来时人已经死了"。
-          // 8 秒节流：被连击时不至于刷爆 token / 消息。
-          if (urgent && Date.now() - lastUrgentWakeAt >= URGENT_GAP_MS) {
-            lastUrgentWakeAt = Date.now();
-            say(`[urgent] ${line} → 已立刻交 agent`);
-            wakeAgent(
-              `🔴 ${line} —— 立刻用 get_combat_snapshot 看附近威胁：` +
-                `血低就先拉开距离保命，有武器就 attack_nearest 反击。别站着挨打。`
-            );
+          const evData = ev.data || {};
+          const isHurt = String(type).toLowerCase() === 'damage';
+
+          // ① 受伤回应总开关：关掉就只当普通事件攒着，不再单独叫醒
+          if (isHurt && !boolOf(cfg.hurtResponse, true)) {
+            pushPending(line);
+            continue;
+          }
+
+          // ② 攻击者是谁 → 决定要不要还手
+          //
+          // DAMAGE 事件现在**自带 attacker_name**（bridge 的 addDamageEntity 会填，
+          // 玩家是账号名、生物是显示名），所以这里不用再回查 get_entities。
+          //
+          // 分流规则（2026-10-22 用户定）：
+          //   · 攻击者 == 配置的 playerName  → 看 retaliateOnPlayerHurt 开关
+          //   · 攻击者是**别的玩家**或怪物   → **一律回击**（不用问）
+          //   · **根本没有攻击者**（attacker_type 为空）→ **环境伤害**：
+          //     溺水 / 摔落 / 岩浆 / 饥饿 / 窒息都没有"谁打的我"，
+          //     这时提"反击"是纯误导 —— 附近可能连个生物都没有，AI 却会去找怪挥刀，
+          //     白白错过上浮、吃东西、后退的黄金时间。这一路把全部精力放在脱困上。
+          const attackerType = String(evData.attacker_type || '').toLowerCase();
+          const hasAttacker = attackerType !== '';
+          const byPlayer = attackerType.includes('player');
+          const attackerName = String(evData.attacker_name || '');
+          const isKnownPlayer = byPlayer && attackerName !== '' && attackerName === cfg.playerName;
+
+          let advice;
+          if (!hasAttacker) {
+            // 环境伤害：bridge 的 damage_type 已经告诉我们具体是哪种，直接照方抓药。
+            const hazard = describeHazard(evData.damage_type);
+            advice = hazard
+              ? `这是**${hazard.zh}** —— ${hazard.fix}。当前是环境伤害，需要尽快脱困。`
+              : `这是**环境伤害**（没有攻击者），需要尽快脱困。`
+                + `看 air_supply / eyes_in_water / fall_distance / on_fire / health，`
+                + `该上浮上浮、该吃就吃、该退就退。`;
+          } else if (isKnownPlayer && !boolOf(cfg.retaliateOnPlayerHurt, true)) {
+            advice = `打你的是 ${attackerName || cfg.playerName}（配置里的玩家）—— `
+              + `按配置这一轮走"脱离"路线：拉开距离、跑开、或者躲到安全处。`;
           } else {
-            pendingNotable.push(line);
+            const who = byPlayer ? (attackerName || '玩家') : '';
+            advice = `血低就先拉开距离保命，有武器就 attack_nearest 反击。`
+              + (byPlayer ? `（打你的是${who}；针对玩家用 attack_nearest(attack_players=true) ）` : '');
+          }
+
+          // ③ 一场战斗的唤醒节流（秒）：连着挨打只叫一次，避免反复打断回复
+          const gapMs = Math.max(0, Number(cfg.hurtWakeGapSeconds) || 0) * 1000;
+          if (!urgent || Date.now() - lastUrgentWakeAt < gapMs) {
+            pushPending(line);
+            continue;
+          }
+          lastUrgentWakeAt = Date.now();
+
+          // ④ 响应延迟（秒）：0 = 立即；>0 则等一下再叫，给连击留出合并窗口
+          const delayMs = Math.max(0, Number(cfg.hurtResponseDelaySeconds) || 0) * 1000;
+          // 环境伤害已经知道是哪一种了，不用再让它去"排查"
+          const look = hasAttacker ? '立刻用 get_combat_snapshot 看附近威胁' : '立刻照下面的处置做';
+          const fire = () => {
+            say(`[urgent] ${line} → 已交 agent${delayMs ? `（延迟 ${delayMs / 1000}s）` : '（立即）'}`);
+            wakeAgent(`🔴 ${line} —— ${look}：${advice}`);
+          };
+          if (delayMs > 0) {
+            const timer = setTimeout(fire, delayMs);
+            if (typeof timer === 'object' && timer && typeof timer.unref === 'function') timer.unref();
+          } else {
+            fire();
           }
         }
         notableCursors.set(key, Number(data.latest_seq ?? cursor));
       }
-      while (pendingNotable.length > 8) pendingNotable.shift();
     } catch {
       /* bridge 不在就下一轮再说 */
     }
   };
 
-  if (O.enabled) {
-    // 1 秒一轮：urgent 类型（受伤/遭攻击/死亡）每一轮都查，所以"挨打 → 检测到"≤1 秒。
-    // 起因（2026-10-16 用户原话「延迟还是有点高」）：3 秒一轮仍嫌钝。首轮要快、后续慢点没事
-    // —— 后续由 URGENT_GAP_MS（60 秒）兜住：一场战斗只会叫醒 agent 一次，压低轮询不会刷爆会话。
-    const stopNotable = ctx.interval(notableTick, 1000);
+  // ── notableTick 的自适应节奏（2026-10-22 优化）────────────────────
+  //
+  // 原来无条件 1 秒一轮 → 一天 86,400 次 get_events，绝大多数是空转。
+  // 但又不能简单降频：僵尸连咬 6 下才 10 秒，3 秒延迟就够挨两下了。
+  //
+  // 折中：**平时 5 秒，检测到事件的 30 秒内切回 1 秒**（"战斗窗口"）。
+  //   · 挨打时永远 1 秒内发现 —— 响应不变慢；
+  //   · 平时请求量降到约 1/5；
+  //   · interval 本身仍是 1 秒粒度，只是回调内部按 due 跳过，不产生 bridge 请求。
+  const NOTABLE_IDLE_MS = 5000;
+  const NOTABLE_COMBAT_MS = 1000;
+  const COMBAT_WINDOW_MS = 30_000;
+  let combatUntil = 0;
+  let lastNotableRun = 0;
+  /** 任何"有料"的检测都算进战斗窗口，接下来 30 秒盯紧一点。 */
+  const markCombat = () => { combatUntil = Date.now() + COMBAT_WINDOW_MS; };
+
+  {
+    // 起因（2026-10-16 用户原话「延迟还是有点高」）：3 秒一轮仍嫌钝，所以战斗窗口内保 1 秒。
+    // 一场战斗只会叫醒 agent 一次（hurtWakeGapSeconds 兜住），压低平时轮询不会漏事件。
+    const stopNotable = ctx.interval(() => {
+      const now = Date.now();
+      const due = now < combatUntil ? NOTABLE_COMBAT_MS : NOTABLE_IDLE_MS;
+      if (now - lastNotableRun < due) return;
+      lastNotableRun = now;
+      notableTick();
+    }, 1000);
     ctx.effect(() => () => {
       if (typeof stopNotable === 'function') stopNotable();
     });
   }
 
+  // ── get_state 短缓存（2026-10-22 优化）──────────────────────────────
+  //
+  // observe / autonomy / proactive 三个引擎各自会拉一次 get_state，内容几乎相同。
+  // 这里给 1.5 秒的共享窗口：同一时刻三个引擎都在跑时只发一次请求。
+  // TTL 故意做得比所有引擎的周期都短 —— 不影响任何"现读"语义，只吃掉重复。
+  const STATE_CACHE_TTL_MS = 1500;
+  let stateCacheAt = 0;
+  let stateCacheValue = null;
+  const getStateCached = async () => {
+    const now = Date.now();
+    if (stateCacheValue && now - stateCacheAt < STATE_CACHE_TTL_MS) return stateCacheValue;
+    const st = await bridgeCall(cfg, 'get_state', {});
+    stateCacheValue = (st && st.data) || {};
+    stateCacheAt = now;
+    return stateCacheValue;
+  };
+
+  /**
+   * 背包压成一行：只列关键物资，其余归并计数。
+   *
+   * 原来是把 30+ 项全铺出来（`... cobblestonex64 andesitex15 cobblestonex64 gravelx1 ...`），
+   * 一行 500+ 字符，日志跟着涨到 10MB。真正要看的只有武器/食物/火把/少量方块，
+   * 其余对判断毫无价值。
+   */
+  const formatInventory = (inventory) => {
+    const items = (inventory || []).filter((i) => Number(i.count) > 0);
+    if (!items.length) return '空';
+    const KEY = [
+      /_sword$/, /_axe$/, /_pickaxe$/, /_shovel$/, /_hoe$/,
+      /^bow$/, /^arrow$/, /^shield$/, /helmet$/, /chestplate$/, /leggings$/, /boots$/,
+      /^torch$/, /bread$/, /beef$/, /porkchop$/, /chicken$/, /mutton$/, /cod$/, /salmon$/,
+      /^apple$/, /^carrot$/, /^potato$/, /melon_slice$/,
+      /bucket$/, /crafting_table$/, /^furnace$/,
+    ];
+    const norm = (id) => String(id || '').replace('minecraft:', '');
+    const key = [];
+    const rest = new Map();
+    for (const i of items) {
+      const name = norm(i.id);
+      const count = Number(i.count) || 0;
+      if (KEY.some((re) => re.test(name))) key.push(`${name}x${count}`);
+      else rest.set(name, (rest.get(name) || 0) + count);
+    }
+    // 剩下的按数量取前三（圆石/泥土这类量大但没信息量的，也只留符号）
+    const top = [...rest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const parts = [...key, ...top.map(([n, c]) => `${n}x${c}`)];
+    const more = rest.size - top.length;
+    if (more > 0) parts.push(`+${more}种`);
+    return parts.join(' ') || '空';
+  };
+
   /** 把当前局面压成一行紧凑文本（越短越省 token）。 */
   const snapshotGame = async () => {
-    const st = await bridgeCall(cfg, 'get_state', {});
-    const s = (st && st.data) || {};
+    const s = await getStateCached();
     // 数据完整性校验。bridge 在玩家未加载 / 刚重生 / 连接抖动的瞬间会返回一堆
     // 默认值——位置(0,0,0)、血0、饿 NaN。照单全收发出去只会误导判断（用户原话：
     // 「找不到就不发，降级处理容易串台」），所以这里直接抛错，让本轮整轮跳过。
@@ -1136,10 +1193,7 @@ export function apply(ctx, input = {}) {
     ];
     try {
       const inv = await bridgeCall(cfg, 'get_inventory', {});
-      const items = ((inv && inv.data && inv.data.inventory) || [])
-        .filter((i) => i.count > 0)
-        .map((i) => `${String(i.id || '').replace('minecraft:', '')}x${i.count}`);
-      bits.push(`背包[${items.join(' ') || '空'}]`);
+      bits.push(`背包[${formatInventory(((inv && inv.data && inv.data.inventory) || []))}]`);
     } catch {
       /* 查不到就略过 */
     }
@@ -1188,9 +1242,9 @@ export function apply(ctx, input = {}) {
 
   const observeTick = async () => {
     // 配置只是默认值，游戏内「态势 关/开」随时覆盖（关着时这里只读一个小文件就返回）。
-    if (!switchOn('observe') || obsBusy) return;
+    if (!masterOn() || !O.enabled || obsBusy) return;
     const startedAt = Date.now();
-    if (startedAt - lastObserveAt < tuneValue('observeSeconds', O.seconds) * 1000) return;
+    if (startedAt - lastObserveAt < O.seconds * 1000) return;
     lastObserveAt = startedAt;
     obsBusy = true;
     try {
@@ -1211,14 +1265,15 @@ export function apply(ctx, input = {}) {
 
       // 会话正忙：不排队、不唤醒，只把最新态势攒着（覆盖旧的）。
       // 忙的时候投递不解决问题，只会在它跑完之后堆出一串「等」。
-      if (isAgentRunning(ctx, effectiveSessionId)) {
+      if (isAgentRunning(ctx, currentSessionId())) {
         pendingObserve = { snap, count: (pendingObserve ? pendingObserve.count : 0) + 1 };
         lastWakeAt = now; // 占住节奏位，免得 agent 一闲下来就被补投一串
         say(`[observe] agent 正忙，暂存态势（累计 ${pendingObserve.count} 次）`);
         return;
       }
 
-      const carried = pendingObserve;
+      // 用户要求（2026-10-22）：「态势只保留最新的一版，不用把历史几次一并汇总」
+      // —— 忙的时候攒下的旧态势直接丢掉，绝不拼进消息里。
       pendingObserve = null;
       lastWakeAt = now;
       observeLog.push(now);
@@ -1227,7 +1282,6 @@ export function apply(ctx, input = {}) {
         ctx,
         sessionsRoot,
         `（游戏态势）${snap}\n` +
-          (carried ? `（我忙的时候态势变了 ${carried.count} 次，上面这条是最新的）\n` : '') +
           `需要操作就直接调工具去做（说话 mcp__baritone__say；血/饿低就吃东西 mcp__baritone__eat；` +
           `跟随 mcp__baritone__follow_player；挖矿 mcp__baritone__mine_quantity）；` +
           `不需要操作就只回一个「等」字，别多说。\n` +
@@ -1238,9 +1292,13 @@ export function apply(ctx, input = {}) {
           `③ 用户没喊「跟上」就别 follow_player；④ 出手前先看 snapshot 的 is_pathing，` +
           `有残留任务先 cancel_command；⑤ 说话一次一句。\n` +
           `（判断表与工具速查：skill mc-situation，或工作区 游戏态势应对手册.md）`,
-        effectiveSessionId,
+        currentSessionId(),
       );
       say(`[observe] ${snap} → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
+    } catch (error) {
+      // 同 autonomyTick：定时器回调必须自己兜住一切。这里原本只有 finally，
+      // 任何意外异常都会冒到 process 层把 DSH 干掉（2026-10-22 用户实遇）。
+      say(`[observe] 本轮出错（已忽略）：${String((error && error.message) || error)}`);
     } finally {
       obsBusy = false;
     }
@@ -1254,8 +1312,8 @@ export function apply(ctx, input = {}) {
       if (typeof stopObs === 'function') stopObs();
     });
     say(
-      `[apply] 态势观察：配置=${O.enabled ? '开' : '关'}，当前=${switchOn('observe') ? '开' : '关'}；` +
-        `每 ${tuneValue('observeSeconds', O.seconds)}s 采一次（游戏内「态势 间隔 <秒>」可改），` +
+      `[apply] 态势观察：${O.enabled ? '开' : '关'}；` +
+        `每 ${O.seconds}s 采一次（游戏内「态势 间隔 <秒>」可改），` +
         `mode=${O.mode}，最短 ${O.minWakeSeconds}s 交一次，` +
         `上限 ${O.maxWakePerHour} 次/小时；开关用「态势 关/开/状态」`,
     );
@@ -1269,12 +1327,13 @@ export function apply(ctx, input = {}) {
   //
   // 时序上刻意保守：交出去之后立刻把 lastBusyAt 拉回 now，避免 agent 还在
   // 干活（比如等 mine_quantity 挖完）时被连环叫醒。
+  // 同 O：全部 getter，每次访问现读 cfg，否则设置页改了不生效。
   const A = {
-    enabled: input.autonomy === true,
-    tickSeconds: Math.max(10, Number(input.autonomyTickSeconds) || 20),
-    idleSeconds: Math.max(30, Number(input.autonomyIdleSeconds) || 120),
-    minGapSeconds: Math.max(60, Number(input.autonomyMinGapSeconds) || 300),
-    maxPerHour: Math.max(1, Number(input.autonomyMaxPerHour) || 6),
+    get enabled() { return boolOf(cfg.autonomy, true); },
+    get tickSeconds() { return Math.max(10, Number(cfg.autonomyTickSeconds) || 20); },
+    get idleSeconds() { return Math.max(30, Number(cfg.autonomyIdleSeconds) || 120); },
+    get minGapSeconds() { return Math.max(60, Number(cfg.autonomyMinGapSeconds) || 300); },
+    get maxPerHour() { return Math.max(1, Number(cfg.autonomyMaxPerHour) || 6); },
   };
 
   let lastBusyAt = Date.now();
@@ -1283,41 +1342,59 @@ export function apply(ctx, input = {}) {
   let autoBusy = false;
 
   const autonomyTick = async () => {
-    // 配置只是默认值，游戏内「自主 关/开」随时覆盖（用户要的就是"操作时能随手关掉"）。
-    if (!switchOn('autonomy') || autoBusy) return;
+    if (!masterOn() || !A.enabled || autoBusy) return;
     autoBusy = true;
     try {
-      // 空闲判定走 get_state 的 is_pathing（bridge 直接给的布尔），
-      // 不用 snapshotGame() —— 那个是给人看的一行文本摘要，拿不到结构化字段。
-      let s;
+      // 空闲判定只关心「在不在寻路 / 活着没 / 血多少」—— 用轻量的 is_idle，
+      // 不再拉整个 get_state（那个会序列化位置/背包/导航/伤害来源，每 20 秒一次纯浪费）。
+      // 老 jar 没有这个命令时报错 → 回退到 get_state，保证不因升级不同步而停摆。
+      let busyState = null;
       try {
-        const st = await bridgeCall(cfg, 'get_state', {});
-        s = (st && st.data) || {};
+        const r = await bridgeCall(cfg, 'is_idle', {});
+        busyState = (r && r.data) || {};
       } catch {
-        return; // bridge 不在 / MC 没开，静默跳过
+        busyState = null;
       }
-      const pos = s.position;
-      if (!pos || !Number.isFinite(Number(pos.x)) || Number(s.health) <= 0) return;
+      let pathing = false;
+      let dead = false;
+      if (busyState) {
+        pathing = busyState.pathing === true;
+        dead = busyState.dead === true || Number(busyState.health) <= 0;
+      } else {
+        // 兜底：老 bridge 没有 is_idle
+        let s;
+        try {
+          const st = await bridgeCall(cfg, 'get_state', {});
+          s = (st && st.data) || {};
+        } catch {
+          return; // bridge 不在 / MC 没开，静默跳过
+        }
+        const pos = s.position;
+        if (!pos || !Number.isFinite(Number(pos.x)) || Number(s.health) <= 0) return;
+        pathing = Number(s.is_pathing) === 1 || s.is_pathing === true;
+        dead = false;
+      }
+      if (dead) return;
 
       const now = Date.now();
-      if (Number(s.is_pathing)) {
+      if (pathing) {
         lastBusyAt = now;
         return;
       }
       // 角色静止 ≠ 会话空闲：agent 可能正在算配方、查背包、等熔炉烧完。
       // 它正忙着就别叫 —— 它本来就在干活，再叫只会多堆一个待处理轮次。
-      if (isAgentRunning(ctx, effectiveSessionId)) {
+      if (isAgentRunning(ctx, currentSessionId())) {
         lastBusyAt = now;
         return;
       }
       const idleFor = now - lastBusyAt;
       // 两个节奏都由游戏内命令控制（现读，立即生效）：
       //   「自主 空闲 <秒>」= 闲满多久才交；「自主 间隔 <秒>」= 两次之间至少隔多久。
-      if (idleFor < tuneValue('autonomyIdleSeconds', A.idleSeconds) * 1000) return;
+      if (idleFor < A.idleSeconds * 1000) return;
 
       while (autonomyLog.length && autonomyLog[0] < now - 3600_000) autonomyLog.shift();
       if (autonomyLog.length >= A.maxPerHour) return;
-      if (now - lastAutonomyAt < tuneValue('autonomyMinGapSeconds', A.minGapSeconds) * 1000) return;
+      if (now - lastAutonomyAt < A.minGapSeconds * 1000) return;
       lastAutonomyAt = now;
       lastBusyAt = now; // 交出去就重新计时，别连环叫
       autonomyLog.push(now);
@@ -1326,7 +1403,11 @@ export function apply(ctx, input = {}) {
       try {
         snap = await snapshotGame();
       } catch {
-        snap = `位置(${Math.round(Number(pos.x))},${Math.round(Number(pos.y))},${Math.round(Number(pos.z))})`;
+        // 🔴 这里原来写的是 `位置(${pos.x},…)`，但 `pos` 只在上面「老 jar 兜底」分支里
+        // 才有定义（2026-10-22 改 is_idle 时挪进去的）。走 is_idle 正常路径时 pos 不存在，
+        // 于是 MC 一关、snapshotGame 抛错 → 这个 catch 自己也抛 ReferenceError →
+        // 没有外层 catch → DSH 进程直接退出。兜底文案不许再依赖任何分支内变量。
+        snap = '（当前局面暂时读不到，bridge 可能刚断开）';
       }
       const r = deliverToSession(
         ctx,
@@ -1345,9 +1426,15 @@ export function apply(ctx, input = {}) {
           '③ 任何一步失败后先重新确认现状，别沿用旧假设；④ 动手前先清残留任务' +
           '（snapshot 看 is_pathing → cancel_command）；⑤ 说话一次一句。\n' +
           '（判断表与起步示例：skill mc-autonomy，或工作区 空闲自主行为手册.md）',
-        effectiveSessionId,
+        currentSessionId(),
       );
       say(`[autonomy] 空闲 ${Math.round(idleFor / 1000)}s → ${r.ok ? '已交 agent' : `失败(${r.why})`}`);
+    } catch (error) {
+      // 🔴 2026-10-22 用户报「dsh 直接中断运行」：这里原本**只有 finally、没有 catch**，
+      // 任何未预料的异常（当时是一个 `pos is not defined`）都会冒到 process 层，
+      // 把整个 DSH 干掉。定时器回调必须自己兜住一切 —— 插件出错的代价只能是
+      // 「这一轮不干活」，绝不能是「宿主退出」。
+      say(`[autonomy] 本轮出错（已忽略）：${String((error && error.message) || error)}`);
     } finally {
       autoBusy = false;
     }
@@ -1360,10 +1447,10 @@ export function apply(ctx, input = {}) {
       if (typeof stopAuto === 'function') stopAuto();
     });
     say(
-      `[apply] 空闲自主：配置=${A.enabled ? '开' : '关'}，当前=${switchOn('autonomy') ? '开' : '关'}；` +
-        `每 ${A.tickSeconds}s 看一次，闲 ${tuneValue('autonomyIdleSeconds', A.idleSeconds)}s 交一次，` +
-        `间隔>=${tuneValue('autonomyMinGapSeconds', A.minGapSeconds)}s，上限 ${A.maxPerHour} 次/小时；` +
-        `开关「自主 关/开/状态」，节奏「自主 空闲 <秒>」「自主 间隔 <秒>」`,
+      `[apply] 空闲自主：${A.enabled ? '开' : '关'}；` +
+        `每 ${A.tickSeconds}s 看一次，闲 ${A.idleSeconds}s 交一次，` +
+        `间隔>=${A.minGapSeconds}s，上限 ${A.maxPerHour} 次/小时；` +
+        `开关与节奏都在 DSH 设置 → Minecraft 陪玩 里改`,
     );
   }
 
@@ -1371,7 +1458,7 @@ export function apply(ctx, input = {}) {
   // （退回"照常投递"的旧行为），那种情况必须在日志里看见，而不是悄悄失效。
   try {
     const agents = ctx.get('agents');
-    const id = String(effectiveSessionId || '').trim();
+    const id = String(currentSessionId() || '').trim();
     const handle = agents && typeof agents.get === 'function' ? agents.get(id) : undefined;
     say(
       `[apply] 忙闲探测：agents=${agents ? 'yes' : 'no'} handle=${handle ? 'yes' : 'no'} ` +
