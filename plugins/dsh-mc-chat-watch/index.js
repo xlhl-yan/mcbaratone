@@ -499,8 +499,9 @@ export function apply(ctx, input = {}) {
               try {
                 const patch = JSON.parse(body || '{}')
                 const saved = writeSettingsFile(cfg, patch)
-                // 立即生效：把 settings.json 叠到运行期 cfg 上
-                Object.assign(cfg, resolveConfig({ ...cfg, ...saved }))
+                // 立即生效：**从原始 input 重建**（不能 `{...cfg, ...saved}` —— cfg 已被上一次
+                // 写入改过，删掉的键会残留在里面，表现为"取消覆盖后值不恢复默认"）。
+                Object.assign(cfg, resolveConfig({ ...input, ...saved }))
                 // 🧹 页面成为"态势/自主"的唯一真源：清掉游戏内命令写的运行时覆盖文件
                 try {
                   const { dir: stateDir } = statePaths(cfg)
