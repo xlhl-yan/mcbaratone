@@ -319,13 +319,28 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
         initializeNetworkLayer();
 
         // 事件推送 WebSocket：订阅后按事件类型推送，替代消费侧的轮询。
+        //
+        // **只有显式给了 -Dbaritone.ws.port 才启用**。没配就一个字节都不推，
+        // 消费端自然回退到轮询（行为与没有这个功能时一致）。
         // 起不来（端口被占/库缺失）只记日志，不能影响 bridge 主通道。
-        try {
-            eventWebSocketServer = new WebSocketEventServer(eventManager);
-            eventWebSocketServer.startServing();
-        } catch (Throwable error) {
-            eventWebSocketServer = null;
-            LOGGER.warn("Event WebSocket server failed to start (bridge still works)", error);
+        final Integer wsPort = readWsPort();
+        if (wsPort == null) {
+            LOGGER.info(
+                "Event WebSocket disabled (set -D{}=<port> to enable)",
+                WebSocketEventServer.PORT_PROPERTY
+            );
+        } else {
+            try {
+                eventWebSocketServer = new WebSocketEventServer(eventManager, wsPort);
+                eventWebSocketServer.startServing();
+            } catch (Throwable error) {
+                eventWebSocketServer = null;
+                LOGGER.warn(
+                    "Event WebSocket server failed to start on port {} (bridge still works)",
+                    wsPort,
+                    error
+                );
+            }
         }
 
         // Initialize MCP Server after client is fully started
@@ -364,6 +379,42 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(
                     BRIDGE_PORT_PROPERTY + " must be an integer: " + configured, e);
+        }
+    }
+
+    /**
+     * 读事件推送 WS 的端口（`-Dbaritone.ws.port=`）。
+     *
+     * **返回 null = 没配 = 不启用**。这里刻意不给默认值：
+     * 两个 MC 客户端都装 bridge，写死一个默认端口必然让它们抢同一个端口，
+     * 而 bind 失败只留一条容易被忽略的 warn。所以"要不要开"必须是显式动作。
+     *
+     * 配了但不是合法端口也不算数（按没配处理），并打一条 warn ——
+     * 拼错的参数静默失效比直接不启动更难查。
+     */
+    static Integer readWsPort() {
+        String configured = System.getProperty(WebSocketEventServer.PORT_PROPERTY);
+        if (configured == null || configured.isBlank()) {
+            return null;
+        }
+        try {
+            int port = Integer.parseInt(configured.trim());
+            if (port < 1 || port > 65535) {
+                LOGGER.warn(
+                    "Ignoring -D{}=({} is not a valid port)",
+                    WebSocketEventServer.PORT_PROPERTY,
+                    configured
+                );
+                return null;
+            }
+            return port;
+        } catch (NumberFormatException e) {
+            LOGGER.warn(
+                "Ignoring -D{}=({} is not an integer)",
+                WebSocketEventServer.PORT_PROPERTY,
+                configured
+            );
+            return null;
         }
     }
 

@@ -24,24 +24,21 @@ public class WebSocketEventServer extends WebSocketServer implements EventManage
     private static final Logger LOGGER = LoggerFactory.getLogger("websocket-event-server");
 
     /**
-     * 事件推送端口。可用 {@code -Dbaritone.ws.port=...} 覆盖（多客户端时必须分开）。
+     * 启用本服务器所需的 JVM 参数：`-Dbaritone.ws.port=<端口>`。
      *
-     * 🔴 这里原来是写死的 5556 —— 而裸 TCP bridge 也占 5556，于是这个 server
-     * 一 start 就 bind 冲突，谁都不敢启动它，整个类就这么躺了半年死代码。
-     * 现在端口可配、默认 5559（5555/5556 是 TCP，5557/5558 是 MCP）。
+     * **故意不设默认端口**，本类也不自己读它 —— 由 {@link BaritoneAPIBridge} 判断
+     * "没配就完全不启动"。原因：两个 MC 客户端都装 bridge，一个写死的默认值必然让
+     * 它们抢同一个端口，而 bind 失败只会留一条容易被忽略的 warn。把"开不开"变成
+     * 一个显式动作，比让它默默撞车安全。
      */
-    static final int DEFAULT_WEBSOCKET_PORT = 5559;
-    private static final String PORT_PROPERTY = "baritone.ws.port";
+    static final String PORT_PROPERTY = "baritone.ws.port";
 
     private static final Gson GSON = new Gson();
 
     private final EventManager eventManager;
     private final Map<WebSocket, Set<String>> clientSubscriptions = new ConcurrentHashMap<>();
 
-    public WebSocketEventServer(EventManager eventManager) {
-        this(eventManager, Integer.getInteger(PORT_PROPERTY, DEFAULT_WEBSOCKET_PORT));
-    }
-
+    /** 端口必须显式传入（见 {@link #PORT_PROPERTY} 的说明）。 */
     public WebSocketEventServer(EventManager eventManager, int port) {
         super(new InetSocketAddress(port));
         this.eventManager = eventManager;
