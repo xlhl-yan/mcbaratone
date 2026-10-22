@@ -203,6 +203,36 @@ def _equip_best_tool(client, *, block: Optional[str] = None) -> Dict[str, Any]:
         return {"equipped": False, "reason": f"equip_best_tool failed: {error}"}
 
 
+def _switch_to_empty_hand(client) -> bool:
+    """把主手切到一个**空的**快捷栏槽位，返回是否成功。
+
+    为什么需要它：赤手伤害 1，铁剑 6 —— 所以"空手反击"和"拿剑反击"是两种完全不同
+    的力度。当对方只是闹着玩时，用武器挥一下本身就是伤害，那不叫回应，叫升级。
+
+    没有空槽时返回 False（手保持原样），调用方要把这个事实如实报出去，不要假装空手。
+    """
+    try:
+        inventory = client.transport.dispatch("get_inventory", {})
+    except Exception:  # noqa: BLE001 —— 读不到背包就不切，别让"空手"变成"乱动背包"
+        return False
+    occupied = set()
+    for entry in (inventory or {}).get("inventory") or []:
+        try:
+            slot = int(entry.get("slot", -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= slot <= 8 and entry.get("item"):
+            occupied.add(slot)
+    for slot in range(9):
+        if slot not in occupied:
+            try:
+                client.transport.dispatch("select_slot", {"slot": slot})
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+    return False
+
+
 def _call_bridge(ctx: RequestContext, label: str, fn: Callable[[Client], T], max_retries: int = 3) -> T:
     session = _session_from_context(ctx)
     last_exc = None
@@ -579,6 +609,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         hostile_only: bool = True,
         entity_type: str = "",
         attack_players: bool = False,
+        use_weapon: bool = True,
     ) -> Dict[str, Any]:
         """Swing at the nearest mob.
 
@@ -596,6 +627,12 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         excluded by default so a stray swing never starts PVP; pass True only when
         retaliation against a human is actually intended (the chat-watch plugin does
         this when the damage came from someone other than its configured player).
+
+        `use_weapon=False` swings **bare-handed**: it does NOT pull a sword out, and
+        it actively switches to an empty hotbar slot when one exists. Bare fists do
+        1 damage versus 6+ for an iron sword, so this is the "they're just messing
+        about, don't actually hurt them" setting. When no hotbar slot is free the
+        hand stays as-is and the response says `bare_handed: false`.
         """
         hostiles = {
             "zombie", "husk", "drowned", "skeleton", "stray", "spider", "cave_spider",
@@ -606,8 +643,15 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         }
 
         def _run(client):
-            # 先把武器拿到手上（剑 > 斧），再找目标 —— 别拿手里的镐去砍人
-            tool = _equip_best_tool(client)
+            if use_weapon:
+                # 先把武器拿到手上（剑 > 斧），再找目标 —— 别拿手里的镐去砍人
+                tool = _equip_best_tool(client)
+                bare = False
+            else:
+                # 空手反击：切到一个空的快捷栏槽位。真实空手伤害 1，比任何武器都低，
+                # 这是"对方只是闹着玩"时该用的力度。
+                tool = {"tool": None}
+                bare = bool(_switch_to_empty_hand(client))
             wanted = (entity_type or "").strip().lower().replace("minecraft:", "")
             hits = 0
             seen = ""
@@ -648,6 +692,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                 "swings": hits,
                 "target": seen or None,
                 "weapon": tool.get("tool"),
+                "bare_handed": bare,
                 "note": "0 swings usually means: nothing in range, or attack cooldown not ready",
             }
 

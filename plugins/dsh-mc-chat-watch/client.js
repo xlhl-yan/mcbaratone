@@ -76,11 +76,11 @@ window.__ModuleLoader__.load({
       {
         title: '连接',
         fields: [
-          { key: '__link', type: 'link', label: '插件 → bridge', help: '插件自己直连 5556 的结果。断开时点右边重连（会清掉事件游标，MC 重启后尤其需要）' },
+          { key: '__link', type: 'link', label: '插件 → bridge', help: '重连会尝试重新建立插件与游戏的全部连接，MCP → bridge 这一步是由DSH自动管理的，若连接失败只能在MC启动的情况下重启DSH' },
           { key: '__mcp', type: 'mcp', label: 'MCP → bridge (5556)', help: 'AI 用 mcp__baritone__* 工具走的是这条：DSH → python wrapper → bridge。wrapper 崩了插件照样通，所以分开看' },
           { key: 'host', label: 'bridge 主机', placeholder: '127.0.0.1' },
-          { key: 'port', label: 'bridge 端口', placeholder: '5556', type: 'number', help: 'AI 客户端的 bridge 端口（人那侧默认 5555）' },
-          { key: 'wsPort', label: '事件推送端口', placeholder: '5559', type: 'number', help: 'damage/chat 走这条 WS 长连接，不再轮询；连不上会自动回退到轮询，填错不会失聪' },
+          { key: 'port', label: 'bridge 端口', placeholder: '5555', type: 'number', help: '默认 5555，和 bridge 模组的默认值一致。双客户端时 AI 那端用 -Dbaritone.bridge.port 改了端口，这里要填同一个值' },
+          { key: 'wsPort', label: '事件推送端口', placeholder: '0 = 不启用', type: 'number', help: '填 0 或不填 = damage/chat 走轮询。要用推送：MC 启动参数加 [-Dbaritone.ws.port=5559]，那这里填 5559，两边的端口需要对应（两个客户端都装 bridge，所以两端都不给默认值）' },
           { key: 'timeoutMs', label: '单次超时 (ms)', placeholder: '4000', type: 'number' },
         ],
       },
@@ -123,8 +123,7 @@ window.__ModuleLoader__.load({
         fields: [
           { key: 'hurtResponse', label: '启用受伤回应', type: 'bool', help: '关掉后受伤只当普通事件攒进态势，不再单独叫醒' },
           { key: 'hurtResponseDelaySeconds', label: '响应延迟 (秒)', placeholder: '0', type: 'number', help: '检测到受伤后等几秒再叫醒；0 = 立即。给连续挨打留一个合并窗口' },
-          { key: 'hurtWakeGapSeconds', label: '同场战斗节流 (秒)', placeholder: '60', type: 'number', help: '两次受伤响应的间隔，间隔太短会反复插入对话，频繁打断 AI 正在进行的操作' },
-          { key: 'retaliateOnPlayerHurt', label: '被玩家打时回击', type: 'bool', help: '关掉后 AI 被玩家打会只躲不打 —— 双人世界里防止它反过来揍你' },
+          { key: 'hurtWakeGapSeconds', label: '同场战斗节流 (秒)', placeholder: '60', type: 'number', help: '两次受伤响应的间隔，间隔太短会反复插入对话，频繁打断 AI 正在进行的操作。同时也用来划分「同一场战斗」——挨打记录里"第几下、累计多少血"按这个间隔重新起算' },
         ],
       },
     ]

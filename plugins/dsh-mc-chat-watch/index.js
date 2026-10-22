@@ -26,15 +26,28 @@ export const inject = ['timer', 'agents'];
 const DEFAULTS = {
   enabled: true,
   host: '127.0.0.1',
-  /** AI 客户端 bridge 的端口（用 JVM 参数 -Dbaritone.bridge.port 控制） */
-  port: 5556,
   /**
-   * 事件推送 WS 的端口（bridge 那侧用 -Dbaritone.ws.port 控制，默认 5559）。
+   * AI 客户端 bridge 的端口。
    *
-   * damage / chat 走这条长连接，不再轮询；连不上时自动回退到轮询，
-   * 所以填错了也只是回到旧行为，不会失聪。
+   * **默认值与 bridge 模组的 `DEFAULT_PORT` 保持一致（5555）** —— 两边默认值不同的话，
+   * "不配就该能连上"这件事不成立，排查时会把"默认值不匹配"误认成"服务没起"。
+   *
+   * 双客户端场景下 AI 那个实例要用 `-Dbaritone.bridge.port=5556` 分开，
+   * 那时这里也要显式填 5556（谁偏离默认，谁就得在两边都写明）。
    */
-  wsPort: 5559,
+  port: 5555,
+  /**
+   * 事件推送 WS 的端口。
+   *
+   * **0 = 不启用**（默认）—— 此时 damage/chat 全部走轮询，和没有这个功能时一样。
+   * bridge 那侧也只有 JVM 参数 `-Dbaritone.ws.port=<端口>` 显式给了才开服务器。
+   * **两端都不给默认值**：两个 MC 客户端都装 bridge，任何一方擅自给默认都会撞车，
+   * 而 bind 失败只留一条容易被忽略的 warn。
+   *
+   * 想让推送生效就两边配同一个端口：MC 启动参数加 `-Dbaritone.ws.port=5560`，
+   * 这里填 `5560`。
+   */
+  wsPort: 0,
   /** 轮询间隔（秒）。事件驱动，所以可以短；3s 对聊天够用。 */
   tickSeconds: 3,
   /** 玩家账号名。用于「跟丢判断」和主动说话时点名。 */
@@ -82,13 +95,6 @@ const DEFAULTS = {
    * 被连击时 agent 刚开口就被打断。给一个可调的缓冲，自己权衡"反应快"与"别打断"。
    */
   hurtResponseDelaySeconds: 0,
-  /**
-   * 被**玩家**打时是否回击。
-   *
-   * 默认 true（保持原有行为：谁打我都还手）。在双人世界里把它关掉，
-   * AI 就只在挨 NPC 打时反击，被玩家误伤时不会反过来打你。
-   */
-  retaliateOnPlayerHurt: true,
   /** 同一场战斗的唤醒节流（秒）—— 一场战斗只叫醒一次，避免反复打断。 */
   hurtWakeGapSeconds: 60,
 };
@@ -165,6 +171,9 @@ export function resolveConfig(input = {}) {
   // 旧键由"忽略谁"改成"只关注谁"，语义是反的 —— 绝不能自动迁移，
   // 直接从配置里摘掉，免得它一直挂在设置文件里让人误以为还在生效。
   delete cfg.ignoreSenders;
+  // 2026-10-22 用户要求删掉：它替 AI 决定"要不要还手"，和"让 AI 自己判断"矛盾。
+  // 同样摘掉，别让它以配置项的身份继续存在。
+  delete cfg.retaliateOnPlayerHurt;
   return cfg;
 }
 
@@ -1191,6 +1200,24 @@ export function apply(ctx, input = {}) {
   const URGENT_TYPES = NOTABLE.filter(([, , u]) => u === true).map(([t]) => String(t).toLowerCase());
   const REST_TYPES = NOTABLE.filter(([, , u]) => u !== true).map(([t]) => String(t).toLowerCase());
 
+  // ── 被「配置里的玩家」攻击时，要交给 AI 的上下文（2026-10-22 用户定的口径）──
+  //
+  // 这里**只记录事实，不替 AI 判断**。用户原话：「只要在唤醒会话中说一下就行，
+  // 让 AI 自行判断需不需要反击」。
+  //
+  // 所以阈值一个都不设 —— 不设"少于几点算误伤"、不设"几次算故意"、不设"多少伤害
+  // 才用武器"。那些数字全是拍脑袋：玩家之间闹着玩和真打起来，边界只有 AI 结合
+  // 当时情况才判得准。代码只负责把「这一下多少血、这场战斗里第几次、累计多少」
+  // 摆清楚，剩下的它自己决定。
+  //
+  // **"同一场战斗"的时间尺度直接复用「受伤回应 → 同场战斗节流」**（`hurtWakeGapSeconds`），
+  // 不另设一个：两件事本来就是同一个语义 —— 隔多久算另起一场。用户定的。
+  const playerHits = { count: 0, totalDamage: 0, lastAt: 0 };
+  const resetPlayerHits = () => {
+    playerHits.count = 0;
+    playerHits.totalDamage = 0;
+  };
+
   /**
    * 处理一条 DAMAGE 事件 —— **轮询和 WS 推送共用这一条路径**。
    *
@@ -1208,18 +1235,21 @@ export function apply(ctx, input = {}) {
       return;
     }
 
-    // ② 攻击者是谁 → 决定要不要还手
+    // ② 攻击者是谁 → 决定给什么样的建议
     //
     // DAMAGE 事件**自带 attacker_name**（bridge 的 addDamageEntity 会填，
     // 玩家是账号名、生物是显示名），所以这里不用再回查 get_entities。
     //
     // 分流规则（2026-10-22 用户定）：
-    //   · 攻击者 == 配置的 playerName  → 看 retaliateOnPlayerHurt 开关
-    //   · 攻击者是**别的玩家**或怪物   → **一律回击**（不用问）
+    //   · 攻击者 == 配置的 playerName（陪玩的那位）→ **只摆事实，判断留给 AI**
+    //   · 攻击者是**别的玩家**或怪物 → 一律回击
     //   · **根本没有攻击者**（attacker_type 为空）→ **环境伤害**：
     //     溺水 / 摔落 / 岩浆 / 饥饿 / 窒息都没有"谁打的我"，
     //     这时提"反击"是纯误导 —— 附近可能连个生物都没有，AI 却会去找怪挥刀，
     //     白白错过上浮、吃东西、后退的黄金时间。这一路把全部精力放在脱困上。
+    //
+    // 原先还有一个 `retaliateOnPlayerHurt` 开关替 AI 决定"要不要还手"，2026-10-22
+    // 用户要求删掉：那个开关本身就是替它做决定，和"让它自己判断"是矛盾的。
     const attackerType = String(evData.attacker_type || '').toLowerCase();
     const hasAttacker = attackerType !== '';
     const byPlayer = attackerType.includes('player');
@@ -1235,9 +1265,30 @@ export function apply(ctx, input = {}) {
         : `这是**环境伤害**（没有攻击者），需要尽快脱困。`
           + `看 air_supply / eyes_in_water / fall_distance / on_fire / health，`
           + `该上浮上浮、该吃就吃、该退就退。`;
-    } else if (isKnownPlayer && !boolOf(cfg.retaliateOnPlayerHurt, true)) {
-      advice = `打你的是 ${attackerName || cfg.playerName}（配置里的玩家）—— `
-        + `按配置这一轮走"脱离"路线：拉开距离、跑开、或者躲到安全处。`;
+    } else if (isKnownPlayer) {
+      // 配置里的玩家打了你 → **只摆事实，判断留给 AI**。
+      // 每一层阈值都是猜的，而 AI 知道当时的场景（在挖矿？在站着？对方刚才说了什么），
+      // 它比我更适合决定"这一下要不要计较"。
+      const amount = Number(evData.amount) || 0;
+      const now = Date.now();
+      // 窗口 = 设置页「受伤回应 → 同场战斗节流」。隔这么久才算另起一场；
+      // 设成 0 表示不区分场次，那提示里就永远说"第 1 下"，也是自洽的。
+      const windowMs = Math.max(0, Number(cfg.hurtWakeGapSeconds) || 0) * 1000;
+      if (windowMs === 0 || now - playerHits.lastAt > windowMs) resetPlayerHits();
+      playerHits.count += 1;
+      playerHits.totalDamage += amount;
+      playerHits.lastAt = now;
+
+      const nth = playerHits.count === 1
+        ? '这是这场战斗的第 1 下'
+        : `这是这场战斗的第 ${playerHits.count} 下，累计 ${playerHits.totalDamage} 点血`;
+      advice = `打你的是 ${attackerName || cfg.playerName}（就是平时陪你玩的那位），`
+        + `这一下 ${amount} 点血，${nth}。`
+        + `要不要回敬、用什么力度，你自己判断 —— `
+        + `用 attack_nearest(attack_players=true) 才能打到人；`
+        + `${cfg.playerName} 是队友，想让他掉血就 use_weapon=true，`
+        + `只是想闹回去可以 use_weapon=false（空手，伤害 1）。`
+        + `挖矿时镐子蹭到 1 点血是常事，那种通常不值得计较。`;
     } else {
       const who = byPlayer ? (attackerName || '玩家') : '';
       advice = `血低就先拉开距离保命，有武器就 attack_nearest 反击。`
@@ -1269,7 +1320,12 @@ export function apply(ctx, input = {}) {
   };
 
   const notableTick = async () => {
-    if (!masterOn() || !O.enabled) return;
+    // 🔴 2026-10-22 修耦合：这里原来还查了 `!O.enabled`，而 `O.enabled` 是**态势播报**
+    //    的开关 —— 于是"关掉态势播报"连"挨打叫醒"一起停了。两件事完全不同：
+    //    · urgent（DAMAGE）是**危险事件叫醒**，和要不要往态势里播报无关；
+    //    · 其余类型（死因/天气/维度）只是攒进态势行，关了播报自然没必要处理。
+    //    现在只受总开关约束，urgent 永远在盯。
+    if (!masterOn()) return;
     try {
       // 首轮只探测"当前末尾"，避免把开启之前的陈年事件倒出来
       if (!notableSeeded) {
@@ -1283,6 +1339,9 @@ export function apply(ctx, input = {}) {
         return;
       }
       // 每 3 秒一轮：urgent 类型全查一遍（秒级反应），非 urgent 才轮着来。
+      //
+      // 非 urgent 类型**即使播报关着也照查**：查了才推得动游标。否则关掉播报一段时间
+      // 再打开，会把这段时间积压的天气/死因一次性倒出来（和游标回绕那个坑同一族）。
       const batch = [...URGENT_TYPES];
       if (REST_TYPES.length) {
         batch.push(REST_TYPES[notableIdx % REST_TYPES.length]);
@@ -1311,9 +1370,18 @@ export function apply(ctx, input = {}) {
         // 照 tick() 的写法两种都认。
         const data = (r && (r.data || r)) || {};
         const events = Array.isArray(data.events) ? data.events : [];
+
+        // 非 urgent 类型 + 播报关着 → 只推进游标，不处理也不打日志。
+        // （仍然查询，是为了让游标跟上，见上面 batch 的说明。）
+        if (!urgent && !O.enabled) {
+          notableCursors.set(key, Number(data.latest_seq ?? cursor));
+          continue;
+        }
+
         if (events.length) {
-          // 有事件 → 进入"战斗窗口"，接下来 30 秒按 1 秒一轮盯紧
-          markCombat();
+          // 有事件 → 进入"战斗窗口"，接下来 30 秒按 1 秒一轮盯紧。
+          // 只有 urgent 才值得提速：天气变了不需要 1 秒一轮去盯。
+          if (urgent) markCombat();
           say(`[notable] ${type} ×${events.length}`);
         }
         for (const ev of events) {
@@ -1739,6 +1807,8 @@ export function apply(ctx, input = {}) {
       bridgeDownSince = 0;
       bridgeDownLogged = false;
       lastObserveAt = 0;
+      // 连击计数也清掉：手动重连往往意味着"世界重开了"，跨世界累计没有意义
+      resetPlayerHits();
       // WS 也一并重连：MC 重启后 WS 长连接通常已经半死，不主动断开会一直挂着不恢复。
       if (wsLink.timer) { try { clearTimeout(wsLink.timer); } catch { /* 忽略 */ } }
       wsLink.timer = null;
@@ -1752,9 +1822,11 @@ export function apply(ctx, input = {}) {
   };
 
   // ── WS 客户端：收 damage / chat 推送 ────────────────────────────────
-  const wsUrl = () => `ws://${cfg.host || '127.0.0.1'}:${Number(cfg.wsPort) || 5559}`;
+  const wsPort = () => Number(cfg.wsPort) || 0;
+  const wsUrl = () => `ws://${cfg.host || '127.0.0.1'}:${wsPort()}`;
 
   const wsScheduleReconnect = (why) => {
+    if (wsPort() === 0) return;          // 端口被改成 0（关掉推送）就不再重连
     if (wsLink.timer) return;
     const delay = Math.min(
       WS_RECONNECT_MAX_MS,
@@ -1768,7 +1840,13 @@ export function apply(ctx, input = {}) {
     if (typeof wsLink.timer === 'object' && wsLink.timer && typeof wsLink.timer.unref === 'function') {
       wsLink.timer.unref();
     }
-    say(`[ws] ${why} → ${Math.round(delay / 1000)}s 后重连（第 ${wsLink.retries} 次）；期间回退到轮询`);
+    // 前三次说清楚就够了。之后每 30 秒一条"还是连不上"会淹掉真正有用的日志，
+    // 而这种情况（bridge 没配 -Dbaritone.ws.port）本来就不是错误。
+    if (wsLink.retries <= 3) {
+      say(`[ws] ${why} → ${Math.round(delay / 1000)}s 后重连（第 ${wsLink.retries} 次）；期间回退到轮询`);
+    } else if (wsLink.retries === 4) {
+      say('[ws] 持续连不上，之后不再重复报；MC 那侧要开推送需加 -Dbaritone.ws.port=<端口>');
+    }
   };
 
   const wsClose = () => {
@@ -1780,6 +1858,9 @@ export function apply(ctx, input = {}) {
   };
 
   const wsConnect = () => {
+    // 端口为 0 = 用户没打算用推送（默认）。此时完全不建连，damage/chat 全走轮询。
+    // 这也意味着一遍遍重连失败去吵用户——没配就是不配，不是错误。
+    if (wsPort() === 0) return;
     // ⚠️ 这里**不看总开关**：连接本身是"观测通道"，连着才能把状态显示出来。
     // 真正处理事件时才看总开关（见 onmessage）—— 关掉总开关后 WS 仍然连着，
     // 但收到的事件一律丢弃。这样"WS 通不通"永远可见，而不是一关总开关就瞎。
