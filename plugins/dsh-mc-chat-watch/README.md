@@ -3,104 +3,68 @@
 DSH 插件：盯住 Minecraft（AI 角色所在那个客户端）的游戏内聊天，一有新消息就把 agent 叫醒；
 另附「游戏态势」与「空闲自主」两套叫醒引擎。**事件驱动**，不是定时开口，闲着的时候几乎不花 token。
 
-- Host 半边：`index.js`（唯一入口，纯 Node，没有浏览器半边）
-- 配置：`cordis.patch.yml`（bundle patch）
-- 日志 / 状态：`<DSH_HOME>/mc-chat-watch/`（默认 `C:\Users\<用户>\.dsh\mc-chat-watch\`）
+- Host 半边：`index.js`（只注册配置读写接口 + 四套引擎）
+- 浏览器半边：`client.js`（在 DSH 设置里贡献「Minecraft 陪玩」页）
+- 配置：`cordis.patch.yml`（bundle patch）为主，**DSH 设置页改动落在 `<DSH_HOME>/mc-chat-watch/settings.json`**
+- 日志 / 状态：`<DSH_HOME>/mc-chat-watch/`（默认 `~/.dsh/mc-chat-watch/`）
 
 ---
 
-## 一、游戏内命令：**是聊天文本，不是 `/` 命令**
+## 一、所有开关都在 DSH 设置页
 
-在 MC 里按 **T** 打开聊天栏（**不是**按 `/`）之后输入：
+**打开方式**：DSH → 设置 → 左侧「Minecraft 陪玩」。
 
-| 打什么 | 作用 |
+七组配置，改完即时生效、不用重启 DSH：
+
+| 组 | 能改什么 |
 | --- | --- |
-| `自主开` / `自主关` / `自主状态` | 空闲自主任务开关 |
-| `态势开` / `态势关` / `态势状态` | 游戏态势提醒开关 |
-| `唤醒会话 <sessionId>` / `唤醒会话 clear` | 游戏消息投给哪个 DSH 窗口（这条由 bridge 实现，插件读它的结果） |
-| `自主间隔 600` / `自主空闲 60` / `态势间隔 300` | **改运行节奏**（单位：秒）；只写 `自主间隔` = 查当前值 |
+| 账号 | 玩家账号名、AI 账号名（用于识别"谁在说话"、排除自己） |
+| 投递目标 | 固定会话 ID、设备前缀 |
+| 连接 | bridge 主机 / 端口 / 单次超时 |
+| 节奏 | 聊天轮询间隔、单轮最多投递 |
+| 开关 | 插件总闸 |
+| 态势播报 | 启用开关、采样间隔、播报模式（`changed` / `always`）、两次最小间隔、每小时上限 |
+| 空闲自主 | 启用开关、空闲阈值、两次最小间隔、忙闲检查间隔、每小时上限 |
 
-> **空格可有可无**（正则里是 `\s*`）：`自主间隔 600`、`自主间隔600`、`自主间隔 600秒`、
-> `自主间隔 600s`、`自主 间隔 600` 都认；开关同理，`自主状态` / `自主 状态` 都行。
+**保存规则**：输入框**失焦或按回车**才提交（不会边打字边存）；开关是点一下即生效。
+保存成功后右下角会浮出「已保存」，1.8 秒后自动消失。
 
-细节：
+**优先级**：`settings.json`（设置页写的） > `cordis.patch.yml` > 代码默认值。
+页面里被改过的项会显示「已覆盖」标记；想回落到配置文件的值，把那一项清空即可。
 
-- **整串匹配**（`^…$`），所以正常聊天里出现「自主」「态势」这两个词**不会被误吃**。
-- 命中命令的那条消息**不投给 agent**、不占投递配额；插件会自己在游戏里回一句确认
-  （`[空闲自主] 已关闭` 这种）。
-- 前缀很宽：`空闲自主` / `自主任务` / `态势提醒` 都认，加上空格可有可无，
-  `空闲自主状态`、`自主任务间隔 900` 这类写法同样有效。
-- 开关状态落在 `<DSH_HOME>/mc-chat-watch/autonomy-switch.txt`（内容 `on` / `off`）：
-  **立即生效、不用重启 DSH**；**删掉文件**即回到 `cordis.patch.yml` 里的默认值。
-- **节奏参数**落在 `<DSH_HOME>/mc-chat-watch/tuning.json`，tick 时**现读** —— 同样立即生效、
-  不用重启；删掉文件或某个键就回到配置默认值。三个参数的含义：
-  - `自主 间隔 <秒>` —— 两次「自主时间」之间至少隔多久（默认 `autonomyMinGapSeconds` = 300s，**花费的主闸门**）
-  - `自主 空闲 <秒>` —— 角色要闲满多久才交（默认 `autonomyIdleSeconds` = 120s）
-  - `态势 间隔 <秒>` —— 隔多久采一次态势（默认 `observeSeconds` = 180s）
-  - 值会被夹在 **10 秒 ~ 24 小时**，防止手滑打出 0 秒这种疯跑值
+> **曾经有一套游戏内聊天命令**（`自主关`、`态势 间隔 300` 之类），
+> 有了设置页之后已经移除 —— 现在游戏里发这些话就是普通聊天，会正常投给 agent。
 
-### 为什么是聊天文本，而不是 `/xxx` 命令？
+### 为什么不由 DSH 的 settings 服务承载？
 
-**因为 `/` 开头的输入根本到不了插件手里。** MC 的输入框是两条独立通道：
+本机实测：`ctx.get('settings')` 返回的是**一份设置文档对象**（`documentPath` / `describe` /
+`mutate` 等），既没有 `installSection` 也没有 `register`。走那条路时页面能挂载、`set()` 也能调，
+但写完 `value` / `user` 里永远是 `undefined`，且**不报错**。
 
-- 按 **T** 打字 → 走**聊天消息**：会广播给所有人，并且作为 `ClientReceiveMessageEvents.CHAT`
-  事件出现在各客户端（含本客户端）—— 插件看的就是这条；
-- 按 **/** 打字 → 走**命令通道**：客户端把整串丢给**服务端**解析，本地只留下「命令回显 /
-  未知的命令」这类系统消息，**原始参数不会以聊天事件的形式出现**。
+所以改成和 `dsh-meme` 一样的做法：**插件自己注册 HTTP 接口**。
 
-bridge 是**客户端 mod**，只注册了 `ClientReceiveMessageEvents.GAME` 与 `CHAT` 两类事件。
-所以自己发出的 `/自主 off` 既不是聊天消息、也不属于这两类系统消息，**插件侧看不到它的参数**。
-
-要做成真正的 `/` 命令，只有两条路：
-
-1. **注册客户端命令** —— Fabric `ClientCommandRegistrationCallback`，命令在本地执行（不进服务端）；
-2. **注册服务端命令** —— 要有服务端侧代码 + 相应权限。
-
-**本插件权衡后选了"不做"**，理由是：
-
-- 收益只是"看起来更正经"：这套命令的使用者只有作者一个人，单人世界里聊天文本一样好用；
-- 代价却是一整条链：改 bridge 的 Java 源码 → 用 JDK 25 重新编译 jar → **两个 MC 客户端各换一次
-  jar** → 重启客户端；而且开关的消费方在 DSH 进程里，Java 侧还得把状态再往回传一遍；
-- 服务端命令那条路更重：单人世界的集成服要注册 + 权限，还会把命令写进服务端日志。
-
-**代价如实说清**（用之前先知道）：
-
-- **没有 tab 补全**，打错一个字就变成普通聊天（会正常广播出去）；
-- 手滑打成 `/自主 off` 会被服务端回一句「未知的命令」——**加了斜杠就不生效**，这是最容易踩的坑；
-- 回执是 `sendChat`，会出现在公屏（单人世界只有自己 + AI 角色，无所谓）。
-
-### 为什么用中文前缀？
-
-- `!` 开头（早期版本兼容过 `!waken xxx`）会被 **Baritone 抢去当命令解析**，聊天栏刷出
-  「未知或不完整的命令。错误见下」+「waken xxx<--[此处]」，看着像插件坏了；
-- 中文前缀不撞任何客户端命令前缀（Baritone 用 `#`、原版用 `/`、不少 mod 用 `!`），
-  而且在中文输入法下顺手；
-- `唤醒会话` 这组前缀写在 bridge 侧的 `WakenSessionStore.PREFIXES` 里；`自主` / `态势`
-  这组写在插件侧 `index.js` 的 `CONTROL_PATTERNS` 里（改词表要重启 DSH）。
+- `GET  /mc-chat-watch-config` → `{ ok, config, overrides }`
+- `POST /mc-chat-watch-config` → 收一个 patch 对象；值为 `null` 表示删掉该覆盖
+- 只接受 loopback 请求（这条路没有认证层）
 
 ---
 
-## 二、配置项
+## 二、配置项（`cordis.patch.yml`）
 
-配置在 bundle patch `cordis.patch.yml` 里，**改完要重启 DSH 才装载**：
+设置页能改的项在配置文件里同样有效，只是优先级更低：
 
 | 键 | 默认 | 作用 |
 | --- | --- | --- |
 | `enabled` | `true` | 插件总闸（聊天转发） |
 | `host` / `port` | `127.0.0.1` / `5556` | AI 客户端 bridge 的地址（端口靠 JVM 参数 `-Dbaritone.bridge.port` 控制） |
 | `tickSeconds` | `3` | 聊天轮询间隔 |
-| `ignoreSenders` | `[DeepSeek]` | 这些发送者的话不投递（AI 自己说的别把自己吵醒） |
+| `playerName` / `aiAccount` | `<玩家名>` / `<AI 账号>` | 双玩家识别 |
+| `ignoreSenders` | `[]` | 这些发送者的话不投递；留空则自动包含 `aiAccount` |
 | `maxPerTick` | `10` | 单轮最多投几条，防刷屏 |
-| `sessionId` | 固定会话 id | 游戏消息投给谁；留空 = **拒绝投递**（不猜） |
+| `sessionId` | 空 | 游戏消息投给谁；留空 = **拒绝投递**（不猜） |
 | `observe` / `observeSeconds` / `observeMode` | `true` / `180` / `changed` | 态势观察引擎 |
 | `autonomy` / `autonomyTickSeconds` / `autonomyIdleSeconds` / `autonomyMinGapSeconds` / `autonomyMaxPerHour` | `true` / `20` / `120` / `300` / `6` | 空闲自主引擎 |
 | `proactive` | `false` | 老的规则版主动说话（已被 observe 取代，默认关） |
-
-> ⚠️ **DSH 的插件页（插件列表 → 详情）不会显示这些配置，那页是空的 —— 这是正常的。**
-> DSH 插件页的配置区**不会**从 cordis config 自动生成表单，必须由插件自带**浏览器半边**
-> （browser half）注册 `plugins.item` / `plugins.bundle.config` / `plugins.row.config`
-> 插槽来画控件。本插件是纯 Host 插件（只有 `index.js`），所以那页永远空白。
-> **要开关请用上面的游戏内命令。**
 
 ---
 
@@ -113,16 +77,19 @@ bridge 是**客户端 mod**，只注册了 `ClientReceiveMessageEvents.GAME` 与
 | 空闲自主 `autonomy` | 角色闲着（不寻路 + agent 不忙）满 120s 就交一次「自主时间」，goal 由 agent 自己定 | 间隔 ≥300s、上限 6 次/小时 |
 | 主动说话 `proactive` | 规则版模板播报（血少 / 天黑 / 饿） | 默认关；和 observe 会打架（同一件事说两遍） |
 
-判断表在工作区（`调研AI陪玩MC`）：`游戏态势应对手册.md`、`空闲自主行为手册.md`。
+判断表在工作区：`游戏态势应对手册.md`、`空闲自主行为手册.md`。
 
 ---
 
 ## 四、投递会话怎么定（防串台）
 
-优先级：**游戏内 `唤醒会话 <id>` > 配置 `sessionId` > 不投**。
+优先级：**游戏内 `唤醒会话 <id>` > 设置页/配置 `sessionId` > 不投**。
+
+`唤醒会话` 这条由 **bridge（Java 侧）** 实现，不是本插件 —— 它把 sessionId 写进
+`.minecraft-ai/versions/<版本>/config/mcbaratone-waken-session.txt`，插件只读那个结果。
 
 没有明确绑定就**直接丢消息并记日志** —— 绝不"猜一个最近活跃的会话"，猜错会把游戏消息
-送进别的窗口（2026-10-13 踩过）。用户原话：「找不到就不发，降级处理容易串台」。
+送进别的窗口。原话：「找不到就不发，降级处理容易串台」。
 
 同理，采到的态势数据不完整（位置全 0 / 血 0 / 饿 NaN，bridge 在玩家未加载或刚重生时会这样）
 就**整轮跳过**，不交给 agent。
@@ -134,10 +101,11 @@ bridge 是**客户端 mod**，只注册了 `ClientReceiveMessageEvents.GAME` 与
 `<DSH_HOME>/mc-chat-watch/watch.log`，每次装载会打自检行：
 
 ```
-[apply] 聊天监听起来了：127.0.0.1:5556 每 3s 一次；忽略 DeepSeek
-[apply] 态势观察：配置=开，当前=开；… 游戏内打「态势 关/开/状态」切换
-[apply] 空闲自主：配置=开，当前=开；… 游戏内打「自主 关/开/状态」切换
+[apply] 聊天监听起来了：127.0.0.1:5556 每 3s 一次；忽略 <AI 账号>
+[apply] 态势观察：开；… 每 180s 采一次（设置页可改），…
+[apply] 空闲自主：开；… 间隔>=300s，上限 6 次/小时；开关与节奏都在 DSH 设置 → Minecraft 陪玩 里改
 [apply] 忙闲探测：agents=yes handle=no status=n/a
+[apply] 设置接口已注册: /mc-chat-watch-config
 ```
 
 常见行：
@@ -145,25 +113,26 @@ bridge 是**客户端 mod**，只注册了 `ClientReceiveMessageEvents.GAME` 与
 | 日志 | 含义 |
 | --- | --- |
 | `[fire] （游戏内聊天）xxx → 投递=已进会话 …` | 正常，话已经进 DSH 会话 |
-| `[cmd] xxx 把「空闲自主」改成 关` | 游戏内命令生效了 |
 | `… → 失败(会话 session-xxx… 不在活跃列表（窗口没开？）)` | 目标窗口没开，**消息丢弃**（不是串台） |
 | `[tick] bridge 不可达：…` | MC 没开 / 端口不对，静默等下一轮 |
 | `[observe] agent 正忙，暂存态势（累计 N 次）` | 背压生效，忙完只会补投最新一条 |
+| `拿不到 webServer，设置页将只能读不能写` | webServer 服务没起来（插件自身照常工作） |
 
-**改 `index.js` 后必须重启 DSH** —— Host 半边没有热重载（`dsh` CLI 只有 `plugin add`）。
-改 `cordis.patch.yml` 的 config 同样要重启。
+**改 `index.js` / `client.js` 后必须重启 DSH** —— Host 半边和浏览器半边都没有热重载。
+**改设置页里的值不用重启**，它落在 `settings.json`，引擎每轮都按当前值跑。
 
 ---
 
-## 六、离线自检脚本
+## 六、离线自检
 
-`调研AI陪玩MC\工具\测插件命令.mjs`：起一个假 bridge（裸 TCP），把本插件真跑起来喂聊天事件，
-验证「命令被拦截 → 写开关文件 → 回执 → 关掉后不再请求 bridge」。不碰真 MC、不碰真 DSH。
+`调研AI陪玩MC\工具\测插件客户端加载.mjs`：用 `vm` 模拟 DSH 的模块加载器和 React，
+把 `client.js` 真跑一遍 —— 验证 `exports.inject` 只含 `slots`（写错会让整个 web boot 白屏）、
+页面注册进 `settings.section`、布尔项走 `primitives.Menu` 而不是原生 `<option>`、保存提示存在。
 
 ```powershell
-node "D:\DeepSeekHarnessDesktop\WorkSpace\调研AI陪玩MC\工具\测插件命令.mjs"
+node "D:\DeepSeekHarnessDesktop\WorkSpace\调研AI陪玩MC\工具\测插件客户端加载.mjs"
 ```
 
 ---
 
-*最后更新：2026-10-15（加游戏内开关 + 写清"为什么是聊天文本而不是 `/` 命令"）*
+*最后更新：2026-10-22（开关统一迁到 DSH 设置页，移除游戏内命令）*

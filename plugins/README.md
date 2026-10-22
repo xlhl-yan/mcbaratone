@@ -12,7 +12,7 @@ DSH ──► plugins/（本目录） ──TCP 5556──► bridge（Fabric mo
 
 | 目录 | 是什么 |
 | --- | --- |
-| `dsh-mc-chat-watch/` | 盯 MC 游戏内聊天 → 把话投进绑定的 DSH 会话叫醒 agent；另含「游戏态势」与「空闲自主」两套叫醒引擎，以及游戏内开关（`自主 关/开/状态`、`态势 关/开/状态`） |
+| `dsh-mc-chat-watch/` | 盯 MC 游戏内聊天 → 把话投进绑定的 DSH 会话叫醒 agent；另含「游戏态势」与「空闲自主」两套叫醒引擎；所有开关在 DSH 设置页「Minecraft 陪玩」里改 |
 
 ## 它在 DSH 里怎么挂上
 
@@ -54,5 +54,5 @@ Copy-Item <REPO>\plugins\dsh-mc-chat-watch\* "<DSH 实际加载目录>\" -Force
    （同 `../AGENTS.md` 的发布边界）。
 2. **不要为了插件方便去改 `bridge/` 或 `src/` 的契约** —— 命令名、事件字段这些是三段之间的接口，
    改之前先读 `../DSH-READHERE.md`。
-3. **游戏内"命令"是聊天文本，不是 `/` 命令** —— 为什么、代价是什么，见
-   `dsh-mc-chat-watch/README.md`「一、游戏内命令」。别顺手"优化"成 `/xxx`，那样根本收不到。
+3. **插件的开关全在 DSH 设置页**（设置 → Minecraft 陪玩），游戏里发 `自主关` 之类的文字
+   现在就是普通聊天，会正常投给 agent。`唤醒会话` 例外 —— 那是 bridge 侧的命令，仍然有效。

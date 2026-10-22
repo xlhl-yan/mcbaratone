@@ -44,7 +44,6 @@
 
 **聊天**
 - 游戏内双向：你打字 → AI 收到（带你的名字）；AI 说话 → 出现在聊天栏
-- 人类可读的**中文**前缀命令，见下面「游戏内命令」
 
 **行动**
 | 能力 | 工具 |
@@ -195,7 +194,7 @@ config.transport_type = "tcp"        # ★ 上游默认 websocket，会连错协
 > 插件没跑，日志里连一行 `[apply]` 都没有。
 
 装完**重启 DSH**，再看 `<DSH_HOME>/mc-chat-watch/watch.log` 有没有 `[apply] …` 自检行。
-说明、配置项、游戏内开关命令见 [`plugins/README.md`](plugins/README.md) 和
+说明、配置项、设置页用法见 [`plugins/README.md`](plugins/README.md) 和
 [`plugins/dsh-mc-chat-watch/README.md`](plugins/dsh-mc-chat-watch/README.md)。
 
 ---
