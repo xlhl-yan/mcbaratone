@@ -1218,6 +1218,35 @@ export function apply(ctx, input = {}) {
     playerHits.totalDamage = 0;
   };
 
+  // ── 受伤流水账：hurt.log（2026-10-22 用户定的）──────────────────────
+  //
+  // **为什么需要文件**：节流期间的伤害叫不醒 agent（那是刻意的，否则一场战斗会
+  // 打断好几次），但"这期间一共挨了多少下"是有价值的信息。指望 bridge 的
+  // `get_events` 补回来行不通 —— 不带 after_seq 会走 pollEvents()，那里的
+  // `iterator.remove()` 会把事件从缓冲区**抽走**，连插件自己的轮询都被抢；
+  // 带 after_seq 又只能往后查、回看不了已发生的事件。所以自己留一份。
+  //
+  // **只追加，不做周期清理**（2026-10-22 用户拍板）：如果按"每场战斗"清空，
+  // agent 还没轮到读就被下一场清掉了 —— 更糟。等实际用起来再根据增长速率
+  // 决定要不要轮转。
+  const hurtLogPath = () => join(statePaths(cfg).dir, 'hurt.log');
+
+  /**
+   * 记一条受伤。
+   *
+   * @param {string} detail 这一行的正文（伤害、攻击者、第几下…）
+   * @param {boolean} woke 是否叫醒了 agent —— 标出"未叫醒"，让 agent 知道哪些是
+   *   因为节流它没被告知的（这正是它需要翻这个文件的原因）
+   */
+  const recordHurt = (detail, woke) => {
+    try {
+      const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      appendFileSync(hurtLogPath(), `${stamp}  ${detail}  ${woke ? '叫醒' : '未叫醒'}\n`, 'utf8');
+    } catch {
+      /* 写不了就跳过 —— 一条流水账绝不能影响叫醒 */
+    }
+  };
+
   /**
    * 处理一条 DAMAGE 事件 —— **轮询和 WS 推送共用这一条路径**。
    *
@@ -1225,13 +1254,27 @@ export function apply(ctx, input = {}) {
    * 判断链（受伤总开关 → 攻击者分流 → 节流 → 延迟），否则会出现"推送时一套规则、
    * 断线回退轮询时另一套"的双标准 —— 这种不一致最难查。
    */
+  /**
+   * 伤害数值 → 给人看的文字。
+   *
+   * 🔴 `Math.round` 会把 0.42 抹成 0 —— 流水账里全变成 `⚠受伤-0`，看起来像"根本没挨打"，
+   * 比不记还误导。所以小于 1 的伤害保留一位小数（0.4），整数原样输出（3）。
+   * 2026-10-22 实机连挨 7 下 0.42 时踩到的。
+   */
+  const formatDamage = (value) => {
+    const amount = Number(value) || 0;
+    if (Number.isInteger(amount)) return String(amount);
+    return amount < 1 ? amount.toFixed(1) : String(Math.round(amount));
+  };
+
   const handleDamageEvent = (evData) => {
-    const line = `⚠受伤-${Math.round(Number(evData.amount) || 0)}` +
+    const line = `⚠受伤-${formatDamage(evData.amount)}` +
       (evData.attacker_type ? `(${String(evData.attacker_type).replace('minecraft:', '')})` : '');
 
     // ① 受伤回应总开关：关掉就只当普通事件攒着，不再单独叫醒
     if (!boolOf(cfg.hurtResponse, true)) {
       pushPending(line);
+      recordHurt(line, false);
       return;
     }
 
@@ -1281,9 +1324,9 @@ export function apply(ctx, input = {}) {
 
       const nth = playerHits.count === 1
         ? '这是这场战斗的第 1 下'
-        : `这是这场战斗的第 ${playerHits.count} 下，累计 ${playerHits.totalDamage} 点血`;
+        : `这是这场战斗的第 ${playerHits.count} 下，累计 ${formatDamage(playerHits.totalDamage)} 点血`;
       advice = `打你的是 ${attackerName || cfg.playerName}（就是平时陪你玩的那位），`
-        + `这一下 ${amount} 点血，${nth}。`
+        + `这一下 ${formatDamage(amount)} 点血，${nth}。`
         + `要不要回敬、用什么力度，你自己判断 —— `
         + `用 attack_nearest(attack_players=true) 才能打到人；`
         + `${cfg.playerName} 是队友，想让他掉血就 use_weapon=true，`
@@ -1299,17 +1342,23 @@ export function apply(ctx, input = {}) {
     const gapMs = Math.max(0, Number(cfg.hurtWakeGapSeconds) || 0) * 1000;
     if (Date.now() - lastUrgentWakeAt < gapMs) {
       pushPending(line);
+      // 被节流挡住的这些**正是 agent 不会知道的**，所以标"未叫醒"落进 hurt.log，
+      // 让它需要时能翻到"这期间原来还挨了这么多下"。
+      recordHurt(line, false);
       return;
     }
     lastUrgentWakeAt = Date.now();
+    recordHurt(line, true);
 
     // ④ 响应延迟（秒）：0 = 立即；>0 则等一下再叫，给连击留出合并窗口
     const delayMs = Math.max(0, Number(cfg.hurtResponseDelaySeconds) || 0) * 1000;
     // 环境伤害已经知道是哪一种了，不用再让它去"排查"
     const look = hasAttacker ? '立刻用 get_combat_snapshot 看附近威胁' : '立刻照下面的处置做';
+    // 完整流水账的路径也给它：节流期间挨的那些不会单独唤醒，只能自己翻。
+    const logHint = `（本次之前被节流挡下的受伤记录在 ${hurtLogPath()}，需要就自己读）`;
     const fire = () => {
       say(`[urgent] ${line} → 已交 agent${delayMs ? `（延迟 ${delayMs / 1000}s）` : '（立即）'}`);
-      wakeAgent(`🔴 ${line} —— ${look}：${advice}`);
+      wakeAgent(`🔴 ${line} —— ${look}：${advice}\n${logHint}`);
     };
     if (delayMs > 0) {
       const timer = setTimeout(fire, delayMs);
