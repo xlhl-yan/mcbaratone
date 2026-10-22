@@ -1,14 +1,16 @@
 /**
  * dsh-mc-chat-watch — 设置页（浏览器半）。
  *
- * 与 Host 半（index.js）用同一个命名空间 'mc-chat-watch' 配对：
- * Host 注册 `ctx.settings.installSection(...)`，这里向 `settings.section` 槽注册
- * 一张独立的一级设置页，表单读写 `ctx.settingsScope.bind({ namespace })`。
+ * 与 Host 半（index.js）用同一个命名空间 'mc-chat-watch' 配对，但**配置数据不走 DSH 的
+ * settings 服务** —— 本机实测那个服务没有 installSection/register，`configForms` 拿到的是
+ * 没有字段的空壳，`set()` 静默无效（2026-10-22）。
+ *
+ * 实际做法：Host 半用 `webServer.register` 开一个 `/mc-chat-watch-config` 接口，
+ * 这里 `fetch` 读写它（同 `dsh-meme` 的做法）。配置落在
+ * `$DSH_HOME/mc-chat-watch/settings.json`，优先级高于 cordis config。
  *
  * 打包成加载器要的 lazy-CJS 工厂产物：`window.__ModuleLoader__.load({ id, factory })`。
  * id 必须与 loader entry 名一致，否则 ModuleLoader 会报 "loaded without registering"。
- *
- * 配置改完**立即生效**（Host 半的 onChange 会把新值同步回运行期），不用重启 DSH。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-mc-chat-watch',
@@ -21,6 +23,8 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const NS = 'mc-chat-watch'
+    /** Host 半注册的配置读写接口（见 index.js 的 CONFIG_ROUTE）。 */
+    const CONFIG_ROUTE = '/mc-chat-watch-config'
 
     /** 表单字段定义：分组 → 字段。defaultValue 只在 Host 没给出值时用于占位显示。 */
     const GROUPS = [
@@ -107,15 +111,11 @@ window.__ModuleLoader__.load({
       .mcw-inline button:hover{border-color:var(--dsw-alias-brand-primary)}
       .mcw-inline button:disabled{opacity:.45;cursor:default}
       .mcw-flag{font-size:11px;color:var(--dsw-alias-brand-primary);white-space:nowrap}
-      /* 滑动开关：跟官方设置页那种胶囊形一致 */
-      .mcw-switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none;width:100%}
-      .mcw-switch input{position:absolute;opacity:0;width:0;height:0}
-      .mcw-switch .track{position:relative;flex:none;width:40px;height:22px;border-radius:999px;background:var(--dsw-alias-border-l1);transition:background .16s ease}
-      .mcw-switch .track::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .16s ease}
-      .mcw-switch input:checked + .track{background:var(--dsw-alias-brand-primary)}
-      .mcw-switch input:checked + .track::after{transform:translateX(18px)}
-      .mcw-switch input:disabled + .track{opacity:.45}
-      .mcw-switch .sw-label{font-size:13px;color:var(--dsw-alias-label-primary)}
+      /* 下拉选择器：照抄 dsh-thinking-language 的 .dshtl_selector（胶囊形、无边框） */
+      .mcw-select{background:var(--dsw-alias-bg-module-platform);height:36px;font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;border:none;border-radius:18px;align-items:center;gap:12px;padding:0 14px;font-size:14px;line-height:22px;display:inline-flex;min-width:96px;outline:none}
+      .mcw-select:hover{background:var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2))}
+      .mcw-select:disabled{opacity:.5;cursor:default}
+      .mcw-switch{display:none}
       .mcw-bar{display:flex;gap:10px;align-items:center;padding-top:4px}
       .mcw-bar button{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer}
       .mcw-bar button:hover{border-color:var(--dsw-alias-brand-primary)}
@@ -147,19 +147,19 @@ window.__ModuleLoader__.load({
       const checked = raw === true || raw === 'true'
       const display = raw === undefined || raw === null ? '' : String(raw)
 
-      // 开关：用原生 checkbox 驱动 CSS 胶囊（官方设置页就是这种滑动 switch），
-      // 而不是一个显示"开/关"的按钮 —— 后者点起来像坏了一样没有反馈。
+      // 布尔项用原生 <select> 二选一，照抄 dsh-thinking-language 的 FallbackMenu：
+      // 官方"思考语言"页就是这种胶囊下拉。比 switch 可靠 —— 下拉的 onChange 不会被
+      // label 转发二次触发，也不需要额外维护 checked 状态。
       const control = isBool
-        ? h('label', { className: 'mcw-switch', htmlFor: `mcw-${field.key}` },
-            h('input', {
-              id: `mcw-${field.key}`,
-              type: 'checkbox',
-              checked,
-              disabled: busy,
-              onChange: (e) => onSet(field.key, !!e.target.checked),
-            }),
-            h('span', { className: 'track' }),
-            h('span', { className: 'sw-label' }, checked ? '已启用' : '已关闭'))
+        ? h('select', {
+            id: `mcw-${field.key}`,
+            className: 'mcw-select',
+            value: checked ? 'on' : 'off',
+            disabled: busy,
+            onChange: (e) => onSet(field.key, e.target.value === 'on'),
+          },
+          h('option', { value: 'on' }, '开'),
+          h('option', { value: 'off' }, '关'))
         : h('input', {
             id: `mcw-${field.key}`,
             type: field.type === 'number' ? 'number' : 'text',
@@ -170,6 +170,8 @@ window.__ModuleLoader__.load({
             onChange: (e) => onSet(field.key, field.type === 'number' ? Number(e.target.value) : e.target.value),
           })
 
+      // 布尔项的下拉本身就是控件，外层 label 只做文字（用 htmlFor 指过去是安全的，
+      // select 不会像 checkbox 那样被 label 二次转发 change）
       return h('div', { className: 'mcw-row' },
         h('label', { htmlFor: `mcw-${field.key}` }, field.label),
         h('div', { className: 'mcw-inline' },
@@ -184,51 +186,56 @@ window.__ModuleLoader__.load({
 
     function McSettingsPage(props) {
       // form 是设置作用域（两代 harness 名字不同、接口一致），由 mountPage 注入
-      const form = props && props.form ? props.form : null
-
-      /** 读快照。0.2.x 叫 getSnapshot()，个别形态只有 get()。 */
-      const readSnapshot = () => {
-        try {
-          if (!form) return null
-          if (typeof form.getSnapshot === 'function') return form.getSnapshot()
-          if (typeof form.get === 'function') return form.get()
-          return null
-        } catch { return null }
-      }
-
-      const [snapshot, setSnapshot] = React.useState(readSnapshot)
+      // 配置数据走插件自己的 HTTP 接口（host 半注册），**不依赖 DSH 的 settings 服务**
+      // —— 本机那个服务没有 installSection/register，configForms 拿到的表单是空壳，
+      // set() 静默无效（2026-10-22 实测）。
+      const [cfg, setCfg] = React.useState(null)
+      const [overrides, setOverrides] = React.useState({})
       const [busy, setBusy] = React.useState(false)
       const [message, setMessage] = React.useState(null)
+      const [fatal, setFatal] = React.useState(null)
 
-      // 订阅作用域变化：别处（另一个窗口/另一个用户）改了也能同步过来
-      React.useEffect(() => {
-        if (!form || typeof form.subscribe !== 'function') return undefined
+      const load = React.useCallback(async () => {
         try {
-          return form.subscribe(() => setSnapshot(readSnapshot()))
-        } catch { return undefined }
-      }, [form])
+          const res = await fetch(CONFIG_ROUTE, { headers: { accept: 'application/json' } })
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          const data = await res.json()
+          setCfg(data.config || {})
+          setOverrides(data.overrides || {})
+          setFatal(null)
+        } catch (error) {
+          setFatal(String(error && error.message ? error.message : error))
+        }
+      }, [])
 
-      const reload = React.useCallback(() => {
-        setSnapshot(readSnapshot())
-      }, [form])
+      React.useEffect(() => { load() }, [load])
 
-      const apply = React.useCallback(async (fn, label) => {
-        if (!form) return
+      // 拼成 FieldRow 认识的 { value, user } 形状：value=当前生效配置，user=页面改过的键
+      const snapshot = { value: cfg || {}, user: overrides || {} }
+
+      const apply = React.useCallback(async (patch, label) => {
         setBusy(true)
         setMessage(null)
         try {
-          await fn()
-          reload()
+          const res = await fetch(CONFIG_ROUTE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(patch),
+          })
+          const data = await res.json().catch(() => ({}))
+          if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`)
+          setCfg(data.config || {})
+          setOverrides(data.overrides || {})
           setMessage({ kind: 'ok', text: `${label}已保存` })
         } catch (error) {
           setMessage({ kind: 'err', text: `${label}保存失败：${String(error && error.message ? error.message : error)}` })
         } finally {
           setBusy(false)
         }
-      }, [form, reload])
+      }, [])
 
-      const onSet = (key, value) => apply(() => form.set(key, value), '配置')
-      const onUnset = (key) => apply(() => form.unset(key), '配置')
+      const onSet = (key, value) => apply({ [key]: value }, '配置')
+      const onUnset = (key) => apply({ [key]: null }, '配置')
 
       // 样式只注入一次
       React.useEffect(() => {
@@ -241,19 +248,20 @@ window.__ModuleLoader__.load({
         return () => { try { style.remove() } catch { /* 忽略 */ } }
       }, [])
 
-      // 诊断条：排查"拿不到表单"时唯一的线索来源（打开设置页就能看见）
-      const diagBar = (props.diagnostics && props.diagnostics.length)
-        ? h('details', { className: 'mcw-diag' },
-            h('summary', null, `诊断（${props.diagnostics.length} 条，点开看）`),
-            props.diagnostics.map((line, i) => h('div', { key: i, className: 'mcw-diagline' }, line)))
-        : null
-
-      if (!form) {
+      // 读不到配置（host 半的设置接口没起来）时给出明确原因，而不是空表单
+      if (fatal) {
         return h('div', { className: 'mcw-panel' },
           h('p', { className: 'hint' },
-            '这个 DSH 版本没有把设置表单接口交给插件（configForms / settingsScope 都不可用），页面暂时只能读不能改。',
-            '可以先改 cordis.patch.yml 里的 config，或在游戏里用「态势 开/关」「自主 开/关」。'),
-          diagBar)
+            `读不到插件配置：${fatal}`),
+          h('p', { className: 'hint' },
+            'Host 半可能没加载，或 webServer 服务不可用。可以先改 cordis.patch.yml 里的 config，',
+            '或在游戏里用「态势 开/关」「自主 开/关」。'))
+      }
+
+      // 首次加载中
+      if (cfg === null) {
+        return h('div', { className: 'mcw-panel' },
+          h('p', { className: 'hint' }, '正在读取配置…'))
       }
 
       return h('div', { className: 'mcw-panel' },
@@ -275,90 +283,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 已经挂过一次页面了吗。
+     * 页面挂进 settings.section 槽。
      *
-     * 两代 harness 的服务名不同，两个分支都装、谁先被服务就用谁；一旦装好，
-     * 另一支必须让位，否则同一页会被注册两次。
-     */
-    let pageMounted = false
-    /** 诊断记录：显示在页面顶部，便于在没有控制台的情况下看清拿到了什么。 */
-    let diagnostics = []
-
-    function note(text) {
-      diagnostics.push(`${new Date().toLocaleTimeString()} ${text}`)
-      if (diagnostics.length > 12) diagnostics.shift()
-      // 同时打到控制台：这样不打开设置页、只看页面加载后的 console 就能确认
-      // apply 拿到了哪个 transport、form 有没有（截图工具会把它当"控制台错误"报出来）。
-      // 定位完可以删掉这一行。
-      try { console.error(`[mc-chat-watch] ${text}`) } catch { /* 忽略 */ }
-    }
-
-    /**
-     * 把页面挂进 settings.section 槽。
-     *
-     * `form` 是设置作用域对象（两代名字不同，接口一致）：
-     *   getSnapshot() / subscribe(fn) / set(field, value) / unset(field)
-     *
-     * ⚠️ 即使拿不到 form 也照样注册页面 —— 否则页面上什么都看不到，排查时只能猜。
-     * 页面会在顶部把诊断写出来（拿到了哪个服务、form 有没有）。
-     */
-    function mountPage(ctx, form, source) {
-      if (pageMounted) return
-      const slots = ctx && ctx.slots
-      if (!slots || typeof slots.inject !== 'function') {
-        note('ctx.slots 不可用，无法注册页面')
-        return
-      }
-      pageMounted = true
-      note(form ? `已挂载页面（来源 ${source}）` : `页面已挂载但拿不到 form（来源 ${source}）`)
-      slots.inject('settings.section', () => slots.register(
-        { name: 'settings.section', id: NS, order: 30, label: 'Minecraft 陪玩' },
-        (props) => h(McSettingsPage, Object.assign({}, props, { form, diagnostics }))))
-    }
-
-    /**
-     * 装两套 transport 分支。
-     *
-     * ⚠️ 这里的 `ctx.inject([...], cb)` 与 `exports.inject` 是**两回事**：
-     *   - `exports.inject` 是**插件级**依赖，不满足 → 整个插件永久 pending → web boot 挂；
-     *   - `apply` 内部的 `ctx.inject` 是**子作用域**依赖，不满足 → 只是这个回调不执行。
-     * 所以可选服务一律用后者（2026-10-21 踩过：把 settingsScope 写进 exports.inject，
-     * Web GUI 直接白屏 "web boot: 1 entry did not activate"）。
-     *
-     * 服务名随 harness 世代变化（dsh 0.2.x = `configForms`，0.1.x = `settingsScope`），
-     * 一个 harness 只会提供其中一种，所以两套都装上、先到的赢。
+     * 数据不走 DSH 的 settings 服务（本机那个服务没有 installSection/register，
+     * configForms.get() 返回的是**没有字段的空壳**），而是走插件自己的 HTTP 接口
+     * `<CONFIG_ROUTE>`（host 半注册，读 `$DSH_HOME/mc-chat-watch/settings.json`）。
      */
     function apply(ctx) {
-      if (!ctx || typeof ctx.inject !== 'function') {
-        note('ctx.inject 不可用')
-        return
-      }
-
-      // dsh 0.2.x：configForms 按命名空间取表单
-      ctx.inject(['configForms', 'locale'], (pageCtx) => {
-        try {
-          const forms = pageCtx.configForms || (typeof pageCtx.get === 'function' ? pageCtx.get('configForms') : null)
-          if (!forms) { note('configForms 分支：服务为空'); return }
-          const form = typeof forms.get === 'function' ? forms.get(NS) : (forms[NS] || forms)
-          note(`configForms 可用（${typeof forms.get === 'function' ? 'get()' : '对象'}），namespace ${NS} → ${form ? '有表单' : '无表单'}`)
-          mountPage(ctx, form, 'configForms')
-        } catch (error) {
-          note(`configForms 分支异常：${error && error.message ? error.message : error}`)
-        }
-      })
-
-      // dsh 0.1.x：settingsScope 需要 bind 出命名空间作用域
-      ctx.inject(['settingsScope', 'locale'], (pageCtx) => {
-        try {
-          const svc = pageCtx.settingsScope || (typeof pageCtx.get === 'function' ? pageCtx.get('settingsScope') : null)
-          if (!svc) { note('settingsScope 分支：服务为空'); return }
-          const form = typeof svc.bind === 'function' ? svc.bind({ namespace: NS }) : svc
-          note(`settingsScope 可用（${typeof svc.bind === 'function' ? 'bind()' : '直接对象'}）→ ${form ? '有作用域' : '无作用域'}`)
-          mountPage(ctx, form, 'settingsScope')
-        } catch (error) {
-          note(`settingsScope 分支异常：${error && error.message ? error.message : error}`)
-        }
-      })
+      const slots = ctx && ctx.slots
+      if (!slots || typeof slots.inject !== 'function') return
+      slots.inject('settings.section', () => slots.register(
+        { name: 'settings.section', id: NS, order: 30, label: 'Minecraft 陪玩' },
+        McSettingsPage))
     }
 
     exports.apply = apply
