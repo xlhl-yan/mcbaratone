@@ -267,11 +267,17 @@ public class StateCommandHandler extends AsyncCommandHandler {
             snapshot.addProperty("attacker_id", attacker.getId());
             snapshot.addProperty("attacker_uuid", attacker.getStringUUID());
             snapshot.addProperty("attacker_type", safeEntityType(attacker));
+            // 与 ClientTickHandler 的 DAMAGE 事件保持一致：直接带名字，
+            // 让消费方不用再反查一次 get_entities。getDisplayName() 可能为 null。
+            var attackerName = attacker.getDisplayName();
+            if (attackerName != null) snapshot.addProperty("attacker_name", attackerName.getString());
         }
         if (directSource != null && directSource != attacker) {
             snapshot.addProperty("direct_source_id", directSource.getId());
             snapshot.addProperty("direct_source_uuid", directSource.getStringUUID());
             snapshot.addProperty("direct_source_type", safeEntityType(directSource));
+            var sourceName = directSource.getDisplayName();
+            if (sourceName != null) snapshot.addProperty("direct_source_name", sourceName.getString());
         }
         snapshot.addProperty("is_projectile", directSource != null && directSource != attacker);
         return snapshot;

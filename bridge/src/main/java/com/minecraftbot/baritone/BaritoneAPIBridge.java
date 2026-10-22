@@ -263,13 +263,22 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
 
     @Override
     public void onInitialize() {
-        // Use bounded thread pool to prevent resource exhaustion
+        // Use bounded thread pool to prevent resource exhaustion.
+        // 🔴 线程一律设成 daemon：即使 CLIENT_STOPPING 因为某种原因没跑到，
+        // 这些池线程也不会把 JVM 钉住、拖到 MC 的关闭看门狗超时崩溃
+        // （2026-10-22 的 `Watchdog (Client shutdown from post-main)` 就是这么来的）。
+        final java.util.concurrent.atomic.AtomicInteger poolSeq = new java.util.concurrent.atomic.AtomicInteger();
         executor = new ThreadPoolExecutor(
                 THREAD_POOL_CORE_SIZE,
                 THREAD_POOL_MAX_SIZE,
                 THREAD_POOL_KEEP_ALIVE_SECONDS,
                 TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(100), // Queue up to 100 tasks
+                runnable -> {
+                    Thread thread = new Thread(runnable, "baritone-bridge-" + poolSeq.incrementAndGet());
+                    thread.setDaemon(true);
+                    return thread;
+                },
                 new ThreadPoolExecutor.CallerRunsPolicy() // Reject policy: run on calling thread if queue full
         );
         schematicDir = new File(Minecraft.getInstance().gameDirectory, "schematics");
@@ -303,6 +312,19 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
         // Initialize MCP Server after client is fully started
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
             initializeMcpServer();
+        });
+
+        // 🔴 2026-10-22 用户报「MC 关闭时跳出错误」：崩溃报告是
+        //   java.lang.Error: Watchdog (Client shutdown from post-main)
+        //   at ClientShutdownWatchdog... 
+        // 线程 dump 里 `pool-4-thread-1` 卡在 `Net.accept`（NetworkServer 的 acceptLoop），
+        // 另有一个 WebSocketSelector 线程也还活着。**因为从来没注册 CLIENT_STOPPING**，
+        // `shutdown()` 一次都没被调用过 —— 那些非守护线程让 JVM 无法退出，
+        // MC 的关闭看门狗等超时就强制报了 Error。
+        // 这里补上退出钩子；同时下面的 threadFactory 把它们都设成 daemon 作双保险。
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            LOGGER.info("Client stopping — shutting down Baritone API bridge");
+            shutdown();
         });
 
         LOGGER.info("Baritone API Bridge initialized on port " + configuredBridgePort());
@@ -1430,9 +1452,76 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
         }
     }
 
+    /**
+     * 关掉 Baritone 上游自己创建、且**从不关闭**的线程池。
+     *
+     * 🔴 为什么需要这个（2026-10-22 用户两次报「关闭 MC 时崩溃」）：
+     * 崩溃报告是 `java.lang.Error: Watchdog (Client shutdown from post-main)`
+     * —— MC 主线程结束后，`ClientShutdownWatchdog` 等 JVM 退出，等超时就强制报错。
+     * 线程 dump 里剩下的钉子是一对 **非守护** 的 `pool-4-thread-1/2`，栈顶是
+     * `baritone.o$a.run` / `baritone.o$b`（后者在 sleep 里做定时存盘）。
+     *
+     * 那些池的创建者是 `baritone.a`（`IBaritone` 的实现类）的**静态字段**
+     * `private static final ThreadPoolExecutor a`，用
+     * `new ThreadPoolExecutor(int,int,long,TimeUnit,BlockingQueue)` 建的 —— 没给
+     * ThreadFactory，所以线程名是默认的 `pool-N-thread-M`，也**没设 daemon**。
+     * Baritone 的公开 API（`ICachedWorld` / `IWorldData` / `IBaritone`）**只提供
+     * save()，不提供 shutdown()**，所以只能反射。
+     *
+     * 用反射而不是依赖混淆后的字段名：按「静态 + 类型是 ExecutorService」筛选，
+     * 这样 Baritone 换版本重新混淆也不会失配。
+     */
+    private void shutdownBaritoneThreadPools() {
+        try {
+            IBaritone primary = BaritoneAPI.getProvider().getPrimaryBaritone();
+            if (primary == null) {
+                return;
+            }
+            // primary 的实际类型就是 baritone.a（IBaritone 的唯一实现）
+            int closed = 0;
+            for (java.lang.reflect.Field field : primary.getClass().getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+                    continue;
+                }
+                if (!java.util.concurrent.ExecutorService.class.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    Object pool = field.get(null);
+                    if (pool instanceof java.util.concurrent.ExecutorService service) {
+                        service.shutdownNow();
+                        closed++;
+                    }
+                } catch (Throwable ignored) {
+                    // 单个字段拿不到不影响其他；Baritone 内部结构变了也不该让退出流程失败
+                }
+            }
+            LOGGER.info("Baritone thread pools shut down: {}", closed);
+        } catch (Throwable error) {
+            // 这里是"尽力而为"的清理：任何异常都只能降级为日志，
+            // 否则一次反射失败会让 MC 关不干净、又触发看门狗崩溃。
+            LOGGER.debug("Baritone thread pool shutdown skipped", error);
+        }
+    }
+
     public void shutdown() {
         running = false;
+        // 🔴 最后一步专门处理 Baritone 上游的线程池（见方法内注释），
+        // 放在最前面是因为它和下面的网络层无关、失败也不影响后续。
+        shutdownBaritoneThreadPools();
         try {
+            // 🔴 2026-10-22：关 MCP WebSocket 服务器（端口 mcp.port，默认 5557）。
+            // 它内部是 `org.java_websocket.server.WebSocketServer`，自带一个非守护的
+            // `WebSocketSelector-N` 线程。之前这里漏了它，只在 JVM shutdown hook 里关 ——
+            // 而 JVM 正因为这个线程退不了，hook 迟迟不跑，成了互相等待：
+            // MC 主线程结束 → ClientShutdownWatchdog 计时 → 超时 → 抛
+            // `java.lang.Error: Watchdog (Client shutdown from post-main)` 崩溃。
+            if (mcpServer != null) {
+                mcpServer.shutdown();
+                mcpServer = null;
+            }
+
             // Shutdown new network layer if initialized
             if (networkServer != null) {
                 networkServer.stop();
@@ -1459,6 +1548,10 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
             }
             if (executor != null) {
                 executor.shutdownNow();
+            }
+            // 命令层的清理线程池同样不能留着（CommandCache/UploadManager 里各有一个）
+            if (commandDispatcher != null) {
+                commandDispatcher.shutdown();
             }
         } catch (IOException e) {
             LOGGER.error("Error shutting down API server", e);

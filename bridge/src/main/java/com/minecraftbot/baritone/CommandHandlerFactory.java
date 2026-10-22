@@ -54,6 +54,8 @@ public class CommandHandlerFactory {
         registerHandler("get_entities", StateCommandHandler.class);
         registerHandler("get_combat_snapshot", StateCommandHandler.class);
         registerHandler("get_player_pos", PlayerPositionCommandHandler.class);
+        // 轻量心跳：只要"忙不忙"的调用方（空闲自主每 20 秒轮询一次）别去拉整个 get_state
+        registerHandler("is_idle", IsIdleCommandHandler.class);
         registerHandler("scan_biomes", BiomeScanCommandHandler.class);
         // 只读：准星当前指着什么（以前这个数据只能靠 use_item 顺带带出来，但调它会真右键）
         registerHandler("get_look_target", GetLookTargetCommandHandler.class);

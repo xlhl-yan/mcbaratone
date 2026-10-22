@@ -7,7 +7,9 @@ import org.slf4j.LoggerFactory;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 
@@ -81,8 +83,14 @@ public class ConnectionHandler {
         String clientId = clientSocket.getRemoteSocketAddress().toString();
         
         try (
-            BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-            PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true)
+            // 🔴 2026-10-22 用户报「你的游戏内回复变成乱码了，我看不了」：
+            // 这两行原来**没有指定字符集**，于是走 JVM 平台默认（中文 Windows 上是 GBK），
+            // 而 Python 侧 transport.py 发的是 UTF-8（`sendall(msg.encode("utf-8"))`）——
+            // 中文请求体一进 Java 就被按 GBK 拆成乱码。两端必须钉死同一个编码。
+            BufferedReader in = new BufferedReader(
+                new InputStreamReader(clientSocket.getInputStream(), StandardCharsets.UTF_8));
+            PrintWriter out = new PrintWriter(
+                new OutputStreamWriter(clientSocket.getOutputStream(), StandardCharsets.UTF_8), true)
         ) {
             LOGGER.debug("Client connected: {}", clientId);
             

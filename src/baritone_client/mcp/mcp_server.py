@@ -573,11 +573,12 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
     @mcp.tool()
     def attack_nearest(
         ctx: RequestContext,
-        max_distance: float = 4.0,
+        max_distance: float = 64.0,
         swings: int = 3,
         min_cooldown: float = 0.9,
         hostile_only: bool = True,
         entity_type: str = "",
+        attack_players: bool = False,
     ) -> Dict[str, Any]:
         """Swing at the nearest mob.
 
@@ -585,6 +586,16 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         attack cooldown isn't ready, so this loops `swings` times with a pause
         between hits. Give `entity_type` (e.g. "zombie") to pick a specific kind,
         or leave it empty to hit whatever hostile mob is closest.
+
+        `max_distance` defaults to 64 because a real fight is not confined to arm's
+        length: the target may back off between your passes, and hostile mobs
+        approach from further out. Pass a smaller value when you deliberately want
+        to stay at close quarters.
+
+        `attack_players` means exactly "may this hit a player too". Players are
+        excluded by default so a stray swing never starts PVP; pass True only when
+        retaliation against a human is actually intended (the chat-watch plugin does
+        this when the damage came from someone other than its configured player).
         """
         hostiles = {
             "zombie", "husk", "drowned", "skeleton", "stray", "spider", "cave_spider",
@@ -607,14 +618,16 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                 candidates = []
                 for entry in (found or {}).get("entities") or []:
                     kind = str(entry.get("type") or "").replace("minecraft:", "")
-                    if "player" in kind:
+                    if "player" in kind and not attack_players:
                         continue
                     if not entry.get("is_living"):
                         continue
                     if wanted:
                         if kind != wanted:
                             continue
-                    elif hostile_only and kind not in hostiles:
+                    elif hostile_only and not attack_players and kind not in hostiles:
+                        continue
+                    elif hostile_only and attack_players and "player" not in kind and kind not in hostiles:
                         continue
                     distance = float(entry.get("distance") or 9999)
                     if distance > float(max_distance):
@@ -623,7 +636,7 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                 if not candidates:
                     break
                 target = min(candidates, key=lambda c: c["distance"])
-                seen = target["type"]
+                seen = target["type"] or seen
                 result = client.transport.dispatch(
                     "attack_entity",
                     {"entity_id": target["id"], "min_cooldown": float(min_cooldown)},

@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import net.minecraft.network.chat.Component;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -344,6 +345,17 @@ public class ClientTickHandler {
         data.addProperty(prefix + "_id", entity.getId());
         data.addProperty(prefix + "_uuid", entity.getStringUUID());
         data.addProperty(prefix + "_type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+        // 攻击者的名字（玩家 = 账号名，生物 = 显示名）。
+        //
+        // 为什么直接带上而不是让消费方自己查：插件要区分"配置的那位玩家"和"别人/怪"，
+        // 光看 type 分不出来。原来消费方得拿 attacker_id 再跑一次 get_entities 反查 ——
+        // 多一跳 bridge 往返，还可能在战斗结束后才查到，白慢。
+        //
+        // 空值保护：mock 实体（单测）与某些无名字实体可能返回 null。
+        Component displayName = entity.getDisplayName();
+        if (displayName != null) {
+            data.addProperty(prefix + "_name", displayName.getString());
+        }
     }
 
     private void addDamageDirection(JsonObject data, Entity source, Entity player) {
