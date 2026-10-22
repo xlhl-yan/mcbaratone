@@ -79,6 +79,15 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
     // MCP Server (Native Java MCP implementation)
     private McpServer mcpServer;
 
+    /**
+     * 事件推送用 WebSocket 服务器（`-Dbaritone.ws.port`，默认 5559）。
+     *
+     * 以前只是"写好放在那儿"：端口写死 5556、和裸 TCP 撞车，于是从没被启动过。
+     * 现在真正接线 —— 客户端订阅后可以收到 damage / chat / inventory_change 等事件，
+     * 不必再靠每秒轮询 get_events。
+     */
+    private WebSocketEventServer eventWebSocketServer;
+
     // Modular event system
     private ClientTickHandler clientTickHandler;
     private FabricEventRegistrar fabricEventRegistrar;
@@ -308,6 +317,16 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
 
         // Initialize modular network layer
         initializeNetworkLayer();
+
+        // 事件推送 WebSocket：订阅后按事件类型推送，替代消费侧的轮询。
+        // 起不来（端口被占/库缺失）只记日志，不能影响 bridge 主通道。
+        try {
+            eventWebSocketServer = new WebSocketEventServer(eventManager);
+            eventWebSocketServer.startServing();
+        } catch (Throwable error) {
+            eventWebSocketServer = null;
+            LOGGER.warn("Event WebSocket server failed to start (bridge still works)", error);
+        }
 
         // Initialize MCP Server after client is fully started
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
@@ -1511,6 +1530,14 @@ public class BaritoneAPIBridge implements ModInitializer, MissionBridgeAdapter {
         // 放在最前面是因为它和下面的网络层无关、失败也不影响后续。
         shutdownBaritoneThreadPools();
         try {
+            // 🔴 事件推送 WS 服务器必须在这里关掉。不带这一步的话，它会像今天的
+            // McpServer 一样留下一个非守护 selector 线程，把 JVM 钉住、逼出
+            // `Watchdog (Client shutdown from post-main)` 崩溃。教训已经吃过两次。
+            if (eventWebSocketServer != null) {
+                eventWebSocketServer.stopServing();
+                eventWebSocketServer = null;
+            }
+
             // 🔴 2026-10-22：关 MCP WebSocket 服务器（端口 mcp.port，默认 5557）。
             // 它内部是 `org.java_websocket.server.WebSocketServer`，自带一个非守护的
             // `WebSocketSelector-N` 线程。之前这里漏了它，只在 JVM shutdown hook 里关 ——

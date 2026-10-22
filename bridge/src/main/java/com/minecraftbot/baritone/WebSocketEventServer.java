@@ -22,15 +22,52 @@ import java.util.concurrent.ConcurrentHashMap;
 public class WebSocketEventServer extends WebSocketServer implements EventManager.EventListener {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("websocket-event-server");
-    private static final int WEBSOCKET_PORT = 5556; // Using 5556 to avoid conflict with TCP on 5555
+
+    /**
+     * 事件推送端口。可用 {@code -Dbaritone.ws.port=...} 覆盖（多客户端时必须分开）。
+     *
+     * 🔴 这里原来是写死的 5556 —— 而裸 TCP bridge 也占 5556，于是这个 server
+     * 一 start 就 bind 冲突，谁都不敢启动它，整个类就这么躺了半年死代码。
+     * 现在端口可配、默认 5559（5555/5556 是 TCP，5557/5558 是 MCP）。
+     */
+    static final int DEFAULT_WEBSOCKET_PORT = 5559;
+    private static final String PORT_PROPERTY = "baritone.ws.port";
+
     private static final Gson GSON = new Gson();
 
     private final EventManager eventManager;
     private final Map<WebSocket, Set<String>> clientSubscriptions = new ConcurrentHashMap<>();
 
     public WebSocketEventServer(EventManager eventManager) {
-        super(new InetSocketAddress(WEBSOCKET_PORT));
+        this(eventManager, Integer.getInteger(PORT_PROPERTY, DEFAULT_WEBSOCKET_PORT));
+    }
+
+    public WebSocketEventServer(EventManager eventManager, int port) {
+        super(new InetSocketAddress(port));
         this.eventManager = eventManager;
+    }
+
+    /** 配置完成后真正开始监听，并把自身挂到事件总线上。 */
+    public void startServing() {
+        start();
+        eventManager.subscribe(this);
+        LOGGER.info("Event WebSocket server started on port {}", getPort());
+    }
+
+    /** 停服并从事件总线下线 —— 一定要被 shutdown() 调到，否则线程会钉住 JVM。 */
+    public void stopServing() {
+        try {
+            eventManager.unsubscribe(this);
+        } catch (Throwable ignored) {
+            // 下线失败不影响后续关闭
+        }
+        try {
+            stop(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Throwable error) {
+            LOGGER.warn("Error stopping event WebSocket server", error);
+        }
     }
 
     @Override
@@ -124,7 +161,7 @@ public class WebSocketEventServer extends WebSocketServer implements EventManage
 
     @Override
     public void onStart() {
-        LOGGER.info("WebSocket event server started on port {}", WEBSOCKET_PORT);
+        LOGGER.info("Event WebSocket server listening on port {}", getPort());
     }
 
     /**
