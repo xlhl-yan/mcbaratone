@@ -95,17 +95,27 @@ window.__ModuleLoader__.load({
       .mcw-group{display:flex;flex-direction:column;gap:10px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
       .mcw-group h3{margin:0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
       .mcw-group .hint{margin:0 0 2px;font-size:12px;color:var(--dsw-alias-label-secondary);line-height:1.5}
-      .mcw-row{display:flex;flex-direction:column;gap:4px}
+      .mcw-row{display:flex;flex-direction:column;gap:5px}
       .mcw-row label{font-size:12px;color:var(--dsw-alias-label-secondary)}
       .mcw-row .help{font-size:11px;color:var(--dsw-alias-label-secondary);opacity:.75;line-height:1.45}
-      .mcw-row input[type=text],.mcw-row input[type=number]{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:7px 10px;font-size:13px;outline:none;transition:border-color .12s ease}
+      .mcw-field{width:100%}
+      .mcw-row input[type=text],.mcw-row input[type=number]{width:100%;box-sizing:border-box;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:8px 11px;font-size:13px;outline:none;transition:border-color .12s ease}
       .mcw-row input:focus{border-color:var(--dsw-alias-brand-primary)}
       .mcw-row input.overridden{border-color:var(--dsw-alias-brand-primary)}
-      .mcw-inline{display:flex;gap:8px;align-items:center}
-      .mcw-inline button{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer}
+      .mcw-inline{display:flex;gap:8px;align-items:center;width:100%}
+      .mcw-inline button{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer;white-space:nowrap}
       .mcw-inline button:hover{border-color:var(--dsw-alias-brand-primary)}
       .mcw-inline button:disabled{opacity:.45;cursor:default}
       .mcw-flag{font-size:11px;color:var(--dsw-alias-brand-primary);white-space:nowrap}
+      /* 滑动开关：跟官方设置页那种胶囊形一致 */
+      .mcw-switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none;width:100%}
+      .mcw-switch input{position:absolute;opacity:0;width:0;height:0}
+      .mcw-switch .track{position:relative;flex:none;width:40px;height:22px;border-radius:999px;background:var(--dsw-alias-border-l1);transition:background .16s ease}
+      .mcw-switch .track::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .16s ease}
+      .mcw-switch input:checked + .track{background:var(--dsw-alias-brand-primary)}
+      .mcw-switch input:checked + .track::after{transform:translateX(18px)}
+      .mcw-switch input:disabled + .track{opacity:.45}
+      .mcw-switch .sw-label{font-size:13px;color:var(--dsw-alias-label-primary)}
       .mcw-bar{display:flex;gap:10px;align-items:center;padding-top:4px}
       .mcw-bar button{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer}
       .mcw-bar button:hover{border-color:var(--dsw-alias-brand-primary)}
@@ -134,28 +144,36 @@ window.__ModuleLoader__.load({
       const overridden = Object.prototype.hasOwnProperty.call(user, field.key)
       const raw = values[field.key]
       const isBool = field.type === 'bool'
-      const display = isBool
-        ? (raw ? '开' : '关')
-        : (raw === undefined || raw === null ? '' : String(raw))
+      const checked = raw === true || raw === 'true'
+      const display = raw === undefined || raw === null ? '' : String(raw)
+
+      // 开关：用原生 checkbox 驱动 CSS 胶囊（官方设置页就是这种滑动 switch），
+      // 而不是一个显示"开/关"的按钮 —— 后者点起来像坏了一样没有反馈。
+      const control = isBool
+        ? h('label', { className: 'mcw-switch', htmlFor: `mcw-${field.key}` },
+            h('input', {
+              id: `mcw-${field.key}`,
+              type: 'checkbox',
+              checked,
+              disabled: busy,
+              onChange: (e) => onSet(field.key, !!e.target.checked),
+            }),
+            h('span', { className: 'track' }),
+            h('span', { className: 'sw-label' }, checked ? '已启用' : '已关闭'))
+        : h('input', {
+            id: `mcw-${field.key}`,
+            type: field.type === 'number' ? 'number' : 'text',
+            className: overridden ? 'overridden' : '',
+            value: display,
+            placeholder: field.placeholder || '',
+            disabled: busy,
+            onChange: (e) => onSet(field.key, field.type === 'number' ? Number(e.target.value) : e.target.value),
+          })
 
       return h('div', { className: 'mcw-row' },
         h('label', { htmlFor: `mcw-${field.key}` }, field.label),
         h('div', { className: 'mcw-inline' },
-          isBool
-            ? h('button', {
-                id: `mcw-${field.key}`,
-                disabled: busy,
-                onClick: () => onSet(field.key, !raw),
-              }, display)
-            : h('input', {
-                id: `mcw-${field.key}`,
-                type: field.type === 'number' ? 'number' : 'text',
-                className: overridden ? 'overridden' : '',
-                value: display,
-                placeholder: field.placeholder || '',
-                disabled: busy,
-                onChange: (e) => onSet(field.key, field.type === 'number' ? Number(e.target.value) : e.target.value),
-              }),
+          control,
           overridden
             ? h(React.Fragment, null,
                 h('span', { className: 'mcw-flag' }, '已覆盖'),

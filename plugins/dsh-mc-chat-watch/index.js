@@ -14,6 +14,7 @@
 import { createConnection } from 'node:net';
 import { readdirSync, statSync } from 'node:fs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -374,6 +375,31 @@ export function parseControlCommand(text) {
 /** 设置页与 Host 半的配对键：两半必须用同一个字符串。 */
 export const SETTINGS_NS = 'mc-chat-watch';
 
+/**
+ * 设置页用的 schema。
+ *
+ * 🔴 必须给 installSection 一个**能声明字段**的 schema，传 null 会让表单拿不到字段定义 ——
+ * 表现为"读得到值、但改不动"（2026-10-22 用户实测：开关点了没反应）。
+ * `Schema.dict(Schema.any())` 是 `meow-memory` 验证过的写法：接受任意键值，不用逐个列。
+ *
+ * 用 createRequire 动态取，取不到就退回一个最小同形对象；两条路都不会让插件起不来。
+ */
+const Schema = (() => {
+  try {
+    const req = createRequire(import.meta.url);
+    const mod = req('@deepseek-ai/schemastery');
+    return mod?.default ?? mod;
+  } catch {
+    // 极简同形对象：installSection 只用到 dict/any 的形态
+    const node = (type) => ({ type, toString: () => `<schema:${type}>` });
+    return { any: () => node('any'), dict: (inner) => ({ type: 'dict', inner }) };
+  }
+})();
+
+const CONFIG_SCHEMA = typeof Schema?.dict === 'function'
+  ? Schema.dict(Schema.any())
+  : null;
+
 export function apply(ctx, input = {}) {
   const cfg = resolveConfig(input);
 
@@ -387,7 +413,7 @@ export function apply(ctx, input = {}) {
   try {
     const settingsSvc = typeof ctx.get === 'function' ? ctx.get('settings') : ctx.settings;
     if (settingsSvc && typeof settingsSvc.installSection === 'function') {
-      settingsSvc.installSection(ctx, SETTINGS_NS, null, cfg, {
+      settingsSvc.installSection(ctx, SETTINGS_NS, CONFIG_SCHEMA, cfg, {
         // 设置页写入后，把新值同步回运行期 —— cfg 是本地对象，直接改它
         setSource: (get) => {
           try {
