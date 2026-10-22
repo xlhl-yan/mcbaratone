@@ -61,7 +61,8 @@ window.__ModuleLoader__.load({
         hint: '游戏内识别"谁在说话"的依据。改完点一下别处即保存。',
         fields: [
           { key: 'playerName', label: '玩家账号名', placeholder: 'xlhl_world', help: '你（人类）在游戏里的名字，用于跟丢判断和主动说话点名' },
-          { key: 'aiAccount', label: 'AI 账号名', placeholder: 'DeepSeek', help: 'AI 自己的账号名。用它排除"自己说的话"和"自己这个实体"' },
+          { key: 'aiAccount', label: 'AI 账号名', placeholder: 'DeepSeek', help: 'AI 自己的账号名。它说的话永远不会被投递回来（防自激），也用它排除自己这个实体' },
+          { key: 'includeSenders', label: '只关注这些人', type: 'list', placeholder: '留空 = 谁说话都关注', help: '填了就只听名单里的人，用逗号或空格分隔（如 xlhl_world, 队友A）。留空则全放行，AI 自己的话始终忽略' },
         ],
       },
       {
@@ -75,8 +76,11 @@ window.__ModuleLoader__.load({
       {
         title: '连接',
         fields: [
+          { key: '__link', type: 'link', label: '插件 → bridge', help: '插件自己直连 5556 的结果。断开时点右边重连（会清掉事件游标，MC 重启后尤其需要）' },
+          { key: '__mcp', type: 'mcp', label: 'MCP → bridge (5556)', help: 'AI 用 mcp__baritone__* 工具走的是这条：DSH → python wrapper → bridge。wrapper 崩了插件照样通，所以分开看' },
           { key: 'host', label: 'bridge 主机', placeholder: '127.0.0.1' },
           { key: 'port', label: 'bridge 端口', placeholder: '5556', type: 'number', help: 'AI 客户端的 bridge 端口（人那侧默认 5555）' },
+          { key: 'wsPort', label: '事件推送端口', placeholder: '5559', type: 'number', help: 'damage/chat 走这条 WS 长连接，不再轮询；连不上会自动回退到轮询，填错不会失聪' },
           { key: 'timeoutMs', label: '单次超时 (ms)', placeholder: '4000', type: 'number' },
         ],
       },
@@ -166,18 +170,60 @@ window.__ModuleLoader__.load({
       .mcw-toast{position:fixed;right:24px;bottom:24px;z-index:9999;padding:10px 16px;border-radius:10px;font-size:13px;line-height:20px;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.2);pointer-events:none}
       .mcw-toast.ok{background:var(--dsw-alias-label-success, #2e9e5b)}
       .mcw-toast.err{background:var(--dsw-alias-label-error, #d64545)}
+      /* 连接状态行：左边小圆点 + 文案，右边重连按钮 */
+      .mcw-link{display:flex;align-items:center;gap:10px;flex:none}
+      .mcw-linkText{display:flex;align-items:center;gap:6px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .mcw-linkText .dot{flex:none;font-size:11px;line-height:1}
+      .mcw-linkText .dot.ok{color:var(--dsw-alias-label-success, #2e9e5b)}
+      .mcw-linkText .dot.err{color:var(--dsw-alias-label-error, #d64545)}
+      .mcw-btn{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-primary);border:none;border-radius:18px;height:36px;padding:0 16px;font:inherit;font-size:14px;line-height:22px;cursor:pointer;outline:none;flex:none}
+      .mcw-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
+      .mcw-btn:disabled{opacity:.5;cursor:default}
+      /* MCP 状态块：整宽（标题 + 状态 + 出错时的引导文本），不占右侧控件位 */
+      .mcw-mcpBlock{display:flex;flex-direction:column;gap:6px;padding:7px 0}
+      .mcw-mcpHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .mcw-mcpHead .name{color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}
+      .mcw-mcpHead .dot{flex:none;font-size:11px;line-height:1}
+      .mcw-mcpHead .dot.ok{color:var(--dsw-alias-label-success, #2e9e5b)}
+      .mcw-mcpHead .dot.err{color:var(--dsw-alias-label-error, #d64545)}
+      .mcw-mcpHead .state{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
+      .mcw-mcpWarn{color:var(--dsw-alias-label-error, #d64545);font-size:12px;line-height:18px;padding-left:2px}
     `
 
-    /** 把数值型草稿安全转成配置值。 */
+    /** 时间戳 → HH:mm:ss（状态行用）。 */
+    function fmtClock(ts) {
+      if (!ts) return '—'
+      const d = new Date(ts)
+      if (Number.isNaN(d.getTime())) return '—'
+      const pad = (n) => String(n).padStart(2, '0')
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    }
+
+    /**
+     * 把输入框草稿转成配置值。
+     *
+     * `list` 类型存的是**数组**：逗号/空格/顿号分隔，去空去重。留空 → `[]`（不是 null
+     * —— 空名单是合法状态，对 `includeSenders` 来说它表示"谁说话都关注"）。
+     */
     function coerce(field, raw) {
+      if (field.type === 'list') {
+        const parts = String(raw == null ? '' : raw).split(/[,，、;；\s]+/)
+        const out = []
+        for (const part of parts) {
+          const name = part.trim()
+          if (name && !out.includes(name)) out.push(name)
+        }
+        return out
+      }
       if (field.type !== 'number') return raw
       if (raw === '') return null
       const n = Number(raw)
       return Number.isFinite(n) ? n : null
     }
 
-    /** 配置值 → 输入框显示的字符串。 */
+    /** 配置值 → 输入框显示的字符串。数组用逗号拼回可编辑形式。 */
     function asText(value) {
+      if (Array.isArray(value)) return value.join(', ')
       return value === undefined || value === null ? '' : String(value)
     }
 
@@ -234,6 +280,12 @@ window.__ModuleLoader__.load({
       const [drafts, setDrafts] = React.useState({})
       const [fatal, setFatal] = React.useState(null)
       const [message, setMessage] = React.useState(null)
+      // 连接状态（host 半每次请求后更新）与重连中的按钮锁
+      const [link, setLink] = React.useState(null)
+      const [reconnecting, setReconnecting] = React.useState(false)
+      // MCP 那条链路（DSH → python wrapper → bridge），与 link 分开看。
+      // 只读展示，没有可点的动作（见 renderControl 里 mcp 分支的说明）。
+      const [mcp, setMcp] = React.useState(null)
 
       const load = React.useCallback(async () => {
         try {
@@ -242,6 +294,8 @@ window.__ModuleLoader__.load({
           const data = await res.json()
           setCfg(data.config || {})
           setOverrides(data.overrides || {})
+          setLink(data.link || null)
+          setMcp(data.mcp || null)
           setFatal(null)
         } catch (error) {
           setFatal(String(error && error.message ? error.message : error))
@@ -249,6 +303,36 @@ window.__ModuleLoader__.load({
       }, [])
 
       React.useEffect(() => { load() }, [load])
+
+      // 状态自己会更新的：定期重新读一次，别让页面停在旧结论上。
+      // 5 秒够快也不会给 host 添麻烦（它本来就是每 3 秒轮询 bridge 的）。
+      React.useEffect(() => {
+        const timer = setInterval(() => { load() }, 5000)
+        return () => clearInterval(timer)
+      }, [load])
+
+      /** 手动重连：让 host 清掉游标状态并真连一次，结果直接反映到状态行。 */
+      const reconnect = React.useCallback(async () => {
+        setReconnecting(true)
+        try {
+          const res = await fetch(CONFIG_ROUTE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ __action: 'reconnect' }),
+          })
+          const data = await res.json().catch(() => ({}))
+          if (data.link) setLink(data.link)
+          if (data.config) setCfg(data.config)
+          if (data.ok === false) throw new Error(data.error || '重连失败')
+          setMessage(data.link && data.link.ok
+            ? { kind: 'ok', text: '重连成功' }
+            : { kind: 'err', text: `仍然连不上：${(data.link && data.link.lastError) || '未知原因'}` })
+        } catch (error) {
+          setMessage({ kind: 'err', text: `重连请求失败：${String(error && error.message ? error.message : error)}` })
+        } finally {
+          setReconnecting(false)
+        }
+      }, [])
 
       // 样式只注入一次
       React.useEffect(() => {
@@ -300,6 +384,60 @@ window.__ModuleLoader__.load({
         const saved = cfg[field.key]
         const overridden = Object.prototype.hasOwnProperty.call(overrides, field.key)
 
+        // 连接状态：只读展示 + 重连按钮（不写 settings.json）
+        if (field.type === 'link') {
+          const online = Boolean(link && link.ok)
+          let detail = '还没连上过'
+          if (online) {
+            detail = `已连接 · 最后响应 ${fmtClock(link.lastOkAt)}`
+          } else if (link && link.lastErrorAt) {
+            detail = `未连接 · ${String(link.lastError || '').slice(0, 60)}`
+          }
+          return h('div', { className: 'mcw-link' },
+            h('div', { className: 'mcw-linkText' },
+              h('span', { className: online ? 'dot ok' : 'dot err' }, '●'),
+              h('span', null, detail),
+              link && link.reconnects ? h('span', { style: { opacity: 0.6 } }, `（已重连 ${link.reconnects} 次）`) : null),
+            h('button', {
+              type: 'button',
+              className: 'mcw-btn',
+              disabled: reconnecting,
+              onClick: reconnect,
+            }, reconnecting ? '重连中…' : '重连'))
+        }
+
+        // MCP 链路：只读展示，不给按钮（2026-10-22 用户拍板 —— 能自愈的轮不到人点，
+        // 救不回来的杀了也没用，按钮只会制造"点一下就好"的假安全感）。
+        // 两个证据拼起来看：wrapper 进程在不在 + bridge 通不通。只显示一个都会误导。
+        if (field.type === 'mcp') {
+          const wrapperAlive = Boolean(mcp && mcp.running)
+          const bridgeOk = Boolean(link && link.ok)
+          const healthy = wrapperAlive && bridgeOk
+          let detail = '未知'
+          let guide = ''
+          if (healthy) {
+            // 不显示进程数：wrapper 自己会再起一层子进程（父子同名脚本），
+            // 显示"2 个进程"会让人以为有重复链路，其实只有一条。
+            detail = '已连接'
+          } else if (wrapperAlive && !bridgeOk) {
+            detail = 'wrapper 在，但 bridge 不通'
+            guide = '连不上 MC 的 bridge（5556）。确认 MC 客户端开着、且 AI 那端启动参数带 -Dbaritone.bridge.port=5556。'
+          } else if (!wrapperAlive && bridgeOk) {
+            detail = 'wrapper 不在（MCP 没在跑）'
+            guide = 'MCP 后台进程没启动。常见原因两个：① 当前 profile 的 cordis.patch.yml 里 mcp-baritone 是 disabled: true（web profile 默认就是关的，要用 MC 工具得先改成 false）；② 之前断过、DSH 的重连预算（10 次）已用完。前者改配置，后者重启 DSH。'
+          } else {
+            detail = 'wrapper 不在，bridge 也不通'
+            guide = 'MC 客户端没开（bridge 5556 没有服务），同时 MCP 后台进程也没在跑。先把 MC 开起来；如果这个 profile 的 mcp-baritone 是 disabled: true，还要把它改成 false。'
+          }
+          if (mcp && mcp.error) detail += ` · 探测出错：${mcp.error}`
+          return h('div', { className: 'mcw-mcpBlock' },
+            h('div', { className: 'mcw-mcpHead' },
+              h('span', { className: 'name' }, field.label),
+              h('span', { className: `dot ${healthy ? 'ok' : 'err'}` }, '●'),
+              h('span', { className: 'state' }, detail)),
+            guide ? h('div', { className: 'mcw-mcpWarn' }, guide) : null)
+        }
+
         if (field.type === 'bool') {
           const on = saved === true || saved === 'true'
           return h(MenuSelect, {
@@ -332,17 +470,19 @@ window.__ModuleLoader__.load({
           onChange: (e) => setDrafts((prev) => ({ ...prev, [field.key]: e.target.value })),
           onBlur: (e) => {
             const next = coerce(field, e.target.value)
-            // 没变就不发请求
-            if (next !== null && String(next) === asText(saved)) {
-              setDrafts((prev) => { const copy = { ...prev }; delete copy[field.key]; return copy })
-              return
-            }
-            if (next === null && asText(saved) === '') {
-              setDrafts((prev) => { const copy = { ...prev }; delete copy[field.key]; return copy })
+            const clearDraft = () => setDrafts((prev) => {
+              const copy = { ...prev }
+              delete copy[field.key]
+              return copy
+            })
+            // 没变就不发请求。统一按"显示文本"比较 —— 数组值用 String() 比会得到
+            // "a,b" 而显示的是 "a, b"，不归一化就会每次失焦都白发一次请求。
+            if (asText(next) === asText(saved)) {
+              clearDraft()
               return
             }
             commit(field.key, next)
-            setDrafts((prev) => { const copy = { ...prev }; delete copy[field.key]; return copy })
+            clearDraft()
           },
           onKeyDown: (e) => { if (e.key === 'Enter') e.target.blur() },
         })
@@ -351,11 +491,15 @@ window.__ModuleLoader__.load({
       const groups = GROUPS.map((group) => h('div', { className: 'mcw-group', key: group.title },
         h('div', { className: 'mcw-groupTitle' }, group.title),
         group.hint ? h('div', { className: 'mcw-groupHint' }, group.hint) : null,
-        group.fields.map((field) => h('div', { className: 'mcw-row', key: field.key },
-          h('div', { className: 'mcw-rowText' },
-            h('div', { className: 'mcw-title' }, field.label),
-            field.help ? h('div', { className: 'mcw-desc' }, field.help) : null),
-          renderControl(field)))))
+        group.fields.map((field) => {
+          // MCP 状态是整宽块（标题+圆点+说明+引导文本），不套「左文字右控件」的 row
+          if (field.type === 'mcp') return h(React.Fragment, { key: field.key }, renderControl(field))
+          return h('div', { className: 'mcw-row', key: field.key },
+            h('div', { className: 'mcw-rowText' },
+              h('div', { className: 'mcw-title' }, field.label),
+              field.help ? h('div', { className: 'mcw-desc' }, field.help) : null),
+            renderControl(field))
+        })))
 
       return h(React.Fragment, null,
         h('div', { className: 'mcw-page' },

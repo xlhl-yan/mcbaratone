@@ -12,6 +12,7 @@
  */
 
 import { createConnection } from 'node:net';
+import { execFile } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -27,6 +28,13 @@ const DEFAULTS = {
   host: '127.0.0.1',
   /** AI 客户端 bridge 的端口（用 JVM 参数 -Dbaritone.bridge.port 控制） */
   port: 5556,
+  /**
+   * 事件推送 WS 的端口（bridge 那侧用 -Dbaritone.ws.port 控制，默认 5559）。
+   *
+   * damage / chat 走这条长连接，不再轮询；连不上时自动回退到轮询，
+   * 所以填错了也只是回到旧行为，不会失聪。
+   */
+  wsPort: 5559,
   /** 轮询间隔（秒）。事件驱动，所以可以短；3s 对聊天够用。 */
   tickSeconds: 3,
   /** 玩家账号名。用于「跟丢判断」和主动说话时点名。 */
@@ -34,16 +42,19 @@ const DEFAULTS = {
   /**
    * AI 自己的账号名。
    *
-   * 两处用它：① 假装不是自己说的话（`ignoreSenders` 留空时自动取它）；
-   * ② 从 `get_entities` 的玩家列表里排除自己这个实体 —— 以前这里写死 'DeepSeek'，
-   * 换账号就得改源码。
+   * 两处用它：① **永远不投递自己说的话**（防自激：自己说一句 → 被投递 → agent 又被
+   * 叫醒 → 又说一句，会转圈）；② 从 `get_entities` 的玩家列表里排除自己这个实体。
    */
   aiAccount: 'DeepSeek',
   /**
-   * 这些发送者的消息不投递（AI 自己说的别把自己吵醒）。
-   * **留空 = 自动用 [aiAccount]**，通常不用手填。
+   * 只关注这些发送者说的话（白名单）。
+   *
+   * **留空 = 谁说话都投递**；填了就只放行名单里的人，其余（包括没有发送者的系统消息）
+   * 一律丢弃。适合"只想听某个队友指挥"或"服里太吵只认一个人"的场景。
+   *
+   * ⚠️ AI 自己说的话无论名单怎么填都不会投递 —— 那是防自激的硬约束，不是配置项。
    */
-  ignoreSenders: [],
+  includeSenders: [],
   /** 单次 tick 最多投递几条，防刷屏。 */
   maxPerTick: 10,
   /** 找「最近有写入的会话」的根目录。留空 = <DSH_HOME>/sessions */
@@ -116,9 +127,28 @@ function describeHazard(damageType) {
   return { key, zh: `${key}（未收录的环境伤害）`, fix: '看 get_state 的 health / on_fire / air_supply 判断' };
 }
 
+/**
+ * 把"逗号/空格/顿号分隔的字符串"或数组统一成去重后的字符串数组。
+ *
+ * 设置页的输入框只能给字符串，而配置里要的是数组 —— 归一化放在这里做一次，
+ * 免得每个用它的地方各自猜格式。
+ */
+export function normalizeSenders(value) {
+  const parts = Array.isArray(value)
+    ? value
+    : String(value == null ? '' : value).split(/[,，、;；\s]+/);
+  const out = [];
+  for (const part of parts) {
+    const name = String(part == null ? '' : part).trim();
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 export function resolveConfig(input = {}) {
   const cfg = { ...DEFAULTS, ...input };
   cfg.port = Number(cfg.port) || DEFAULTS.port;
+  cfg.wsPort = Number(cfg.wsPort) || DEFAULTS.wsPort;
   cfg.tickSeconds = Math.max(1, Number(cfg.tickSeconds) || DEFAULTS.tickSeconds);
   cfg.maxPerTick = Math.max(1, Number(cfg.maxPerTick) || DEFAULTS.maxPerTick);
   cfg.timeoutMs = Math.max(500, Number(cfg.timeoutMs) || DEFAULTS.timeoutMs);
@@ -130,10 +160,11 @@ export function resolveConfig(input = {}) {
     : (input.watchPlayer !== undefined ? input.watchPlayer : DEFAULTS.playerName);
   cfg.playerName = String(rawPlayer).trim() || DEFAULTS.playerName;
   cfg.aiAccount = String(cfg.aiAccount || DEFAULTS.aiAccount).trim() || DEFAULTS.aiAccount;
-  // 留空 = 只忽略 AI 自己说的（这也是历史默认行为）
-  if (!Array.isArray(cfg.ignoreSenders) || cfg.ignoreSenders.length === 0) {
-    cfg.ignoreSenders = [cfg.aiAccount];
-  }
+  // 仅关注名单：留空 = 全放行。字符串也认（设置页输入框给的就是字符串）。
+  cfg.includeSenders = normalizeSenders(cfg.includeSenders);
+  // 旧键由"忽略谁"改成"只关注谁"，语义是反的 —— 绝不能自动迁移，
+  // 直接从配置里摘掉，免得它一直挂在设置文件里让人误以为还在生效。
+  delete cfg.ignoreSenders;
   return cfg;
 }
 
@@ -336,12 +367,30 @@ export function isAgentRunning(ctx, sessionId) {
   }
 }
 
-/** 从 bridge 事件里抽出「谁说了什么」。 */
-export function parseChatEvent(event, ignoreSenders) {
+/**
+ * 从 bridge 事件里抽出「谁说了什么」。
+ *
+ * @param event          bridge 的 chat 事件（`{data:{sender,message}}`）
+ * @param includeSenders 仅关注名单；**空数组 = 谁说话都放行**
+ * @param selfName       AI 自己的账号名 —— 它说的话永远丢弃（见下方说明）
+ * @returns {{sender:string,raw:string,text:string}|null} null = 这条不该投递
+ */
+export function parseChatEvent(event, includeSenders, selfName) {
   const data = event?.data || {};
   const sender = typeof data.sender === 'string' ? data.sender : '';
   const raw = typeof data.message === 'string' ? data.message : '';
-  if (sender && ignoreSenders.includes(sender)) return null;
+
+  // ① AI 自己的话永远丢弃。这是**防自激的硬约束**，不开放配置：
+  //    自己说一句 → 被投递 → agent 又被叫醒 → 又说一句，会无限转圈烧 token。
+  //    不能靠默认值兜底 —— 用户手滑把名单填成自己就会转圈，所以在代码里挡住。
+  if (sender && selfName && sender === selfName) return null;
+
+  // ② 仅关注名单：留空 = 全放行；填了就只放行名单里的人。
+  //    注意 sender 为空（系统消息/命令回显）且名单非空时也要挡掉 ——
+  //    既然用户说了"只听这几个人"，那就别让无名消息混进来。
+  const list = Array.isArray(includeSenders) ? includeSenders : [];
+  if (list.length > 0 && (!sender || !list.includes(sender))) return null;
+
   // bridge 给的 message 是**整行**（形如 `<xlhl_world> 你好`）。
   // 有独立 sender 字段时剥掉前缀，没有就原样留着（宁可多带一点也别丢内容）。
   let text = raw;
@@ -391,6 +440,9 @@ function writeSettingsFile(cfg, patch) {
   const current = readSettingsFile(cfg);
   const next = { ...current };
   for (const [key, value] of Object.entries(patch || {})) {
+    // `__` 开头的是内部指令键（`__action` 之类），不是配置项 —— 绝不能落盘，
+    // 否则它会一直躺在 settings.json 里被当成真配置读回来。
+    if (key.startsWith('__')) continue;
     if (value === null || value === undefined) delete next[key];
     else next[key] = value;
   }
@@ -437,6 +489,94 @@ export function apply(ctx, input = {}) {
     ? resolveConfig({ ...input, ...bootSaved })
     : bootCfg;
 
+  // ── 连接状态 + 手动重连（设置页「连接」组用）──────────────────────
+  //
+  // 用户要的：状态放到页面上，断了能自己点重连，不用重启 DSH。
+  // 状态只反映「最近一次请求是不是通的」——它是观测值，不额外探测，
+  // 所以页面看到的是真实结果，不是 ping 出来的假绿。
+  const link = {
+    ok: false,
+    lastOkAt: 0,
+    lastErrorAt: 0,
+    lastError: '',
+    lastReconnectAt: 0,
+    reconnects: 0,
+  };
+  const noteLinkUp = () => {
+    link.ok = true;
+    link.lastOkAt = Date.now();
+  };
+  const noteLinkDown = (error) => {
+    link.ok = false;
+    link.lastErrorAt = Date.now();
+    link.lastError = String((error && error.message) || error || 'unknown');
+  };
+  /** 由 apply 末尾赋上（游标等状态定义在后面，这里只留引用）。 */
+  let resetCursorState = null;
+
+  // ── MCP 连接（5556 那条链路的另一半）────────────────────────────────
+  //
+  // 别和上面的 `link` 混了：
+  //   · `link`   = **插件自己**直连 bridge 5556 的结果；
+  //   · `mcp`    = **DSH 的 MCP 客户端 → python wrapper → bridge 5556** 那条链路。
+  // 两者共用同一个 bridge 端口，但 wrapper 崩了插件照样通 —— 所以要分开显示。
+  //
+  // 这里**只做状态展示，不提供重连**（2026-10-22 用户拍板）。原因：
+  //   · wrapper 活着、只是 5556 断了 → 下一个**只读**命令（get_state 等）会自己
+  //     `_reconnect`，轮不到人点；
+  //   · wrapper 已被 DSH 放弃（`reconnect.maxAttempts=10` 用完，进程直接没了）
+  //     → 没有进程可杀，唯一解法是重启 DSH。
+  // 所以"重启 MCP"按钮只在极窄的中间态有用，却会制造"点一下就好"的假安全感。
+  //
+  // 探测手段只有一个可靠的：**找 python 进程里命令行含 mcp_stdio_wrapper 的那些**。
+  // 用 `execFile` 异步跑（不要 execFileSync：那会阻塞事件循环、拖慢整个 HTTP 响应），
+  // 而且只在缓存过期时刷新，GET 永远拿缓存值、不等待。
+  const mcpProbe = {
+    pids: [],
+    checkedAt: 0,
+    error: '',
+  };
+  const MCP_PROBE_TTL_MS = 15_000;
+  let mcpProbing = false;
+
+  const probeMcp = () => {
+    if (mcpProbing) return;
+    if (Date.now() - mcpProbe.checkedAt < MCP_PROBE_TTL_MS) return;
+    mcpProbing = true;
+    try {
+      execFile(
+        'powershell',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | " +
+            "Where-Object { $_.CommandLine -match 'mcp_stdio_wrapper' } | " +
+            'Select-Object -ExpandProperty ProcessId',
+        ],
+        { timeout: 10_000, windowsHide: true },
+        (error, stdout) => {
+          mcpProbing = false;
+          mcpProbe.checkedAt = Date.now();
+          if (error) {
+            mcpProbe.pids = [];
+            mcpProbe.error = String(error.message || error).slice(0, 120);
+            return;
+          }
+          mcpProbe.error = '';
+          mcpProbe.pids = String(stdout || '')
+            .split(/\s+/)
+            .map((s) => Number(s))
+            .filter((n) => Number.isInteger(n) && n > 0);
+        },
+      );
+    } catch (error) {
+      mcpProbing = false;
+      mcpProbe.checkedAt = Date.now();
+      mcpProbe.error = String((error && error.message) || error).slice(0, 120);
+    }
+  };
+
   // ── 设置页的读写接口（HTTP，不依赖 DSH 的 settings 服务）─────────────────
   //
   // 为什么不用 DSH 的 settings 机制：本机实测（2026-10-22）ctx.get('settings') 拿到的
@@ -474,7 +614,20 @@ export function apply(ctx, input = {}) {
           try {
             const method = String(req.method || 'GET').toUpperCase()
             if (method === 'GET') {
-              sendJson(res, 200, { ok: true, config: cfg, overrides: readSettingsFile(cfg) })
+              // 顺手刷新一次 MCP 探测（异步、不阻塞本次响应；命中缓存则什么都不做）
+              probeMcp()
+              sendJson(res, 200, {
+                ok: true,
+                config: cfg,
+                overrides: readSettingsFile(cfg),
+                link,
+                mcp: {
+                  running: mcpProbe.pids.length > 0,
+                  pids: mcpProbe.pids,
+                  checkedAt: mcpProbe.checkedAt,
+                  error: mcpProbe.error,
+                },
+              })
               return
             }
             if (method !== 'POST') {
@@ -486,9 +639,37 @@ export function apply(ctx, input = {}) {
               body += chunk
               if (body.length > 65536) { try { req.destroy() } catch { /* 忽略 */ } }
             })
-            req.on('end', () => {
+            req.on('end', async () => {
               try {
                 const patch = JSON.parse(body || '{}')
+
+                // 手动重连：清掉游标与节流状态，然后真连一次把结果带回页面。
+                // 不清游标的话，MC 重启后 event_seq 从 0 重数，旧游标会把新事件全挡在门外
+                // （2026-10-21 踩过：聊天全哑、受伤事件正常，极难辨认）。
+                if (patch && patch.__action === 'reconnect') {
+                  link.reconnects += 1;
+                  link.lastReconnectAt = Date.now()
+                  try {
+                    if (typeof resetCursorState === 'function') resetCursorState()
+                  } catch { /* 状态还没就绪就只做探测 */ }
+                  try {
+                    await bridgeCall(cfg, 'get_version', {})
+                    noteLinkUp()
+                  } catch (error) {
+                    noteLinkDown(error)
+                  }
+                  sendJson(res, 200, {
+                    ok: true,
+                    config: cfg,
+                    overrides: readSettingsFile(cfg),
+                    link,
+                  })
+                  return
+                }
+
+                // MCP 那条链路**故意没有重连动作**：能自愈的（只读命令）会自己重连，
+                // 救不回来的（wrapper 已被 DSH 放弃）只能重启 DSH。页面只展示状态。
+
                 const saved = writeSettingsFile(cfg, patch)
                 // 立即生效：**从原始 input 重建**（不能 `{...cfg, ...saved}` —— cfg 已被上一次
                 // 写入改过，删掉的键会残留在里面，表现为"取消覆盖后值不恢复默认"）。
@@ -501,7 +682,12 @@ export function apply(ctx, input = {}) {
                     if (existsSync(path)) rmSync(path, { force: true })
                   }
                 } catch { /* 删不掉就下次 tick 现读时仍按文件走 */ }
-                sendJson(res, 200, { ok: true, config: cfg, overrides: saved })
+                sendJson(res, 200, {
+                  ok: true,
+                  config: cfg,
+                  overrides: saved,
+                  link,
+                })
               } catch (error) {
                 sendJson(res, 400, { ok: false, error: '写入失败: ' + String(error && error.message ? error.message : error) })
               }
@@ -688,6 +874,47 @@ export function apply(ctx, input = {}) {
    */
   const masterOn = () => boolOf(cfg.enabled, true);
 
+  // ── WS 事件通道（2026-10-22）────────────────────────────────────────
+  //
+  // 把 damage 和 chat 从轮询换成 bridge 的事件推送（`ws://host:5559`）：
+  // 挨打从"最多 1 秒发现"变成"几乎立刻"，同时省掉一天十万次 get_events。
+  //
+  // ⚠️ 两个关键约束：
+  // 1. **WS 事件里没有 seq**（`broadcastEvent` 只发 type/timestamp/data），所以无法
+  //    和轮询结果去重 —— 只能二选一：WS 连通时暂停对应轮询、断开时恢复。
+  // 2. **必须自己重连**。WS 断了不会有任何报错，表现只是"AI 完全不响应"，
+  //    这比轮询失败更难发现。所以这里带指数退避重连，并且断开时立刻回退轮询。
+  const WS_EVENTS = ['damage', 'chat'];
+  const WS_RECONNECT_MIN_MS = 1000;
+  const WS_RECONNECT_MAX_MS = 30_000;
+  const wsLink = {
+    state: 'off', // off | connecting | open | closed
+    socket: null,
+    timer: null,
+    retries: 0,
+    lastError: '',
+    lastMsgAt: 0,
+    connectedAt: 0,
+  };
+  const wsUp = () => wsLink.state === 'open';
+
+  /**
+   * 投递一条聊天事件 —— **WS 推送和轮询共用这一条路径**。
+   * @param {{sender?:string,message?:string}} chatData bridge chat 事件的 data
+   * @returns {boolean} 是否真的投递了一条
+   */
+  const deliverChat = (chatData) => {
+    const parsed = parseChatEvent({ data: chatData }, cfg.includeSenders, cfg.aiAccount);
+    if (!parsed || !parsed.text) return false;
+    lastHumanChatAt = Date.now(); // 有人说话 → 闲聊计时重来
+    const line = `（游戏内聊天）${parsed.sender || '某人'}：${parsed.text}`;
+    const sent = deliverToSession(ctx, sessionsRoot, line, currentSessionId());
+    say(
+      `[fire] ${line} → 投递=${sent.ok ? `已进会话（${sent.mode}）${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
+    );
+    return true;
+  };
+
   const tick = async () => {
     if (!masterOn()) return;
     if (busy) return; // 上一轮还没回来就跳过，别堆积
@@ -701,6 +928,7 @@ export function apply(ctx, input = {}) {
       });
       // 连上了 → 复位断线状态，下一次断开才会重新报一条（见 shouldLogBridgeDown）
       noteBridgeUp();
+      noteLinkUp();
       const latest = Number(result?.data?.latest_seq ?? result?.latest_seq ?? 0);
 
       if (cursor === null) {
@@ -715,18 +943,17 @@ export function apply(ctx, input = {}) {
           ? result.events
           : [];
 
+      // WS 正在推送聊天 → 轮询只推进游标，避免同一条消息被投递两次
+      // （WS 事件里没有 seq，无法去重，所以只能二选一）。
+      if (wsUp()) {
+        cursor = latest;
+        return;
+      }
+
       let delivered = 0;
       for (const event of events) {
-        const parsed = parseChatEvent(event, cfg.ignoreSenders);
-        if (!parsed || !parsed.text) continue;
-        lastHumanChatAt = Date.now(); // 有人说话 → 闲聊计时重来
         if (delivered >= cfg.maxPerTick) break;
-        const line = `（游戏内聊天）${parsed.sender || '某人'}：${parsed.text}`;
-        const sent = deliverToSession(ctx, sessionsRoot, line, currentSessionId());
-        delivered += 1;
-        say(
-          `[fire] ${line} → 投递=${sent.ok ? `已进会话（${sent.mode}）${String(sent.sessionId).slice(0, 20)}…` : `失败(${sent.why})`}`,
-        );
+        if (deliverChat(event.data || {})) delivered += 1;
       }
 
       // 🔴 2026-10-16 实测：**bridge（MC 客户端）重启后 event_seq 会从头开始计数**，
@@ -744,6 +971,7 @@ export function apply(ctx, input = {}) {
     } catch (error) {
       // bridge 没起、MC 没开，都会走到这 —— 静默跳过，等下一轮。
       noteBridgeDown();
+      noteLinkDown(error);
       // tick 每 3 秒一次，用时间窗判断会连报 2~3 条；改成布尔标志，只在
       // 从"正常"转"断开"的那一刻打一条，恢复时（noteBridgeUp）复位。
       if (shouldLogBridgeDown()) {
@@ -755,7 +983,8 @@ export function apply(ctx, input = {}) {
   };
 
   say(
-    `[apply] 聊天监听起来了：${cfg.host}:${cfg.port} 每 ${cfg.tickSeconds}s 一次；忽略 ${cfg.ignoreSenders.join('/')}`,
+    `[apply] 聊天监听起来了：${cfg.host}:${cfg.port} 每 ${cfg.tickSeconds}s 一次；` +
+      `只关注 ${cfg.includeSenders.length ? cfg.includeSenders.join('/') : '所有人'}（AI 自己说的始终忽略）`,
   );
   const stop = ctx.interval(tick, cfg.tickSeconds * 1000);
 
@@ -962,6 +1191,83 @@ export function apply(ctx, input = {}) {
   const URGENT_TYPES = NOTABLE.filter(([, , u]) => u === true).map(([t]) => String(t).toLowerCase());
   const REST_TYPES = NOTABLE.filter(([, , u]) => u !== true).map(([t]) => String(t).toLowerCase());
 
+  /**
+   * 处理一条 DAMAGE 事件 —— **轮询和 WS 推送共用这一条路径**。
+   *
+   * 抽出来的原因（2026-10-22 把 damage 换成 WS 推送时）：两种来源必须走完全相同的
+   * 判断链（受伤总开关 → 攻击者分流 → 节流 → 延迟），否则会出现"推送时一套规则、
+   * 断线回退轮询时另一套"的双标准 —— 这种不一致最难查。
+   */
+  const handleDamageEvent = (evData) => {
+    const line = `⚠受伤-${Math.round(Number(evData.amount) || 0)}` +
+      (evData.attacker_type ? `(${String(evData.attacker_type).replace('minecraft:', '')})` : '');
+
+    // ① 受伤回应总开关：关掉就只当普通事件攒着，不再单独叫醒
+    if (!boolOf(cfg.hurtResponse, true)) {
+      pushPending(line);
+      return;
+    }
+
+    // ② 攻击者是谁 → 决定要不要还手
+    //
+    // DAMAGE 事件**自带 attacker_name**（bridge 的 addDamageEntity 会填，
+    // 玩家是账号名、生物是显示名），所以这里不用再回查 get_entities。
+    //
+    // 分流规则（2026-10-22 用户定）：
+    //   · 攻击者 == 配置的 playerName  → 看 retaliateOnPlayerHurt 开关
+    //   · 攻击者是**别的玩家**或怪物   → **一律回击**（不用问）
+    //   · **根本没有攻击者**（attacker_type 为空）→ **环境伤害**：
+    //     溺水 / 摔落 / 岩浆 / 饥饿 / 窒息都没有"谁打的我"，
+    //     这时提"反击"是纯误导 —— 附近可能连个生物都没有，AI 却会去找怪挥刀，
+    //     白白错过上浮、吃东西、后退的黄金时间。这一路把全部精力放在脱困上。
+    const attackerType = String(evData.attacker_type || '').toLowerCase();
+    const hasAttacker = attackerType !== '';
+    const byPlayer = attackerType.includes('player');
+    const attackerName = String(evData.attacker_name || '');
+    const isKnownPlayer = byPlayer && attackerName !== '' && attackerName === cfg.playerName;
+
+    let advice;
+    if (!hasAttacker) {
+      // 环境伤害：bridge 的 damage_type 已经告诉我们具体是哪种，直接照方抓药。
+      const hazard = describeHazard(evData.damage_type);
+      advice = hazard
+        ? `这是**${hazard.zh}** —— ${hazard.fix}。当前是环境伤害，需要尽快脱困。`
+        : `这是**环境伤害**（没有攻击者），需要尽快脱困。`
+          + `看 air_supply / eyes_in_water / fall_distance / on_fire / health，`
+          + `该上浮上浮、该吃就吃、该退就退。`;
+    } else if (isKnownPlayer && !boolOf(cfg.retaliateOnPlayerHurt, true)) {
+      advice = `打你的是 ${attackerName || cfg.playerName}（配置里的玩家）—— `
+        + `按配置这一轮走"脱离"路线：拉开距离、跑开、或者躲到安全处。`;
+    } else {
+      const who = byPlayer ? (attackerName || '玩家') : '';
+      advice = `血低就先拉开距离保命，有武器就 attack_nearest 反击。`
+        + (byPlayer ? `（打你的是${who}；针对玩家用 attack_nearest(attack_players=true) ）` : '');
+    }
+
+    // ③ 一场战斗的唤醒节流（秒）：连着挨打只叫一次，避免反复打断回复
+    const gapMs = Math.max(0, Number(cfg.hurtWakeGapSeconds) || 0) * 1000;
+    if (Date.now() - lastUrgentWakeAt < gapMs) {
+      pushPending(line);
+      return;
+    }
+    lastUrgentWakeAt = Date.now();
+
+    // ④ 响应延迟（秒）：0 = 立即；>0 则等一下再叫，给连击留出合并窗口
+    const delayMs = Math.max(0, Number(cfg.hurtResponseDelaySeconds) || 0) * 1000;
+    // 环境伤害已经知道是哪一种了，不用再让它去"排查"
+    const look = hasAttacker ? '立刻用 get_combat_snapshot 看附近威胁' : '立刻照下面的处置做';
+    const fire = () => {
+      say(`[urgent] ${line} → 已交 agent${delayMs ? `（延迟 ${delayMs / 1000}s）` : '（立即）'}`);
+      wakeAgent(`🔴 ${line} —— ${look}：${advice}`);
+    };
+    if (delayMs > 0) {
+      const timer = setTimeout(fire, delayMs);
+      if (typeof timer === 'object' && timer && typeof timer.unref === 'function') timer.unref();
+    } else {
+      fire();
+    }
+  };
+
   const notableTick = async () => {
     if (!masterOn() || !O.enabled) return;
     try {
@@ -992,6 +1298,13 @@ export function apply(ctx, input = {}) {
         //    表里的键写成 'DAMAGE'/'DEATH' 就永远匹配不上，notableTick 一条事件都读不到。
         //    实测对照：type=damage ✅ 有事件、type=DAMAGE ❌ 空。所以这里一律转小写。
         const r = await bridgeCall(cfg, 'get_events', { after_seq: cursor, type: key, limit: 5 });
+        // WS 在推送 damage 时，这里只推进游标、不重复处理（原因见 WS 段的说明）。
+        // 断开后 WS 停止推送，这一支自然失效、轮询接管。
+        if (wsUp() && key === 'damage') {
+          const d0 = (r && (r.data || r)) || {};
+          notableCursors.set(key, Number(d0.latest_seq ?? cursor));
+          continue;
+        }
         // 🔴 2026-10-16 实测：bridge 的响应**没有 data 包装**（直接 { events, latest_seq, ... }）。
         // 这里原来只认 r.data.events，于是 events 永远是空数组 —— notableTick 自上线起就一直
         // 在空转：死亡/受伤/遭攻击一条都没唤醒过 agent（用户原话「怎么没见你攻击呢」）。
@@ -1004,73 +1317,13 @@ export function apply(ctx, input = {}) {
           say(`[notable] ${type} ×${events.length}`);
         }
         for (const ev of events) {
-          const line = render(ev.data || {});
           const evData = ev.data || {};
-          const isHurt = String(type).toLowerCase() === 'damage';
-
-          // ① 受伤回应总开关：关掉就只当普通事件攒着，不再单独叫醒
-          if (isHurt && !boolOf(cfg.hurtResponse, true)) {
-            pushPending(line);
-            continue;
-          }
-
-          // ② 攻击者是谁 → 决定要不要还手
-          //
-          // DAMAGE 事件现在**自带 attacker_name**（bridge 的 addDamageEntity 会填，
-          // 玩家是账号名、生物是显示名），所以这里不用再回查 get_entities。
-          //
-          // 分流规则（2026-10-22 用户定）：
-          //   · 攻击者 == 配置的 playerName  → 看 retaliateOnPlayerHurt 开关
-          //   · 攻击者是**别的玩家**或怪物   → **一律回击**（不用问）
-          //   · **根本没有攻击者**（attacker_type 为空）→ **环境伤害**：
-          //     溺水 / 摔落 / 岩浆 / 饥饿 / 窒息都没有"谁打的我"，
-          //     这时提"反击"是纯误导 —— 附近可能连个生物都没有，AI 却会去找怪挥刀，
-          //     白白错过上浮、吃东西、后退的黄金时间。这一路把全部精力放在脱困上。
-          const attackerType = String(evData.attacker_type || '').toLowerCase();
-          const hasAttacker = attackerType !== '';
-          const byPlayer = attackerType.includes('player');
-          const attackerName = String(evData.attacker_name || '');
-          const isKnownPlayer = byPlayer && attackerName !== '' && attackerName === cfg.playerName;
-
-          let advice;
-          if (!hasAttacker) {
-            // 环境伤害：bridge 的 damage_type 已经告诉我们具体是哪种，直接照方抓药。
-            const hazard = describeHazard(evData.damage_type);
-            advice = hazard
-              ? `这是**${hazard.zh}** —— ${hazard.fix}。当前是环境伤害，需要尽快脱困。`
-              : `这是**环境伤害**（没有攻击者），需要尽快脱困。`
-                + `看 air_supply / eyes_in_water / fall_distance / on_fire / health，`
-                + `该上浮上浮、该吃就吃、该退就退。`;
-          } else if (isKnownPlayer && !boolOf(cfg.retaliateOnPlayerHurt, true)) {
-            advice = `打你的是 ${attackerName || cfg.playerName}（配置里的玩家）—— `
-              + `按配置这一轮走"脱离"路线：拉开距离、跑开、或者躲到安全处。`;
+          // damage 走共用路径（WS 推送时也调它）；其余类型一律攒进待播队列
+          // —— 表里第三列 urgent 只有 DAMAGE 一个，所以这里可以直接分流。
+          if (key === 'damage') {
+            handleDamageEvent(evData);
           } else {
-            const who = byPlayer ? (attackerName || '玩家') : '';
-            advice = `血低就先拉开距离保命，有武器就 attack_nearest 反击。`
-              + (byPlayer ? `（打你的是${who}；针对玩家用 attack_nearest(attack_players=true) ）` : '');
-          }
-
-          // ③ 一场战斗的唤醒节流（秒）：连着挨打只叫一次，避免反复打断回复
-          const gapMs = Math.max(0, Number(cfg.hurtWakeGapSeconds) || 0) * 1000;
-          if (!urgent || Date.now() - lastUrgentWakeAt < gapMs) {
-            pushPending(line);
-            continue;
-          }
-          lastUrgentWakeAt = Date.now();
-
-          // ④ 响应延迟（秒）：0 = 立即；>0 则等一下再叫，给连击留出合并窗口
-          const delayMs = Math.max(0, Number(cfg.hurtResponseDelaySeconds) || 0) * 1000;
-          // 环境伤害已经知道是哪一种了，不用再让它去"排查"
-          const look = hasAttacker ? '立刻用 get_combat_snapshot 看附近威胁' : '立刻照下面的处置做';
-          const fire = () => {
-            say(`[urgent] ${line} → 已交 agent${delayMs ? `（延迟 ${delayMs / 1000}s）` : '（立即）'}`);
-            wakeAgent(`🔴 ${line} —— ${look}：${advice}`);
-          };
-          if (delayMs > 0) {
-            const timer = setTimeout(fire, delayMs);
-            if (typeof timer === 'object' && timer && typeof timer.unref === 'function') timer.unref();
-          } else {
-            fire();
+            pushPending(render(evData));
           }
         }
         notableCursors.set(key, Number(data.latest_seq ?? cursor));
@@ -1467,6 +1720,141 @@ export function apply(ctx, input = {}) {
   } catch (error) {
     say(`[apply] 忙闲探测失败：${String((error && error.message) || error)}`);
   }
+
+  /**
+   * 手动重连时要清掉的状态。
+   *
+   * 为什么必须清：bridge（MC 客户端）重启后 `event_seq` 会从 0 重新计数，而这里的游标
+   * 是单向推进的 —— 不清就会"拿着一个大数去等小序号"，事件永远读不到。2026-10-21 踩过
+   * 一次：受伤事件看着正常（它每轮无条件覆盖游标），只有聊天全哑，极难辨认。
+   * 同理还有战斗窗口与断线计时器，不清会让重连后立刻又进"静默"状态。
+   */
+  resetCursorState = () => {
+    try {
+      cursor = null;
+      notableSeeded = false;
+      notableCursors.clear();
+      lastUrgentWakeAt = 0;
+      combatUntil = 0;
+      bridgeDownSince = 0;
+      bridgeDownLogged = false;
+      lastObserveAt = 0;
+      // WS 也一并重连：MC 重启后 WS 长连接通常已经半死，不主动断开会一直挂着不恢复。
+      if (wsLink.timer) { try { clearTimeout(wsLink.timer); } catch { /* 忽略 */ } }
+      wsLink.timer = null;
+      wsClose();
+      wsLink.state = 'off';
+      wsLink.retries = 0;
+      wsConnect();
+    } catch {
+      /* 个别状态还没就绪也无妨，重连本身已经做了探测 */
+    }
+  };
+
+  // ── WS 客户端：收 damage / chat 推送 ────────────────────────────────
+  const wsUrl = () => `ws://${cfg.host || '127.0.0.1'}:${Number(cfg.wsPort) || 5559}`;
+
+  const wsScheduleReconnect = (why) => {
+    if (wsLink.timer) return;
+    const delay = Math.min(
+      WS_RECONNECT_MAX_MS,
+      WS_RECONNECT_MIN_MS * Math.max(1, 2 ** Math.min(wsLink.retries, 5)),
+    );
+    wsLink.retries += 1;
+    wsLink.timer = setTimeout(() => {
+      wsLink.timer = null;
+      wsConnect();
+    }, delay);
+    if (typeof wsLink.timer === 'object' && wsLink.timer && typeof wsLink.timer.unref === 'function') {
+      wsLink.timer.unref();
+    }
+    say(`[ws] ${why} → ${Math.round(delay / 1000)}s 后重连（第 ${wsLink.retries} 次）；期间回退到轮询`);
+  };
+
+  const wsClose = () => {
+    const socket = wsLink.socket;
+    wsLink.socket = null;
+    if (socket) {
+      try { socket.onclose = null; socket.onerror = null; socket.onmessage = null; socket.close(); } catch { /* 忽略 */ }
+    }
+  };
+
+  const wsConnect = () => {
+    // ⚠️ 这里**不看总开关**：连接本身是"观测通道"，连着才能把状态显示出来。
+    // 真正处理事件时才看总开关（见 onmessage）—— 关掉总开关后 WS 仍然连着，
+    // 但收到的事件一律丢弃。这样"WS 通不通"永远可见，而不是一关总开关就瞎。
+    if (wsLink.state === 'connecting' || wsLink.state === 'open') return;
+    if (typeof WebSocket !== 'function') {
+      wsLink.state = 'off';
+      say('[ws] 当前 Node 没有内置 WebSocket —— 只走轮询');
+      return;
+    }
+    const url = wsUrl();
+    wsLink.state = 'connecting';
+    try {
+      const socket = new WebSocket(url);
+      wsLink.socket = socket;
+
+      socket.onopen = () => {
+        wsLink.state = 'open';
+        wsLink.retries = 0;
+        wsLink.connectedAt = Date.now();
+        wsLink.lastError = '';
+        try {
+          socket.send(JSON.stringify({ type: 'subscribe', events: WS_EVENTS }));
+        } catch { /* 订阅失败下一次重连再说 */ }
+        say(`[ws] 已连接 ${url}，订阅 ${WS_EVENTS.join('/')}（这两个类型改由推送驱动）`);
+      };
+
+      socket.onmessage = (event) => {
+        wsLink.lastMsgAt = Date.now();
+        const raw = typeof event.data === 'string' ? event.data : '';
+        if (!raw) return;
+        let msg;
+        try { msg = JSON.parse(raw); } catch { return; }
+        if (!msg || msg.type !== 'event') return;   // subscribed / pong 之类
+        // 只订了 damage/chat，这两个都很小；真收到压缩包说明订阅面变了，直接跳过。
+        if (msg.compressed) return;
+        const kind = String(msg.event_type || '').toLowerCase();
+        const data = msg.data || {};
+        // 总开关关掉 → 事件照收（保活、可见），但一条都不处理
+        if (!masterOn()) return;
+        try {
+          if (kind === 'damage') handleDamageEvent(data);
+          else if (kind === 'chat') deliverChat(data);
+        } catch (error) {
+          // 和定时器同理：一条推送处理失败不能冒到外面去
+          say(`[ws] 处理 ${kind} 出错（已忽略）：${String((error && error.message) || error)}`);
+        }
+      };
+
+      socket.onerror = () => {
+        wsLink.lastError = 'socket error';
+        // 具体原因通常只有 close 才拿得到，这里不重复记日志
+      };
+
+      socket.onclose = () => {
+        const wasOpen = wsLink.state === 'open';
+        wsLink.state = 'closed';
+        wsLink.socket = null;
+        if (wasOpen) say('[ws] 连接断开，自动重连并回退轮询');
+        wsScheduleReconnect('连接关闭');
+      };
+    } catch (error) {
+      wsLink.state = 'closed';
+      wsLink.lastError = String((error && error.message) || error);
+      wsScheduleReconnect(`建立连接失败：${wsLink.lastError}`);
+    }
+  };
+
+  wsConnect();
+
+  ctx.effect(() => () => {
+    if (wsLink.timer) { try { clearTimeout(wsLink.timer); } catch { /* 忽略 */ } }
+    wsClose();
+    wsLink.state = 'off';
+    say('[ws] 连接已关闭');
+  });
 
   ctx.effect(() => () => {
     if (typeof stop === 'function') stop();
