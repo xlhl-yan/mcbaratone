@@ -224,6 +224,65 @@ bridge 只负责"看"和"动"，**叫醒 agent** 这件事由 DSH 侧插件做�
 
 最后一行只在开了事件推送时出现。没开的话不会有 `[ws]`，`damage`/`chat` 走轮询 —— 正常。
 
+### 3.8 装 MC 预设（推荐：工具面按需加载）
+
+3.6 是把 `mcp-baritone` **全局**插进 profile —— 于是每个会话都挂 106 个 MC 工具，
+不管它玩不玩 MC。写代码的会话也被塞了一整套游戏工具，白占 token，还容易分心。
+
+更干净的做法是用 **DSH 的 agent preset（预设模式）**：把「人格 + MC 工具 + 技能」打包成
+一个预设，新建会话时选它，**只有那些会话**才有 MC 工具。
+
+本仓库自带现成的：`<REPO>\plugins\dsh-mc-preset`，两个预设：
+
+| preset id | 名称 | 给谁用 |
+| --- | --- | --- |
+| `mc-companion` | MC 陪玩 | **有人一起玩** —— 跟着走、听指令、不需要动作只回「等」 |
+| `mc-solo` | MC 单人游玩 | **一个人玩** —— 没有外援，目标自己定，麻烦自己扛 |
+
+两个预设的工具面一样，差别全在 `persona.prefix`（行为准则）。
+
+**装**：
+
+```bash
+node <REPO>/plugins/dsh-mc-preset/install.mjs
+```
+
+脚本会：探测本机 venv / wrapper / skills 三个绝对路径 → 替换模板占位符 → 幂等合并进
+`<DSH_HOME>\profiles\<profile>\cordis.patch.yml`（带 `# === MC agent presets BEGIN ===`
+标记，重复跑只替换自己那段）→ 用 DSH 同一套 YAML schema 校验结构 → 备份后写入。
+**装完重启 DSH。**
+
+常用参数：`--dry-run`（只看不写）、`--profile desktop`、`--port 5557`、
+`--python <路径>` / `--wrapper <路径>`（自动探测失败时）、`--uninstall`。
+
+**前置**：profile 里要有 `agent-preset-registry`。DSH 0.1.7+ 的 web profile 自带，
+desktop 可能没有：
+
+```yaml
+- id: agent-preset-registry
+  name: '@deepseek-ai/dsh-agent-preset-registry'
+  config:
+    default: standard
+    selectedDefault: standard
+```
+
+**装完记得把 3.6 那段全局的 `mcp-baritone` 删掉** —— 否则全局挂一份、预设里又挂一份，
+而且"只有选了预设才有"这个设计就失效了。
+
+> ⚠️ **没选预设的会话看不到 MC 工具**，即使被 `dsh-mc-chat-watch` 叫醒也操作不了游戏。
+> 所以陪玩/单人会话**必须选预设**。
+
+**验证装得对不对（不必启动 DSH）**：
+
+```bash
+node <DSH>\lib\bin.js --profile web --dump-config | grep -A3 "id: preset-mc"
+```
+
+能看到 `preset-mc-companion` / `preset-mc-solo` 两段、各自带完整 `plugins` 列表，就对。
+比启动试错快得多。
+
+细节、模板结构、排错表见 `<REPO>\plugins\dsh-mc-preset\README.md`。
+
 ---
 
 ## 4. 验收清单（逐项打勾）
@@ -281,23 +340,28 @@ bridge 只负责"看"和"动"，**叫醒 agent** 这件事由 DSH 侧插件做�
 - **数量 > 5**：只负责启动，立刻返回，由调用方轮询背包进度
 - **超时会自动 `cancel`** —— 这是刻意的，避免残留的 Baritone 任务把角色拖着到处跑
 
-### 5.5 陪玩时读的三本手册
+### 5.5 陪玩时读的四份文档
 
-本仓库根目录下有三本**给 agent 读**的操作手册 —— 陪玩那个会话要照着它们做：
+本仓库根目录下有**四份给 agent 读**的文档 —— 陪玩/单人游玩那个会话要照着它们做：
 
-| 手册 | 什么时候读 | 讲什么 |
+| 文档 | 什么时候读 | 讲什么 |
 | --- | --- | --- |
 | `陪玩会话启动提示.md` | **新开陪玩会话时，第一件事** | 你是谁、环境由哪三段链路组成、会被什么唤醒、**条件反射表**（受伤/聊天/态势/空闲各怎么反应）、七条铁律、工具速查、已知的坑、进游戏先做哪三件侦察 |
+| `单人游玩启动提示.md` | **新开单人游玩会话时** | 同上，但假设**没有人在场**：目标自己定、卡住自己解、危险自己扛；`say` 当日记 |
 | `空闲自主行为手册.md` | 被 `[autonomy]` 叫醒时（消息开头是「（空闲自主时间）」） | 用 **DSH 自己的 goal 机制**（`get_goal` / `create_goal` / `update_goal`）给自己立目标、把目标拆成能判定完成的步骤、一轮只推进一步；另有缺料闭环、红线 |
 | `游戏态势应对手册.md` | 收到「（游戏态势）…」消息时 | 低 token 查表：什么情况该动、什么情况只回一个「等」字 |
+
+> ✅ **更省事的做法**：装了 §3.8 的 MC 预设之后，这些内容已经拆进 `persona.prefix`
+> （铁律/条件反射，常驻）和 `skills/`（工具速查/坑/目标灵感，按需读），**不用再手工喂文档**。
+> 这四份 md 留作人翻阅和改动源。
 
 要点（别踩）：
 
 - **目标用 DSH 的 goal，不要往文件里写** —— 目标的持久化靠 `create_goal` / `update_goal`，
   新窗口 `get_goal` 就能接上；`phase` 是 `active` 时 DSH 会自己续轮推进它（要停就 `pause` / `complete`）。
-- 三本手册在**本仓库根**（与 `DSH-READHERE.md` 同级）；工作区里另有副本供人翻阅，
+- 四份文档在**本仓库根**（与 `DSH-READHERE.md` 同级）；工作区里另有副本供人翻阅，
   **改完手动同步两边**。
-- 三本手册都**不含具体世界状态/坐标/玩家数据**（公开仓库的发布边界，见 `AGENTS.md`）。
+- 四份文档都**不含具体世界状态/坐标/玩家数据**（公开仓库的发布边界，见 `AGENTS.md`）。
   当前环境的真实状态由会话自己用工具侦察。
 
 ---
