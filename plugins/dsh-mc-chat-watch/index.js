@@ -680,9 +680,21 @@ export function apply(ctx, input = {}) {
                 // 救不回来的（wrapper 已被 DSH 放弃）只能重启 DSH。页面只展示状态。
 
                 const saved = writeSettingsFile(cfg, patch)
+                // 🔴 改了 host / wsPort 必须重建 WS 连接。原来只更新 cfg 不碰连接，
+                //    表现为"端口改了但推送还是连旧地址，要手动点重连才生效"。
+                //    这两个是箭头函数、定义在 apply 尾部，而 HTTP handler 是运行时才执行，
+                //    所以这里调它们时早已初始化完毕。2026-10-27 修。
+                const prevHost = cfg.host
+                const prevWsPort = wsPort()
                 // 立即生效：**从原始 input 重建**（不能 `{...cfg, ...saved}` —— cfg 已被上一次
                 // 写入改过，删掉的键会残留在里面，表现为"取消覆盖后值不恢复默认"）。
                 Object.assign(cfg, resolveConfig({ ...input, ...saved }))
+                if (cfg.host !== prevHost || wsPort() !== prevWsPort) {
+                  try {
+                    wsClose()
+                    wsConnect()
+                  } catch { /* 连接层异常不影响配置保存，下一拍自会重连 */ }
+                }
                 // 🧹 页面成为"态势/自主"的唯一真源：清掉游戏内命令写的运行时覆盖文件
                 try {
                   const { dir: stateDir } = statePaths(cfg)
@@ -1517,14 +1529,18 @@ export function apply(ctx, input = {}) {
       /bucket$/, /crafting_table$/, /^furnace$/,
     ];
     const norm = (id) => String(id || '').replace('minecraft:', '');
-    const key = [];
+    // 🔴 同类物品必须按名字聚合：同一种方块/工具常常分占好几个格子（每格 1 个），
+    //    原来直接 push 会输出成 `stone_pickaxe×1 stone_pickaxe×1 stone_pickaxe×1`，
+    //    既刷屏又把「共 3 把」这个真信息稀释成三条重复。2026-10-27 修。
+    const keyMap = new Map();
     const rest = new Map();
     for (const i of items) {
       const name = norm(i.id);
       const count = Number(i.count) || 0;
-      if (KEY.some((re) => re.test(name))) key.push(`${name}x${count}`);
-      else rest.set(name, (rest.get(name) || 0) + count);
+      const bucket = KEY.some((re) => re.test(name)) ? keyMap : rest;
+      bucket.set(name, (bucket.get(name) || 0) + count);
     }
+    const key = [...keyMap.entries()].map(([n, c]) => `${n}x${c}`);
     // 剩下的按数量取前三（圆石/泥土这类量大但没信息量的，也只留符号）
     const top = [...rest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
     const parts = [...key, ...top.map(([n, c]) => `${n}x${c}`)];

@@ -203,6 +203,86 @@ def _equip_best_tool(client, *, block: Optional[str] = None) -> Dict[str, Any]:
         return {"equipped": False, "reason": f"equip_best_tool failed: {error}"}
 
 
+# 方块 → 挖掉之后**背包里真正出现的物品**。
+#
+# 为什么需要这张表：`mine_quantity` 原来的判据是拿**方块名**去背包里数（`coal_ore`），
+# 但挖掉煤矿掉的是 `coal`、铁矿掉 `raw_iron` —— 判据永远 0，只能等 90 秒超时
+# （2026-10-16 连撞三次）。名字相同的（木头、沙砾、羊毛）不用列，走兜底。
+_BLOCK_DROPS = {
+    "coal_ore": ("coal",), "deepslate_coal_ore": ("coal",),
+    "iron_ore": ("raw_iron",), "deepslate_iron_ore": ("raw_iron",),
+    "copper_ore": ("raw_copper",), "deepslate_copper_ore": ("raw_copper",),
+    "gold_ore": ("raw_gold",), "deepslate_gold_ore": ("raw_gold",),
+    "nether_gold_ore": ("gold_nugget",),
+    "diamond_ore": ("diamond",), "deepslate_diamond_ore": ("diamond",),
+    "emerald_ore": ("emerald",), "deepslate_emerald_ore": ("emerald",),
+    "redstone_ore": ("redstone",), "deepslate_redstone_ore": ("redstone",),
+    "lapis_ore": ("lapis_lazuli",), "deepslate_lapis_ore": ("lapis_lazuli",),
+    "nether_quartz_ore": ("quartz",),
+    "stone": ("cobblestone",),
+    "deepslate": ("cobbled_deepslate",),
+    "grass_block": ("dirt",), "podzol": ("dirt",), "mycelium": ("dirt",),
+}
+
+
+def _block_drops(block: str) -> tuple:
+    """挖掉 `block` 之后，背包里该出现哪些物品 id。没收录的当同名处理。"""
+    return _BLOCK_DROPS.get(block, (block,))
+
+
+def _wait_attack_cooldown(client, threshold: float = 0.9, timeout: float = 2.5) -> float:
+    """等攻击冷却回到 `threshold` 再返回。
+
+    MC 1.9+ 的伤害**按冷却进度缩放**：刚挥完立刻再挥，伤害只有满值的零头。
+    连续攻击不等冷却的后果是"看着砍了十几下，血量几乎没动"——而且不报错，
+    最容易误判成"怪太肉"或"武器没用"（2026-10-27 修）。
+
+    `attack_cooldown` 在 `get_state` 里（0.0~1.0 的进度）；读不到就返回 1.0，
+    宁可让调用方多挥一下，也不要卡在这里。
+    """
+    deadline = time.time() + timeout
+    progress = 0.0
+    while time.time() < deadline:
+        try:
+            raw_state = client.transport.dispatch("get_state", {}) or {}
+        except Exception:  # noqa: BLE001 —— 读不到状态不该挡住攻击
+            return progress
+        source = raw_state.get("data") if isinstance(raw_state, dict) else None
+        body = source or raw_state or {}
+        raw = body.get("attack_cooldown")
+        if raw is None:
+            return 1.0
+        try:
+            progress = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        if progress >= threshold:
+            return progress
+        time.sleep(0.05)
+    return progress
+
+
+def _cursor_of(snapshot) -> str:
+    """从 `ContainerEvidence.snapshot()` 形状的快照里取出光标物品；空手返回空串。
+
+    bridge 的 `inventory_click` 返回 `before` / `after` 两份快照，每份都带 `cursor`
+    字段（`menu.getCarried()`）。`get_screen` 那份**没有** cursor —— 所以只有这里能看。
+    """
+    if not isinstance(snapshot, dict):
+        return ""
+    cursor = snapshot.get("cursor")
+    if not isinstance(cursor, dict):
+        return ""
+    item_id = str(cursor.get("id") or "")
+    if not item_id or item_id in ("minecraft:air", "air"):
+        return ""
+    try:
+        count = int(cursor.get("count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return f"{item_id.replace('minecraft:', '')}×{count}"
+
+
 def _switch_to_empty_hand(client) -> bool:
     """把主手切到一个**空的**快捷栏槽位，返回是否成功。
 
@@ -886,6 +966,10 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                     )
                 if held.get("changed"):
                     time.sleep(0.2)  # 等一个 tick，让服务端也认这个手持
+            # 攻击要等冷却：冷却没满时伤害按进度打折，连续调用会"看着打了很多下、
+            # 实际几乎没掉血"（2026-10-27 修）。其它动作没有冷却概念，直接走。
+            if act == "attack":
+                _wait_attack_cooldown(client)
             result = client.transport.dispatch("entity_interact", params)
             if isinstance(result, dict) and held.get("tool"):
                 result.setdefault("tool", held.get("tool"))
@@ -1290,7 +1374,40 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
                     if isinstance(current, int):
                         params["sync_id"] = current
 
-            return client.transport.dispatch("inventory_click", params)
+            try:
+                result = client.transport.dispatch("inventory_click", params)
+            except Exception as error:  # noqa: BLE001 —— 包装成带诊断的错误再抛
+                # 🔴 容器点击失败最常见的原因是**光标上卡着物品**，此时所有点击要么
+                #    静默无效果、要么报 `Observed effect deadline exceeded`，表现得像
+                #    "物品凭空消失"。bridge 的报错本身不带 cursor 状态，这里补一次
+                #    界面快照塞进错误里，省得调用方只能靠猜。2026-10-27 修。
+                hint = ""
+                try:
+                    snap = client.transport.dispatch("get_screen", {}) or {}
+                    body = snap.get("data") if isinstance(snap, dict) else None
+                    src = body or snap or {}
+                    hint = (
+                        f"（当前界面 {src.get('type')!r}，"
+                        f"非空槽 {len(src.get('slots') or [])} 个）"
+                    )
+                except Exception:  # noqa: BLE001
+                    hint = "（连界面快照都读不到，bridge 可能已断）"
+                raise RuntimeError(
+                    f"inventory_click 失败：{error}{hint}。"
+                    "最常见原因是**光标(cursor)上卡着物品**，或界面已被关闭 —— "
+                    "先 close_screen() 再重新 interact_block 打开，光标会清回背包"
+                ) from error
+
+            # 点击成功了，但光标上可能还留着东西 —— 提示调用方，否则下一次点击
+            # 会莫名其妙失败，而这次看起来是"成功"的。
+            if isinstance(result, dict):
+                stuck = _cursor_of(result.get("after"))
+                if stuck:
+                    result["cursor_warning"] = (
+                        f"光标上还卡着 {stuck} —— 下一次容器点击很可能失败。"
+                        "先 close_screen() 再重开界面，光标会清回背包。"
+                    )
+            return result
 
         # 点击不是幂等操作：重试会真的点第二下（拿起来又放下），所以只许一次。
         return _call_bridge(ctx, "command/inventory_click", _run, max_retries=1)
@@ -1510,6 +1627,31 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             wanted = f"minecraft:{wanted}"
 
         def _run(client):
+            # 🔴 先看目标是不是**自己正站着的格子**。MC 会报
+            #    "Target position is already occupied"，但从那句话看不出是"自己占着"
+            #    还是别的方块占着 —— 白试一轮还以为是缓存没刷新（2026-10-16 踩过）。
+            #    玩家碰撞箱占 2 格高（脚 + 头），水平占满一格。
+            #    ⚠️ 这里**返回而非抛异常**：`_call_bridge` 会把 _run 里的异常包成
+            #    RuntimeError 重试 3 遍，而这个判断每次都成立，重试纯属空耗。2026-10-27 修。
+            try:
+                raw_pos = client.transport.dispatch("get_player_pos", {}) or {}
+                pos_body = raw_pos.get("data") if isinstance(raw_pos, dict) else None
+                me = pos_body or raw_pos or {}
+                fx = int(float(me.get("x")) // 1)
+                fy = int(float(me.get("y")) // 1)
+                fz = int(float(me.get("z")) // 1)
+                if (int(x), int(y), int(z)) in ((fx, fy, fz), (fx, fy + 1, fz)):
+                    return {
+                        "placed": False,
+                        "reason": (
+                            f"目标 ({x},{y},{z}) 就是你自己站的格子 —— 会报 "
+                            "'Target position is already occupied'。"
+                            f"先往旁边走一格再放，或换到 ({fx},{fy - 1},{fz}) 这样的空位。"
+                        ),
+                    }
+            except Exception:  # noqa: BLE001 —— 读不到位置就不拦，让 bridge 自己报
+                pass
+
             held = _hold_item(client, wanted)
             if held.get("equipped") is not True:
                 # `_hold_item` 扫的是**整个背包**，比 bridge 只看主手更宽 —— 连它都找不到，
@@ -2020,11 +2162,14 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         target = int(quantity or 0)
 
         def _run(client):
+            drops = _block_drops(wanted)
+
             def count_of(entry_list):
+                # 数**掉落物**，不是方块名（见 _BLOCK_DROPS 的说明）。
                 total = 0
                 for entry in entry_list or []:
                     item = str(entry.get("id") or "").replace("minecraft:", "")
-                    if item == wanted:
+                    if item in drops:
                         total += int(entry.get("count") or 0)
                 return total
 
@@ -2032,7 +2177,10 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
             # 只管它自己挖的时候选工具，手动动作和它无关 —— 这里补一刀，省得拿镐砍树。
             tool = _equip_best_tool(client, block=wanted)
             before = count_of((client.transport.dispatch("get_inventory", {}) or {}).get("inventory"))
-            client.transport.dispatch("chat", {"message": f"#mine {wanted}"})
+            # 🔴 必须走 `client.command.run()`（Baritone API）。原来发 bridge 的 `chat`
+            #    通道 → 那是 `sendChat`，绕过了 Fabric 的聊天发送事件，Baritone 收不到：
+            #    命令在聊天栏能看见，但人不挖（2026-10-16 实测）。
+            client.command.run(f"mine {wanted}")
             if target <= 0:
                 return {
                     "started": True,
