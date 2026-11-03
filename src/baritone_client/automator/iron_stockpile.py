@@ -45,6 +45,7 @@ DARK_TRIP_SECONDS = 600
 DARK_PATIENCE = 5.0
 TORCH_RETRY_SECONDS = 3600.0
 ROOM_WANTED = 10
+STORAGE_FOOD_RESERVE = 64
 #: Clutter worth banking before a trip. Never tools, food, torches or armour.
 CLUTTER = frozenset(
     "minecraft:" + name
@@ -230,7 +231,7 @@ def _bank(client: Any, state: Any) -> int:
     return max(0, before - _count(client, IRON_INGOT))
 
 
-HOME_RANGE = 40.0
+HOME_RANGE = 4.0
 
 
 def _near(client: Any, anchor: Tuple[int, int, int], distance: float) -> bool:
@@ -238,7 +239,16 @@ def _near(client: Any, anchor: Tuple[int, int, int], distance: float) -> bool:
 
     position = _live(client).get("block_position") or {}
     try:
-        return hypot(float(position["x"]) - anchor[0], float(position["z"]) - anchor[2]) <= distance
+        return (hypot(float(position["x"]) - anchor[0], float(position["z"]) - anchor[2]) <= distance
+                and abs(float(position["y"]) - anchor[1]) <= 2)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _at_cell(client: Any, target: Tuple[int, int, int]) -> bool:
+    position = _live(client).get("block_position") or {}
+    try:
+        return tuple(int(float(position[axis])) for axis in ("x", "y", "z")) == target
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -246,7 +256,7 @@ def _near(client: Any, anchor: Tuple[int, int, int], distance: float) -> bool:
 def _make_room(client: Any, state: Any) -> int:
     """Bank clutter in the home chest so a trip never starts with a full pack."""
     from ..common.inventory import deposit_excess_to_chest
-    from ..common.tunnel_miner import free_slots
+    from ..common.tunnel_miner import DIGGING_JUNK, free_slots
 
     chest = _supply_chest(state)
     if chest is None:
@@ -257,7 +267,12 @@ def _make_room(client: Any, state: Any) -> int:
     except Exception:
         return 0
     try:
-        moved = deposit_excess_to_chest(client, chest, deposit_items=set(CLUTTER))
+        # Mining rubble is safe to bank, and can otherwise occupy a slot for
+        # every block type collected on prior trips before preparation runs.
+        moved = deposit_excess_to_chest(
+            client, chest, deposit_items=set(CLUTTER) | set(DIGGING_JUNK),
+            retain_counts={"minecraft:cobblestone": 64},
+        )
     except Exception as exc:
         print(f"IRON SUPPLY: could not bank clutter ({exc})")
         return 0
@@ -277,11 +292,12 @@ def _schedule(rec: dict, now: float, ok: bool) -> None:
 
 def run_supply_trip(client: Any, state: Any, *, now: Optional[float] = None) -> Tuple[bool, str, int, int]:
     """One bounded trip. Returns the scheduler's (success, detail, before, after)."""
-    from ..common.navigation import goto
+    from ..common.navigation import goto, recovery_navigation_defense
     from ..common.tasks import PlayerDeathDetected, SurvivalRecoveryRequired
-    from ..common.tunnel_miner import MineAbort, TunnelMiner
+    from ..common.tunnel_miner import MineAbort, TunnelMiner, route_travel_seconds
     from ..common.tunnel_planner import loop_erase
     from .armor_recovery import _home, _smelt_raw_iron
+    from .mining_checkpoint import checkpoint_progress
 
     current = time.time() if now is None else float(now)
     rec = _record(state)
@@ -289,18 +305,25 @@ def run_supply_trip(client: Any, state: Any, *, now: Optional[float] = None) -> 
     before = iron_stock(client, state)
     anchor = _home(state)
 
-    def done(ok: bool, detail: str):
+    def done(ok: bool, detail: str, *, retry_after: Optional[float] = None):
         _schedule(rec, current, ok)
+        if retry_after is not None and not ok:
+            rec["next_trip"] = current + retry_after
         after = iron_stock(client, state)
         print(f"IRON SUPPLY: {detail} (stock {before}->{after})")
         return ok, detail, before, after
 
     if anchor is not None and not _near(client, anchor, HOME_RANGE):
-        # The surface around the base is only loaded (and so only readable)
-        # when the bot is there, so a trip starts by walking home.
-        if not goto(client, *anchor, timeout=300, tolerance=8.0, radius=6):
-            return done(False, "could not get home to start a mining trip")
+        # Storage preparation needs actual home arrival, even after a short flee.
+        if (not goto(client, *anchor, timeout=300, tolerance=2.0,
+                     on_defense=lambda: recovery_navigation_defense(client))
+                or not _near(client, anchor, HOME_RANGE)):
+            return done(False, "could not get home to start a mining trip", retry_after=600.0)
     _make_room(client, state)
+    from .iron_preparation import prepare_iron_inventory
+
+    if reason := prepare_iron_inventory(client, state):
+        return done(False, reason, retry_after=600.0)
     if _count(client, TORCH) < MIN_TORCHES and anchor is not None and current >= float(rec.get("torch_retry", 0) or 0):
         from .base_lighting import ensure_torches
 
@@ -312,28 +335,55 @@ def run_supply_trip(client: Any, state: Any, *, now: Optional[float] = None) -> 
         except Exception as exc:
             print(f"IRON SUPPLY: could not make torches ({exc})")
     lit = _count(client, TORCH) >= MIN_TORCHES
+    saved_spine = rec.get("spine", [])
+    if not lit and saved_spine and min(c[1] for c in saved_spine) < saved_spine[0][1] - 12:
+        # The miner refuses deep unlit work. Do not spend the entire trip
+        # walking down a saved route whose prerequisite is still missing.
+        rec["torch_retry"] = min(float(rec.get("torch_retry", current) or current), current + 600.0)
+        return done(False, "deep saved mine needs torches before descent; route preserved", retry_after=600.0)
     if not lit:
         print("IRON SUPPLY: no torches; running a shorter dark trip")
     entrance = rec.get("entrance")
     entrance = tuple(entrance) if isinstance(entrance, (list, tuple)) and len(entrance) == 3 else choose_entrance(client, state)
     if entrance is None:
         return done(False, "no safe surface entrance near the base")
-    rec["entrance"] = list(entrance)
-    if not goto(client, *entrance, timeout=150, tolerance=1.5, radius=1):
-        return done(False, "could not reach the mine entrance")
+    from ..common.house_door_travel import prepare_house_door_for_departure
 
+    if not prepare_house_door_for_departure(client, state, anchor):
+        return done(False, "saved-house doorway is not safe for mine travel", retry_after=600.0)
+    rec["entrance"] = list(entrance)
     spine: List[Tuple[int, int, int]] = [tuple(c) for c in rec.get("spine", [])] or [entrance]
+    from ..common.tunnel_travel_defense import intact_route_start
+
+    start = intact_route_start(spine, lambda cell: _block(client, *cell))
+    if start:
+        # Walk to the intact part; the entrance height still anchors the miner.
+        print(f"IRON SUPPLY: saved route lost its floor near the entrance; starting at step {start} {spine[start]}")
+        spine = spine[start:]
+    if (
+        not goto(client, *spine[0], timeout=150, tolerance=0.8)
+        or not _at_cell(client, spine[0])
+    ):
+        rec["approach_failures"] = int(rec.get("approach_failures", 0) or 0) + 1
+        # Interrupted travel does not establish bad terrain or depleted ore.
+        # Retain the proven route; fresh navigation/terrain checks still gate it.
+        return done(False, "could not reach the mine entrance", retry_after=600.0)
+    rec["approach_failures"] = 0
+
     miner = TunnelMiner(
         client, surface_y=entrance[1],
-        deadline=time.monotonic() + (TRIP_SECONDS if lit else DARK_TRIP_SECONDS),
+        deadline=time.monotonic() + route_travel_seconds(spine),
         spine=spine, entrance=entrance, min_y=MIN_Y,
         patience=12.0 if lit else DARK_PATIENCE,
+        on_progress=checkpoint_progress(client, state, rec),
     )
     raw_start = _count(client, RAW_IRON)
     goal = raw_start + max(1, min(MAX_RAW_PER_TRIP, TARGET_STOCK - before))
     reason = ""
     try:
         miner.descend(spine)
+        miner.check()  # expired/unsafe travel cannot renew the work deadline
+        miner.deadline = time.monotonic() + (TRIP_SECONDS if lit else DARK_TRIP_SECONDS)
         reason = miner.mine(goal, lambda: _count(client, RAW_IRON))
     except MineAbort as abort:
         reason = abort.reason
@@ -341,23 +391,25 @@ def run_supply_trip(client: Any, state: Any, *, now: Optional[float] = None) -> 
         raise
     finally:
         rec["spine"] = [list(c) for c in loop_erase(miner.trail)][-400:]
-    if "died" not in reason and not miner.retreat():
-        goto(client, *entrance, timeout=240, tolerance=2.0)
+    returned = reason != "died" and miner.retreat()
     mined = max(0, _count(client, RAW_IRON) - raw_start)
     if mined:
         rec["dry_trips"] = 0
-    elif not reason.startswith(("time", "died", "hostile", "health", "needs")):
-        # Three trips in a row that found nothing and were not cut short by the
-        # clock or a mob: this entrance or its tunnel is the problem. Start over.
+    elif reason == "no reachable iron":
+        # Only a completed search with no reachable ore says anything about
+        # geology. Inventory pressure and failed tunnel navigation are
+        # operational failures; they must not retire a proven entrance.
         rec["dry_trips"] = int(rec.get("dry_trips", 0) or 0) + 1
         if rec["dry_trips"] >= 3:
             rec.setdefault("bad_entrances", []).append(list(entrance))
             for stale in ("entrance", "spine", "dry_trips"):
                 rec.pop(stale, None)
-    smelted = _smelt_raw_iron(client, state) if mined else 0
+    smelted = _smelt_raw_iron(client, state) if mined and returned else 0
     banked = _bank(client, state) if smelted else 0
-    detail = f"mined {mined} raw iron ({reason or 'done'}); smelted {smelted}; banked {banked}; {miner.stats.moves} tunnel moves"
-    return done(mined > 0, detail)
+    return_detail = "" if returned else "; return route not verified, raw iron retained"
+    detail = f"mined {mined} raw iron ({reason or 'done'}); smelted {smelted}; banked {banked}; {miner.stats.moves} tunnel moves{return_detail}"
+    return done(mined > 0 and returned, detail,
+                retry_after=600.0 if reason != "no reachable iron" else None)
 
 
 __all__ = [

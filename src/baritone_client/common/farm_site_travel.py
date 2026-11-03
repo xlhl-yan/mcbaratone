@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from math import hypot
 from typing import Any, Sequence
+from .home_surface import protect_home_route
 
 
 #: `get_view` only reports a small cube around the player, so a planned site
@@ -40,17 +41,20 @@ def approach_candidate(client: Any, candidate: Sequence[int]) -> None:
     if separation != separation or separation <= CANDIDATE_VIEW_DISTANCE:
         return
     try:
-        from .navigation import goto_xz
-
-        goto_xz(
-            client,
-            int(candidate[0]),
-            int(candidate[2]),
-            timeout=CANDIDATE_TRAVEL_TIMEOUT,
-            tolerance=CANDIDATE_VIEW_DISTANCE - 2,
-        )
+        anchor = getattr(client, "_protected_home_anchor", None)
+        _surface_candidate_trip(client, int(candidate[0]),
+                                int(anchor[1] if anchor else candidate[1]),
+                                int(candidate[2]))
     except Exception:
         pass
+
+
+@protect_home_route(surface_work=True)
+def _surface_candidate_trip(client, x, y, z):
+    from .navigation import goto_xz
+
+    return goto_xz(client, x, z, timeout=CANDIDATE_TRAVEL_TIMEOUT,
+                   tolerance=CANDIDATE_VIEW_DISTANCE - 2)
 
 
 __all__ = [

@@ -9,6 +9,7 @@ to the surface. It never uses Baritone's ``mine``, which dives into caves.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -16,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from .tunnel_planner import (
     FLUIDS, GRAVITY, HAZARDS, IRON_ORES, PLANTS, STONE, Cell, Move, View,
     approach_cells, coarse_waypoint, is_ore, loop_erase, ore_is_safe, plan,
-    required_cells,
+    required_cells, is_support,
 )
 
 OPEN_BLOCKS = frozenset({"minecraft:air", "minecraft:cave_air"})
@@ -48,6 +49,13 @@ TORCH_EVERY = 7
 PLAN_MOVES = 5
 MAX_TRAIL = 400
 MIN_FREE_SLOTS = 3
+PICKAXE_RETURN_RESERVE = 32
+MINING_PICKAXES = {f"minecraft:{tier}_pickaxe" for tier in ("stone", "iron", "diamond", "netherite")}
+
+
+def route_travel_seconds(cells: Sequence[Cell]) -> float:
+    """Bound travel by the saved route, including the longest retained trail."""
+    return min(4800.0, max(240.0, 12.0 * (len(cells) - 1)))
 
 
 class MineAbort(Exception):
@@ -56,6 +64,14 @@ class MineAbort(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class RouteBroken(MineAbort):
+    """A saved step is proven broken; ``index`` is the last cell reached."""
+
+    def __init__(self, reason: str, index: int) -> None:
+        super().__init__(reason)
+        self.index = index
 
 
 @dataclass
@@ -85,15 +101,9 @@ def own_cells_of(spine: Sequence[Cell]) -> Set[Cell]:
 
 def free_slots(client: Any) -> int:
     """Empty main-inventory slots (the hotbar and the 27 above it)."""
-    items = _unwrap(client.transport.dispatch("get_inventory", {})).get("inventory", [])
-    used = sum(
-        1
-        for item in items
-        if 0 <= int(item.get("slot", -1)) <= 35
-        and item.get("id") not in (None, "", "minecraft:air")
-        and int(item.get("count", 1) or 0) > 0
-    )
-    return 36 - used
+    from ..inventory_evidence import free_carried_slots
+
+    return free_carried_slots(client.transport.dispatch("get_inventory", {}))
 
 
 class TunnelMiner:
@@ -108,6 +118,7 @@ class TunnelMiner:
         min_y: int = 12,
         count_fn: Optional[Callable[[str], int]] = None,
         patience: float = HOSTILE_PATIENCE,
+        on_progress: Optional[Callable[[Sequence[Cell]], None]] = None,
     ) -> None:
         self.client = client
         self.surface_y = int(surface_y)
@@ -116,18 +127,31 @@ class TunnelMiner:
         self.patience = float(patience)
         self.trail: List[Cell] = list(spine) or ([entrance] if entrance else [])
         self.own: Set[Cell] = own_cells_of(self.trail)
+        self._protected_floor_cells: Set[Cell] = {
+            (cell[0], cell[1] - 1, cell[2]) for cell in self.trail
+        }
         self.skip: Set[Cell] = set()
         self.stats = TripStats()
         self._since_torch = 0
         self._torch_failures = 0
         self._count = count_fn or self._default_count
+        self.on_progress = on_progress
 
     # -- bridge access ------------------------------------------------------
     def _call(self, route: str, payload: Optional[dict] = None) -> Dict[str, Any]:
         try:
-            return _unwrap(self.client.transport.dispatch(route, payload or {}))
+            response = self.client.transport.dispatch(route, payload or {})
         except Exception as exc:
             raise MineAbort(f"bridge {route} failed: {exc}") from exc
+        if route in {"get_state", "get_entities"}:
+            for envelope in (response, response.get("data") if isinstance(response, dict) else None):
+                if isinstance(envelope, dict) and (
+                    envelope.get("success") is False
+                    or str(envelope.get("status", "")).lower() == "error"
+                    or envelope.get("error")
+                ):
+                    raise MineAbort(f"bridge {route} telemetry error")
+        return _unwrap(response)
 
     def _default_count(self, item: str) -> int:
         from .inventory import count_item
@@ -138,9 +162,30 @@ class TunnelMiner:
         live = self._call("get_state")
         position = live.get("block_position") or live.get("position") or {}
         try:
-            live["cell"] = tuple(int(float(position[axis])) for axis in ("x", "y", "z"))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise MineAbort("player position unavailable") from exc
+            coordinates = []
+            for axis in ("x", "y", "z"):
+                coordinate = position[axis]
+                if isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)):
+                    raise ValueError("coordinate must be numeric")
+                coordinate_value = float(coordinate)
+                if not math.isfinite(coordinate_value):
+                    raise ValueError("coordinate must be finite")
+                coordinates.append(int(coordinate_value))
+            live["cell"] = tuple(coordinates)
+            health = live["health"]
+            health_value = float(health)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise MineAbort("player telemetry invalid") from exc
+        if (
+            isinstance(health, bool)
+            or not isinstance(health, (int, float))
+            or not math.isfinite(health_value)
+            or health_value < 0
+            or not isinstance(live.get("is_dead"), bool)
+            or not isinstance(live.get("dimension"), str)
+            or not live["dimension"]
+        ):
+            raise MineAbort("player telemetry invalid")
         return live
 
     def cell(self) -> Cell:
@@ -173,15 +218,48 @@ class TunnelMiner:
         return max(0, self.free_slots() - before)
 
     # -- safety -------------------------------------------------------------
-    def hostiles(self) -> int:
-        entities = self._call("get_entities", {"radius": int(HOSTILE_RADIUS) + 3}).get("entities", [])
+    def hostiles(self, player_state: Optional[Dict[str, Any]] = None) -> int:
+        """Count actionable nearby threats using the canonical defense policy.
+
+        Missing or malformed observations must stop a trip, not masquerade as
+        an empty area. The miner keeps its tighter seven-block work radius,
+        while ``assess_threats`` applies the shared visibility/aggression rules.
+        """
+        from .defense import assess_threats
+
+        if player_state is None:
+            player_state = self.state()
+        if not isinstance(player_state, dict) or "cell" not in player_state:
+            raise MineAbort("player telemetry invalid")
+
+        observation = self._call(
+            "get_entities", {"radius": int(HOSTILE_RADIUS) + 3}
+        )
+        skipped = observation.get("skipped_count", 0)
+        if isinstance(skipped, bool) or not isinstance(skipped, int) or skipped != 0:
+            raise MineAbort("entity telemetry incomplete")
+        entities = observation.get("entities")
+        if not isinstance(entities, list):
+            raise MineAbort("entity telemetry invalid")
+        for entity in entities:
+            if not isinstance(entity, dict) or not isinstance(entity.get("type"), str):
+                raise MineAbort("entity telemetry invalid")
+            distance = entity.get("distance")
+            try:
+                distance_value = float(distance)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MineAbort("entity telemetry invalid") from exc
+            if (isinstance(distance, bool) or not isinstance(distance, (int, float))
+                    or not math.isfinite(distance_value) or distance_value < 0):
+                raise MineAbort("entity telemetry invalid")
+
         return sum(
             1
-            for e in entities
-            if e.get("type") in HOSTILES and float(e.get("distance", 99) or 99) <= HOSTILE_RADIUS
+            for threat in assess_threats(entities, player_state)
+            if threat.distance <= HOSTILE_RADIUS
         )
 
-    def check(self) -> Dict[str, Any]:
+    def check(self, *, returning: bool = False) -> Dict[str, Any]:
         """Raise ``MineAbort`` unless it is still safe to keep digging."""
         live = self.state()
         if live.get("is_dead") or float(live.get("health", 0) or 0) <= 0:
@@ -190,17 +268,20 @@ class TunnelMiner:
             raise MineAbort("left the overworld")
         if float(live.get("health", 20) or 0) < ABORT_HEALTH:
             raise MineAbort("health low")
-        if time.monotonic() > self.deadline:
+        if not returning and time.monotonic() > self.deadline:
             raise MineAbort("time")
-        if self.hostiles():
+        if self.hostiles(live):
             # The safety system owns fighting; give it a moment, then leave.
             waited = 0.0
-            while waited < self.patience and self.hostiles():
+            while waited < self.patience:
                 time.sleep(1.0)
                 waited += 1.0
-                if float(self.state().get("health", 20) or 0) < ABORT_HEALTH:
+                live = self.state()
+                if float(live.get("health", 20) or 0) < ABORT_HEALTH:
                     raise MineAbort("health low")
-            if self.hostiles():
+                if not self.hostiles(live):
+                    break
+            else:
                 raise MineAbort("hostile mob")
         return live
 
@@ -218,8 +299,7 @@ class TunnelMiner:
         ):
             raise MineAbort(f"unexpected block {block}")
         for attempt in range(2):
-            if attempt:
-                self.equip()  # eating mid-dig swaps the held item
+            self.equip()  # Recheck the held tool before every block/retry.
             self._call("dig_block", {"x": cell[0], "y": cell[1], "z": cell[2], "max_ticks": 160})
             deadline = time.monotonic() + 9.0
             while time.monotonic() < deadline:
@@ -232,9 +312,29 @@ class TunnelMiner:
 
     def equip(self) -> None:
         from .resources import equip_best_pickaxe
+        from ..inventory_evidence import unwrap_inventory, valid_inventory
 
-        if not equip_best_pickaxe(self.client):
+        if not equip_best_pickaxe(self.client, pickaxe_ids=sorted(MINING_PICKAXES)):
             raise MineAbort("no pickaxe")
+        try:
+            raw = self.client.transport.dispatch("get_inventory", {})
+        except Exception as exc:
+            raise MineAbort("pickaxe durability unverified") from exc
+        data = unwrap_inventory(raw)
+        if (not valid_inventory(raw) or not isinstance(data, dict) or raw.get("success") is False
+                or data.get("success") is False or data.get("snapshot_valid") is not True
+                or not isinstance(data.get("inventory"), list)):
+            raise MineAbort("pickaxe durability unverified")
+        selected = data.get("selected_slot")
+        rows = data.get("inventory", [])
+        matches = [r for r in rows if type(r.get("slot")) is int and r["slot"] == selected] if type(selected) is int and 0 <= selected < 9 else []
+        held = matches[0] if len(matches) == 1 else {}
+        maximum, damage = held.get("max_damage"), held.get("damage")
+        if (held.get("id") not in MINING_PICKAXES or held.get("count", 0) <= 0
+                or type(maximum) is not int or type(damage) is not int or not 0 <= damage < maximum):
+            raise MineAbort("pickaxe durability unverified")
+        if maximum - damage <= PICKAXE_RETURN_RESERVE:
+            raise MineAbort("pickaxe return reserve")
 
     def step(self, target: Cell) -> None:
         from .navigation import goto
@@ -268,51 +368,160 @@ class TunnelMiner:
             raise MineAbort("moved off the planned path")
         if not self.trail or self.trail[-1] != here:
             self.trail = loop_erase(self.trail + [here])  # e.g. entered a cell off
+        protected_floors = self._protected_floors(here)
+        if any(cell in protected_floors for cell in move.dig):
+            raise MineAbort("planned dig would remove a recorded tunnel floor")
         if move.dig:
             self.equip()
         for cell in move.dig:
             self.dig(cell)
         self.step(move.to)
         self.own.update(move.required)
+        self._protected_floor_cells.add((move.to[0], move.to[1] - 1, move.to[2]))
         self.trail = loop_erase(self.trail + [move.to])[-MAX_TRAIL:]
         self.stats.moves += 1
         self._since_torch += 1
         self.torch(move.frm, move.to)
+        self._note_progress()
+
+    def _note_progress(self) -> None:
+        if self.on_progress is not None:
+            try:
+                self.on_progress(self.trail)
+            except Exception as exc:
+                # Checkpoint I/O must never interrupt a safe return walk.
+                print(f"TUNNEL MINER: progress checkpoint failed ({exc})")
 
     def execute(self, path: Sequence[Move]) -> None:
         for move in path:
             self.advance(move)
 
     # -- movement over our own tunnel --------------------------------------
-    def _hop(self, cells: Sequence[Cell], *, each: int = 5, timeout: int = 40) -> None:
+    def _hop(
+        self, cells: Sequence[Cell], *, timeout: int = 40,
+        returning: bool = False, return_deadline: Optional[float] = None,
+    ) -> None:
         from .navigation import goto
+        from .home_surface import _read_break_setting, _write_break_setting
 
-        hops = list(cells[each - 1::each]) + [cells[-1]]
-        for target in hops:
-            self.check()
-            if not goto(self.client, *target, timeout=timeout, check_interval=0.5, tolerance=1.5):
-                if self.cell() != target:
+        if not cells:
+            return
+        try:
+            setting = _read_break_setting(self.client)
+            if setting == "true":
+                # The bridge acknowledges the request before the game thread
+                # applies it; the shared helper polls for observed state.
+                _write_break_setting(self.client, "false")
+        except Exception as exc:
+            raise MineAbort(f"cannot verify digging is disabled for tunnel travel: {exc}") from exc
+        try:
+            here = self.cell()
+            for index, target in enumerate(cells):
+                beyond = cells[index + 1] if index + 1 < len(cells) else None
+                if return_deadline is not None and time.monotonic() >= return_deadline:
+                    raise MineAbort("return route time limit")
+                dx, dy, dz = (target[i] - here[i] for i in range(3))
+                if abs(dx) + abs(dz) != 1 or abs(dy) > 1:
+                    raise MineAbort("recorded tunnel contains a non-adjacent waypoint")
+                arrived = False
+                for _attempt in range(2):
+                    self.check(returning=returning)
+                    if return_deadline is not None and time.monotonic() >= return_deadline:
+                        raise MineAbort("return route time limit")
+                    from .tunnel_travel_defense import TARGET_UNSUPPORTED, CorridorStepDefense, broken_step
+
+                    on_defense = CorridorStepDefense(
+                        self.client, here, target, self.block, beyond=beyond
+                    )
+                    if not on_defense.preflight():
+                        reason = on_defense.abort_reason or "tunnel corridor is unsafe"
+                        if (not returning and reason == TARGET_UNSUPPORTED
+                                and broken_step(target, self.block)):
+                            raise RouteBroken(reason, index)
+                        raise MineAbort(reason)
+                    goto(
+                        self.client, *target,
+                        timeout=min(timeout, max(1, int(return_deadline - time.monotonic())))
+                        if return_deadline is not None else timeout,
+                        check_interval=0.5, tolerance=0.8,
+                        on_defense=on_defense,
+                    )
+                    if on_defense.abort_reason is not None:
+                        raise MineAbort(on_defense.abort_reason)
+                    observed = self.cell()
+                    if observed == target:
+                        arrived = True
+                        break
+                if not arrived:
                     raise MineAbort("blocked while following the tunnel")
+                here = target
+                self._note_progress()
+        finally:
+            # Navigation must have stopped before restoring a setting that
+            # could let Baritone break terrain on its next path.
+            # An unverified stop still leaves digging off, but owes it back:
+            # silently leaving it off is how A1 was trapped in a shaft.
+            from .home_surface import _owe
+
+            try:
+                live = self._call("get_state")
+            except MineAbort:
+                if setting == "true":
+                    _owe(self.client, {"allowBreak": "true"})
+                raise
+            if live.get("is_pathing") is not False:
+                if setting == "true":
+                    _owe(self.client, {"allowBreak": "true"})
+                raise MineAbort("tunnel travel stop was not verified")
+            if setting == "true":
+                try:
+                    _write_break_setting(self.client, "true")
+                except Exception as exc:
+                    _owe(self.client, {"allowBreak": "true"})
+                    raise MineAbort(f"could not restore allowBreak after tunnel travel: {exc}") from exc
 
     def descend(self, spine: Sequence[Cell]) -> None:
-        """Walk a recorded spine from the entrance to its end."""
+        """Walk a recorded spine from the entrance to its end.
+
+        A step proven broken partway down ends the descent at the last good
+        step: mining starts there and the saved route is cut to it. Live A1
+        2026-11-02 walked 83 steps down to y=48, found two floorless steps,
+        and climbed all the way back with 0 iron, as every trip would.
+        """
         if len(spine) > 1:
-            self._hop(spine[1:])
+            if self.cell() != spine[0]:
+                raise MineAbort("not at the recorded tunnel entrance")
+            try:
+                self._hop(spine[1:])
+            except RouteBroken as broken:
+                reached = tuple(spine[broken.index])
+                if broken.index < 1 or self.cell() != reached:
+                    raise  # the entrance prefix has its own skip; keep the route
+                print(f"TUNNEL MINER: saved route broken at step {broken.index + 1} "
+                      f"{tuple(spine[broken.index + 1])}; mining from step {broken.index} {reached}")
+                self.trail = [tuple(cell) for cell in spine[: broken.index + 1]]
+                self._note_progress()
 
     def retreat(self) -> bool:
         """Retrace our own trail to the entrance; True when the bot got there."""
         path = list(reversed(loop_erase(self.trail)))
-        if len(path) <= 1:
-            return True
-        from .navigation import goto
-
         try:
-            for target in list(path[4::5]) + [path[-1]]:
-                if not goto(self.client, *target, timeout=45, check_interval=0.5, tolerance=1.5):
-                    if self.cell() != target:
-                        break
-            return abs(self.cell()[1] - path[-1][1]) <= 2
-        except MineAbort:
+            here = self.cell()
+            forward = list(reversed(path))
+            if here not in forward:
+                return False
+            index = forward.index(here)
+            route = list(reversed(forward[: index + 1]))
+            if len(route) > 1:
+                # Every cell receives fresh corridor checks and exact XYZ
+                # verification. A fixed four minutes strands long saved
+                # routes even when every step succeeds. Still bound the
+                # complete return and each individual hop.
+                deadline = time.monotonic() + route_travel_seconds(route)
+                self._hop(route[1:], timeout=20, returning=True, return_deadline=deadline)
+            return self.cell() == forward[0]
+        except MineAbort as exc:
+            print(f"TUNNEL MINER: retreat stopped ({exc.reason})")
             return False
 
     # -- the mining loop ----------------------------------------------------
@@ -333,11 +542,15 @@ class TunnelMiner:
     def mine_adjacent(self, view: View, here: Cell, raw_now: Callable[[], int]) -> bool:
         """Mine any safe iron ore touching the bot's feet or head cell."""
         standing = self.own | {here, (here[0], here[1] + 1, here[2])}
+        protected_floors = self._protected_floors(here)
         for ore in sorted(view.iron_ores() - self.skip):
             touching = (
                 abs(ore[0] - here[0]) + abs(ore[2] - here[2]) == 1 and ore[1] in (here[1], here[1] + 1)
             )
             if not touching:
+                continue
+            if ore in protected_floors:
+                self.skip.add(ore)
                 continue
             if not ore_is_safe(view, ore, standing, self.surface_y):
                 self.skip.add(ore)
@@ -351,6 +564,13 @@ class TunnelMiner:
                 print(f"TUNNEL MINER: {ore} dug but no raw iron arrived")
             return True
         return False
+
+    def _protected_floors(self, here: Cell) -> Set[Cell]:
+        """Floors for the complete saved/current route, across plan batches."""
+        return self._protected_floor_cells | {
+            (cell[0], cell[1] - 1, cell[2])
+            for cell in set(self.trail) | {here}
+        }
 
     def mine(self, raw_goal: int, raw_now: Callable[[], int]) -> str:
         """Dig toward iron until the goal, the clock or a safety limit."""
@@ -373,13 +593,19 @@ class TunnelMiner:
             if self.mine_adjacent(view, here, raw_now):
                 continue
             ores = set()
+            protected_floors = self._protected_floors(here)
             for ore in view.iron_ores() - self.skip:
-                if ore_is_safe(view, ore, self.own, self.surface_y):
+                if ore in protected_floors:
+                    self.skip.add(ore)
+                elif ore_is_safe(view, ore, self.own, self.surface_y):
                     ores.add(ore)
                 else:
                     self.skip.add(ore)
             goals = {cell for ore in ores for cell in approach_cells(ore)}
-            path = plan(view, here, goals, self.own, self.surface_y) if goals else None
+            path = plan(
+                view, here, goals, self.own, self.surface_y,
+                protected_floors=protected_floors,
+            ) if goals else None
             if goals and not path:
                 # Unreachable from here: forget ores we could have planned to.
                 self.skip.update(o for o in ores if any(view.inside(c) for c in approach_cells(o)))
@@ -392,7 +618,10 @@ class TunnelMiner:
                 for steps, prefer_z in ((PLAN_MOVES, False), (PLAN_MOVES, True), (3, False)):
                     waypoint = coarse_waypoint(here, target, steps, prefer_z=prefer_z)
                     if waypoint != here:
-                        path = plan(view, here, {waypoint}, self.own, self.surface_y)
+                        path = plan(
+                            view, here, {waypoint}, self.own, self.surface_y,
+                            protected_floors=protected_floors,
+                        )
                         if path:
                             break
                 if not path:
@@ -406,5 +635,6 @@ class TunnelMiner:
 
 
 __all__ = [
-    "DIGGING_JUNK", "HOSTILES", "MineAbort", "TripStats", "TunnelMiner", "free_slots", "own_cells_of",
+    "DIGGING_JUNK", "HOSTILES", "MineAbort", "RouteBroken", "TripStats", "TunnelMiner", "free_slots",
+    "own_cells_of",
 ]

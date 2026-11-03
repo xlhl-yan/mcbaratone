@@ -5,11 +5,12 @@ from __future__ import annotations
 from math import hypot
 from typing import Any, Iterable, Mapping
 
-from ..common.combat import acquire_emergency_food
-from ..common.inventory import count_item
+from ..common.combat import acquire_emergency_food, eat_until_hunger
+from ..common.inventory import get_inventory
+from ..common.tasks import PlayerDeathDetected, SurvivalRecoveryRequired
 from .end_readiness import PREPARED_FOOD_ITEMS
 from .local_opportunity import LocalOpportunity, OpportunityKind
-from .food_recovery_state import recover_food_from_known_sources
+from .food_recovery_state import _durable_food_search_anchor, recover_food_from_known_sources
 from .phases.iron_age_food import FOOD_ANIMALS
 
 
@@ -147,13 +148,15 @@ def cooldown_ready(
 
 
 def reachable_farm_location(signals: Any) -> tuple[int, int, int] | None:
-    """Return a nearby observed or checkpointed crop patch."""
-    if signals.crop_location is not None:
-        return signals.crop_location
+    """Prefer the maintained nearby plot over an incidental nearest crop.
+
+    Its checkpoint identifies where to inspect, not proof that crops remain.
+    The crop executor still verifies terrain and crop identity before work.
+    """
     known = signals.known_farm_location
-    if known is None or hypot(known[0] - signals.position[0], known[2] - signals.position[2]) > 64:
-        return None
-    return known
+    if known is not None and hypot(known[0] - signals.position[0], known[2] - signals.position[2]) <= 64:
+        return known
+    return signals.crop_location
 
 
 def _banked_total(cycle: Any, fallback: int) -> int:
@@ -190,18 +193,37 @@ def run_balanced_food_production(
     client: Any,
     state: Any,
 ) -> tuple[bool, str, int, int]:
-    """Run one food cycle while retaining A1's required expedition reserve.
+    """Run one food cycle while retaining the required expedition reserve.
 
-    A nearby herd refills the reserve far faster than wheat, so a bounded
-    hunt-and-cook batch runs first; the wheat cycle still follows.
+    Prepare carried grain before collecting more ingredients. A refused
+    local craft must not turn into another farm trip with a full pack.
     """
     from ..common.food_supply import run_food_cycle
     from ..common.livestock_food import run_livestock_food_cycle
 
-    def prepared_total() -> int:
-        return sum(count_item(client, item) for item in PREPARED_FOOD_ITEMS)
+    def observed_inventory() -> tuple[Mapping[str, int], int]:
+        inventory = get_inventory(client)
+        return inventory, sum(inventory.get(item, 0) for item in PREPARED_FOOD_ITEMS)
 
-    before = prepared_total()
+    try:
+        inventory, before = observed_inventory()
+    except (PlayerDeathDetected, SurvivalRecoveryRequired):
+        raise
+    except Exception:
+        return False, "current inventory unavailable; food production deferred", 0, 0
+    if inventory.get("minecraft:wheat", 0) >= 3:
+        try:
+            cycle = run_food_cycle(
+                client, state,
+                personal_food_reserve=BALANCED_PREPARED_FOOD_TARGET,
+                carried_wheat_only=True,
+            )
+            _, after = observed_inventory()
+        except (PlayerDeathDetected, SurvivalRecoveryRequired):
+            raise
+        except Exception:
+            return False, "could not verify prepared food after the carried-wheat attempt", before, before
+        return after > before, str(cycle.detail), before, after
     livestock = run_livestock_food_cycle(
         client,
         state,
@@ -213,9 +235,14 @@ def run_balanced_food_production(
         state,
         personal_food_reserve=BALANCED_PREPARED_FOOD_TARGET,
     )
-    after = prepared_total()
+    try:
+        _, after = observed_inventory()
+    except (PlayerDeathDetected, SurvivalRecoveryRequired):
+        raise
+    except Exception:
+        return False, "could not verify prepared food after production", before, before
     detail = f"{livestock.detail}; {cycle.detail}"
-    return bool(livestock.success or cycle.success), detail, before, after
+    return after > before, detail, before, after
 
 
 def run_food_production(
@@ -254,6 +281,53 @@ def _health(client: Any) -> float:
         return float(state.get("health", 20.0) or 0.0)
     except (TypeError, ValueError):
         return 20.0
+
+
+#: Storage and farm recovery only reach this far from the bot.
+HOME_FOOD_REACH = 96.0
+
+
+def _distance_and_health(client: Any, home) -> tuple[float, float] | None:
+    """Return (distance to home, health), or None when either is unknown."""
+    if home is None:
+        return None
+    try:
+        live = client.transport.dispatch("get_state", {})
+        position = live.get("block_position", live.get("position", {}))
+        return (hypot(float(position["x"]) - home[0], float(position["z"]) - home[2]),
+                float(live.get("health", 0) or 0))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _within_home_reach(client: Any, home) -> bool:
+    observed = _distance_and_health(client, home)
+    return observed is not None and observed[0] <= HOME_FOOD_REACH
+
+
+def _return_home_for_food(client: Any, home) -> bool:
+    """Walk a hungry, able bot back into reach of its farm and storage.
+
+    Live A1 2026-10-18..20: each search centred on wherever the bot stood, so
+    it drifted 140+ blocks into jagged peaks, out of reach of its own farm
+    and 3159 banked carrots, and failed 394 searches in a day. Below 10
+    health the long walk is skipped and the caller searches locally.
+    """
+    observed = _distance_and_health(client, home)
+    if observed is None or observed[0] <= HOME_FOOD_REACH or observed[1] < 10.0:
+        return False
+    from ..common.navigation import recovery_goto
+    from ..common.staged_approach import staged_goto
+
+    # Baritone rejects an exact goal in unloaded terrain, so a single goto
+    # from 154 blocks out failed in four seconds (live A1 2026-10-20). Walk
+    # in legs; partial progress survives for the next cycle.
+    print(f"RECOVERY: hungry {observed[0]:.0f} blocks from home; returning to its farm and food storage first")
+    live = client.transport.dispatch("get_state", {})
+    position = live.get("block_position", live.get("position", {}))
+    origin = tuple(int(position[axis]) for axis in ("x", "y", "z"))
+    target = tuple(int(round(value)) for value in home)
+    return staged_goto(client, target, origin, navigate=recovery_goto)
 
 
 def _current_center(client: Any) -> tuple[float, float, float] | None:
@@ -296,6 +370,9 @@ def run_scheduled_food_recovery(
     if before >= minimum_food:
         return True, "food already meets the mining threshold", before, before
 
+    home = _durable_food_search_anchor(state)
+    _return_home_for_food(client, home)
+
     # A local recovery pass can bake/harvest without an expedition. Its bool
     # targets full hunger, so a partial meal still needs a fresh floor check.
     from ..common.survival_farm import local_farm_wait_reason, tend_local_farm_for_food
@@ -312,11 +389,13 @@ def run_scheduled_food_recovery(
         return False, wait_reason, before, after
 
     if recover_food_from_known_sources(client, state, FOOD_ANIMALS):
+        # Known sources eat only to 12; finish the meal from what they fetched.
+        eat_until_hunger(client, minimum_food=minimum_food)
         after = _food_level(client)
         if after >= minimum_food:
             return True, "recovered food from a checkpointed source", before, after
 
-    center = _current_center(client)
+    center = home if _within_home_reach(client, home) else _current_center(client)
     recovered = acquire_emergency_food(
         client,
         minimum_health=12.0,

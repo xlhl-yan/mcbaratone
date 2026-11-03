@@ -17,6 +17,7 @@ from .inventory import count_item, craft, select_item
 from .navigation import find_nearby_block, find_water_source, goto
 from .water_bucket_actions import use_water_bucket
 from .home_surface import protect_home_route
+from .farm_maintenance import farm_surface_safe, replant_empty_wheat_tiles
 from .farm_irrigation import existing_plot_source
 from .farm_planting import plant_farm_tiles
 
@@ -548,6 +549,7 @@ def _gather_seeds(client, needed: int, timeout: int = 180) -> bool:
     return count_item(client, "minecraft:wheat_seeds") >= needed
 
 
+@protect_home_route(surface_work=True)
 def establish_wheat_farm(
     client, x: int, y: int, z: int, size: int = 5, state=None
 ) -> Optional[Tuple[int, int, int]]:
@@ -604,6 +606,7 @@ def establish_wheat_farm(
     return (x, y, z)
 
 
+@protect_home_route(surface_work=True)
 def reestablish_wheat_farm(
     client, x: int, y: int, z: int, size: int = 5, state=None
 ) -> Optional[Tuple[int, int, int]]:
@@ -754,34 +757,9 @@ def relocate_wheat_farm(
     return relocated
 
 
-@protect_home_route()
+@protect_home_route(surface_work=True)
 def harvest_wheat_farm(client, x: int, y: int, z: int, range_: int = 8) -> bool:
-    """Run Baritone's own farm process over the established patch.
+    """Harvest a wheat patch and preserve its observed crop identity."""
+    from .farm_crop_identity import run_wheat_farm_harvest
 
-    Baritone's farm process harvests mature crops and replants from carried
-    seeds within range -- verified here by wheat count actually increasing,
-    since the bridge command reports "started", not "produced results".
-    """
-    if not goto(client, x, y, z, timeout=120, tolerance=4):
-        return False
-
-    before = count_item(client, "minecraft:wheat")
-    try:
-        client.transport.dispatch("farm", {"range": range_})
-    except Exception as exc:
-        print(f"  Farm harvest dispatch failed: {exc}")
-        return False
-
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        time.sleep(2)
-        current = count_item(client, "minecraft:wheat")
-        if current > before:
-            client.transport.dispatch("cancel", {})
-            return True
-        # If we're already at a good wheat count, consider it successful
-        if current >= 8:
-            client.transport.dispatch("cancel", {})
-            return True
-    client.transport.dispatch("cancel", {})
-    return count_item(client, "minecraft:wheat") >= 8
+    return run_wheat_farm_harvest(client, x, y, z, range_)

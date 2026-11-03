@@ -548,7 +548,9 @@ def test_mine_initial_iron_uses_checkpointed_chest_not_arbitrary_nearby_location
 
 
 def test_mine_initial_iron_shortfall_transitions_once_and_retries(monkeypatch):
-    transport = SimpleNamespace(dispatch=lambda route, payload: {})
+    transport = SimpleNamespace(
+        dispatch=lambda route, payload: _valid_inventory() if route == "get_inventory" else {}
+    )
     client = SimpleNamespace(transport=transport)
     gather_attempts = []
     descent_calls = []
@@ -581,7 +583,9 @@ def test_mine_initial_iron_shortfall_transitions_once_and_retries(monkeypatch):
 
 
 def test_mine_initial_iron_transition_failure_returns_false_without_infinite_loop(monkeypatch):
-    transport = SimpleNamespace(dispatch=lambda route, payload: {})
+    transport = SimpleNamespace(
+        dispatch=lambda route, payload: _valid_inventory() if route == "get_inventory" else {}
+    )
     client = SimpleNamespace(transport=transport)
     gather_attempts = []
     descent_calls = []

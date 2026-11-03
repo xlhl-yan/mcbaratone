@@ -70,6 +70,51 @@ def valid_inventory(payload):
     return all(_valid_section(payload[key]) for key in present)
 
 
+def _carried_slots(payload: Any) -> Optional[list[Dict[str, Any]]]:
+    """Validate the current slot layout before deriving any capacity."""
+    data = unwrap_inventory(payload)
+    if data is None or not valid_inventory(payload):
+        return None
+    if any(part.get("success") is False or part.get("error")
+           or part.get("status") == "error" for part in (payload, data)):
+        return None
+    slots = data.get("inventory")
+    if not isinstance(slots, list):
+        return None  # Aggregated item counts cannot establish slot capacity.
+    seen = set()
+    for item in slots:
+        slot = item.get("slot")
+        if (type(slot) is not int or not 0 <= slot < 36 or slot in seen
+                or not isinstance(item.get("id"), str) or type(item.get("count")) is not int
+                or (item["id"] == "minecraft:air" and item["count"] != 0)):
+            return None
+        seen.add(slot)
+    return slots
+
+
+def free_carried_slots(payload: Any) -> int:
+    """Fail closed when a read cannot establish carried-slot occupancy."""
+    slots = _carried_slots(payload)
+    return 0 if slots is None else 36 - sum(item["count"] > 0 for item in slots)
+
+
+def carried_output_capacity(payload: Any, item_id: str, max_count: int = 64) -> int:
+    """Room for plain recipe output; offhand and custom stacks cannot merge."""
+    slots = _carried_slots(payload)
+    if slots is None or type(max_count) is not int or max_count <= 0:
+        return 0
+    room = (36 - sum(item["count"] > 0 for item in slots)) * max_count
+    for item in slots:
+        if (item["id"] != item_id or item["count"] <= 0
+                or any(item.get(key) for key in ("components", "enchantments", "stored_enchantments", "damage"))):
+            continue
+        limit = item.get("max_count", max_count)
+        if type(limit) is not int or limit != max_count or item["count"] > limit:
+            return 0
+        room += limit - item["count"]
+    return room
+
+
 def _section_items(value: Any) -> Iterable[Dict[str, Any]]:
     """Normalize list and item-id/count-map inventory section shapes."""
     if isinstance(value, list):

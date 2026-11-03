@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from .food_preparation import _bread_output_capacity, _prepare_bread
 from dataclasses import dataclass
 from math import ceil, hypot, sqrt
 import math
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from .farm_maintenance import plot_on_cooldown
 from .combat import eat_until_hunger
 from .farming import (
     _block_id,
@@ -22,16 +24,25 @@ from .inventory import (
     resolve_storage_location,
 )
 from .navigation import find_nearby_block, find_water_source
-from .survival_farm import local_farm_wait_reason
+from .survival_farm import fed_enough_for_home_farm, local_farm_wait_reason
 from .farm_site_travel import (
     approach_candidate as _approach_candidate,
     horizontal_distance as _horizontal_distance,
 )
+from .food_workstation import craft_bread_at_saved_home
+from .house_door_travel import prepare_house_door_for_departure
+from .food_return import return_after_food_cycle
+from .inventory_disposal import shed_surplus_seeds
 
 
 WHEAT = "minecraft:wheat"
 SEEDS = "minecraft:wheat_seeds"
 BREAD = "minecraft:bread"
+OTHER_EDIBLE_CROPS = (
+    "minecraft:carrot",
+    "minecraft:potato",
+    "minecraft:beetroot",
+)
 #: Farms must stay within one short walk of the durable base anchor. A plot
 #: further out is not an asset: the worker stops visiting it, the harvest step
 #: times out travelling, and the fleet accumulates farms it never uses. At 64
@@ -49,6 +60,8 @@ RETURN_HOME_TIMEOUT = 150
 #: Seed top-up runs every cycle, so it gets a short leash; partial stock is
 #: still progress and the next cycle tries again.
 SEED_STOCK_TIMEOUT = 45
+#: A cycle should prepare at most one output stack before yielding to safety.
+MAX_BREAD_PER_CYCLE = 64
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,8 @@ class FoodCycleResult:
     total_plots: int = 0
     total_crop_tiles: int = 0
     total_wheat_harvested: int = 0
+    other_edible_crops_harvested: int = 0
+    total_other_edible_crops_harvested: int = 0
     total_crops_replanted: int = 0
     total_bread_crafted: int = 0
     total_prepared_food_banked: int = 0
@@ -291,20 +306,19 @@ def _retire_distant_plots(
 
 
 def _return_to_anchor(client: Any, anchor: Optional[Tuple[int, int, int]]) -> bool:
-    """Walk back toward base so the next cycle starts within reach.
+    """Return with a separate travel budget and clear-area recovery movement.
 
-    A 468-block journey cannot finish inside the harvest step's 120s travel
-    budget, which is why the worker never got home on its own. This trip is
-    given room to complete, and partial progress still helps: the next cycle
-    starts closer than the last.
+    Long journeys exceed the harvest budget; partial travel still brings the
+    next cycle closer to home. Actual threats can still interrupt the return.
     """
     if anchor is None:
         return False
     try:
-        from .navigation import goto as _goto
+        from .navigation import goto as _goto, recovery_navigation_defense
 
         return bool(_goto(client, anchor[0], anchor[1], anchor[2],
-                          timeout=RETURN_HOME_TIMEOUT, tolerance=8.0))
+                          timeout=RETURN_HOME_TIMEOUT, tolerance=8.0,
+                          on_defense=lambda: recovery_navigation_defense(client)))
     except Exception:
         return False
 
@@ -359,10 +373,9 @@ def _next_plot_candidate(
     )
     worker["expansion_cursor"] = cursor + 1
     anchor_key = list(anchor)
-    if candidate is None and not known and rejected:
-        # Setup failures (notably a missing bucket) used to blacklist every
-        # nearby coordinate. With no farm left, that made the bounded search
-        # permanently return None even after the prerequisite was repaired.
+    if candidate is None and rejected:
+        # Setup failures can blacklist every nearby site. A recorded plot
+        # may be flooded or destroyed, so its presence cannot disable retries.
         streak = int(worker.get("exhausted_frontier_streak", 0) or 0) + 1
         if (
             worker.get("failed_site_reset_anchor") != anchor_key
@@ -464,6 +477,10 @@ def _establish_candidate(client: Any, state: Any, candidate, size: int):
         surface = find_farm_surface_near(client, *candidate)
     if surface is None:
         return None
+    anchor = _base_anchor(state)
+    if anchor is not None and abs(surface[1] - anchor[1]) > 8:
+        _return_to_anchor(client, anchor)
+        return None
     return establish_wheat_farm(client, *surface, size=size, state=state)
 
 
@@ -518,6 +535,9 @@ def _result(
         total_plots=int(worker.get("plots", 0) or 0),
         total_crop_tiles=int(worker.get("crop_tiles", 0) or 0),
         total_wheat_harvested=int(worker.get("wheat_harvested", 0) or 0),
+        total_other_edible_crops_harvested=int(
+            worker.get("other_edible_crops_harvested", 0) or 0
+        ),
         total_crops_replanted=int(worker.get("crops_replanted", 0) or 0),
         total_bread_crafted=int(worker.get("bread_crafted", 0) or 0),
         total_prepared_food_banked=int(worker.get("prepared_food_banked", 0) or 0),
@@ -576,6 +596,52 @@ def _waiting_for_crops(client, state, harvested):
     )
 
 
+def _harvest_known_plots(client, state, worker, known, limit, cursor, farm_range):
+    inspected = (
+        [known[(cursor + index) % len(known)] for index in range(min(limit, len(known)))]
+        if known else []
+    )
+    harvested = other_edible = 0
+    unreachable = []
+    for plot in (plot for plot in inspected if not plot_on_cooldown(state, plot)):
+        before = get_inventory(client)
+        harvest_wheat_farm(client, *plot, range_=farm_range)
+        after = get_inventory(client)
+        harvested += max(0, _count(after, WHEAT) - _count(before, WHEAT))
+        other_edible += sum(
+            max(0, _count(after, item) - _count(before, item))
+            for item in OTHER_EDIBLE_CROPS
+        )
+        separation = _plot_distance(client, plot)
+        if separation == separation and separation > UNREACHED_PLOT_DISTANCE:
+            unreachable.append((plot, separation))
+
+    if known:
+        worker["plot_cursor"] = (cursor + len(inspected)) % len(known)
+    if unreachable and len(unreachable) == len(inspected) and harvested == 0:
+        worker["unreachable_plots"] = [list(plot) for plot, _ in unreachable]
+        nearest = min(distance for _, distance in unreachable)
+        anchor = _anchor(state, known)
+        retired = _retire_distant_plots(state, worker, anchor)
+        if retired:
+            _flush(state, client)
+            return harvested, other_edible, _result(
+                worker, False,
+                f"retired {len(retired)} farm plot(s) beyond the "
+                f"{MAX_ANCHOR_RADIUS}-block siting radius; will resite near base",
+            )
+        went_home = _return_to_anchor(client, anchor)
+        _flush(state, client)
+        return harvested, other_edible, _result(
+            worker, False,
+            f"could not reach {len(unreachable)} known farm plot(s); nearest is "
+            f"{nearest:.0f} blocks away; "
+            + ("walked back toward base" if went_home else "return to base failed"),
+        )
+    return harvested, other_edible, None
+
+
+@return_after_food_cycle
 def run_food_cycle(
     client: Any,
     state: Any,
@@ -587,29 +653,41 @@ def run_food_cycle(
     max_candidate_slots: int = 3,
     personal_food_reserve: int = 8,
     seed_reserve: int = 8,
+    carried_wheat_only: bool = False,
 ) -> FoodCycleResult:
-    """Harvest known plots, craft/bank proven surplus, or add exactly one plot.
-
-    This intentionally has no lifetime plot limit.  Each invocation has one
-    short farm pass for a round-robin subset of known plots and may establish
-    *one* irrigated plot near the durable base/farm anchor when none yield.
-    """
+    """Prepare carried grain first, then take one bounded farm/expansion pass."""
     worker = _worker(state)
     worker["attempts"] = int(worker.get("attempts", 0) or 0) + 1
     if not _survival_ready(client):
         _flush(state, client)
         return _result(worker, False, "survival state is unsafe for farm travel")
     try:
-        safe_to_work = eat_until_hunger(client, minimum_food=14)
+        safe_to_work = eat_until_hunger(client, minimum_food=14) or fed_enough_for_home_farm(client)
     except Exception:
         safe_to_work = False
-    if not safe_to_work:
+    if safe_to_work and _count(get_inventory(client), WHEAT) >= 3:
+        crafted, banked = _prepare_bread(client, state, personal_food_reserve, seed_reserve)
+        if crafted or banked:
+            values = {"cycles": 1, "bread_crafted": crafted, "prepared_food_banked": banked}
+            for key, value in values.items():
+                worker[key] = int(worker.get(key, 0) or 0) + value
+            _flush(state, client)
+            return _result(worker, True, f"crafted {crafted} bread from carried wheat; banked {banked}", **values)
+        if carried_wheat_only:
+            _flush(state, client)
+            return _result(
+                worker, False,
+                "carried wheat produced no verified bread; check output space and the saved-home workstation",
+            )
+    if carried_wheat_only and safe_to_work:
         _flush(state, client)
-        return _result(
-            worker,
-            False,
-            "survival recovery could not restore food before farm travel",
-        )
+        return _result(worker, False, "no craftable carried wheat remains")
+    if not safe_to_work or not prepare_house_door_for_departure(
+        client, state, _base_anchor(state)
+    ):
+        _flush(state, client)
+        reason = "survival recovery could not restore food before farm travel" if not safe_to_work else "house door blocked"
+        return _result(worker, False, reason)
     known = _plots(state)
     anchor = _base_anchor(state)
     retired = _retire_distant_plots(state, worker, anchor)
@@ -630,61 +708,18 @@ def run_food_cycle(
     known = _plots(state)
     worker["farm_plots"] = [{"origin": list(plot)} for plot in known]
     harvested = 0
-    limit = max(1, int(max_plots_per_cycle))
+    other_edible_harvested = 0
     cursor = int(worker.get("plot_cursor", 0) or 0)
-    inspected = (
-        [
-            known[(cursor + index) % len(known)]
-            for index in range(min(limit, len(known)))
-        ]
-        if known
-        else []
+    harvested, other_edible_harvested, unreachable_result = _harvest_known_plots(
+        client, state, worker, known, max(1, int(max_plots_per_cycle)), cursor,
+        max(1, int(farm_range)),
     )
-    unreachable = []
-    for plot in inspected:
-        plot_before = _count(get_inventory(client), WHEAT)
-        harvest_wheat_farm(client, *plot, range_=max(1, int(farm_range)))
-        harvested += max(0, _count(get_inventory(client), WHEAT) - plot_before)
-        # harvest_wheat_farm returns False both when it never arrived and when
-        # it arrived to find nothing ripe, so its flag cannot distinguish them.
-        # Measure instead: still far from the plot means the trip failed, and
-        # that is a different problem from an empty farm. Bot18 sat 461 blocks
-        # from its own plot reporting "harvested 0 wheat" six times, then tried
-        # to fix it by building another farm it also could not reach.
-        separation = _plot_distance(client, plot)
-        if separation == separation and separation > UNREACHED_PLOT_DISTANCE:
-            unreachable.append((plot, separation))
-    if known:
-        worker["plot_cursor"] = (cursor + len(inspected)) % len(known)
-    if unreachable and len(unreachable) == len(inspected) and harvested == 0:
-        # Every plot this pass was out of reach. Establishing another near the
-        # same distant anchor would repeat the trip that just failed.
-        worker["unreachable_plots"] = [list(plot) for plot, _ in unreachable]
-        nearest = min(distance for _, distance in unreachable)
-        anchor = _anchor(state, known)
-        # Two different failures wear the same symptom. A plot beyond the
-        # siting radius is a bad plot, left over from the unbounded search, and
-        # is retired so a fresh one can be sited near base. A good plot the
-        # worker simply walked away from needs the worker brought home instead
-        # -- Bot18's plot sat 21 blocks from its anchor while the bot was 468.
-        retired = _retire_distant_plots(state, worker, anchor)
-        if retired:
-            _flush(state, client)
-            return _result(
-                worker,
-                False,
-                f"retired {len(retired)} farm plot(s) beyond the "
-                f"{MAX_ANCHOR_RADIUS}-block siting radius; will resite near base",
-            )
-        went_home = _return_to_anchor(client, anchor)
-        _flush(state, client)
-        return _result(
-            worker,
-            False,
-            f"could not reach {len(unreachable)} known farm plot(s); nearest is "
-            f"{nearest:.0f} blocks away; "
-            + ("walked back toward base" if went_home else "return to base failed"),
-        )
+    if unreachable_result is not None:
+        return unreachable_result
+    if harvested:
+        # Each harvest returns more seed than replanting needs; shed it at
+        # the farm instead of carrying it home into the chests.
+        shed_surplus_seeds(client)
 
     new_plots = 0
     crop_tiles = 0
@@ -693,14 +728,7 @@ def run_food_cycle(
     waiting_for_crops = _waiting_for_crops(client, state, harvested)
     if harvested == 0 and not waiting_for_crops:
         anchor = _anchor(state, known)
-        # Seeds are the bootstrap for the whole food economy and every bot in
-        # the fleet carried zero. Grass breaking already existed, but only
-        # inside establish_wheat_farm -- after travel and after irrigation --
-        # so any site that failed earlier meant no seeds were ever collected
-        # and the next attempt started empty again. The 29 seeds in storage
-        # are no help: they sit as ones and twos across thirteen chests.
-        # Stock up first; seeds keep, and a reserve makes every later attempt
-        # cheaper.
+        # Stock seeds before irrigation/travel failures can prevent collection.
         seeds_gathered = _stock_seeds(client, seed_reserve)
         home = _home_first(client, state, worker, anchor, known, seeds_gathered)
         if home is not None:
@@ -728,41 +756,20 @@ def run_food_cycle(
                 replanted = 1
             elif candidate is not None:
                 worker["failed_plot_sites"].append(list(candidate))
-
-    after_harvest = get_inventory(client)
-    bread_before = _count(after_harvest, BREAD)
-    wheat_available = _count(after_harvest, WHEAT)
-    breads_requested = max(0, (wheat_available - 3) // 3)
-    if breads_requested:
-        craft(client, BREAD, breads_requested)
-    after_craft = get_inventory(client)
-    bread_crafted = max(0, _count(after_craft, BREAD) - bread_before)
-
-    banked = 0
-    chest = resolve_storage_location(client, state=state, verify=False)
-    if chest is not None and _count(after_craft, BREAD) > max(0, int(personal_food_reserve)):
-        deposited = deposit_excess_to_chest(
-            client,
-            chest,
-            deposit_items={BREAD},
-            retain_counts={
-                BREAD: max(0, int(personal_food_reserve)),
-                SEEDS: max(0, int(seed_reserve)),
-            },
-            state=state,
-        )
-        if deposited >= 0:
-            after_bank = get_inventory(client)
-            banked = max(0, _count(after_craft, BREAD) - _count(after_bank, BREAD))
+    bread_crafted, banked = _prepare_bread(client, state, personal_food_reserve, seed_reserve)
 
     # Gathering seeds is real progress: it is the bootstrap the whole food
     # economy waits on, and a cycle that stocks them has not done nothing.
-    success = bool(harvested or new_plots or bread_crafted or banked or seeds_gathered)
+    success = bool(
+        harvested or other_edible_harvested or new_plots or bread_crafted
+        or banked or seeds_gathered
+    )
     values = {
         "cycles": int(success),
         "plots": new_plots,
         "crop_tiles": crop_tiles,
         "wheat_harvested": harvested,
+        "other_edible_crops_harvested": other_edible_harvested,
         "crops_replanted": replanted,
         "bread_crafted": bread_crafted,
         "prepared_food_banked": banked,
@@ -774,6 +781,8 @@ def run_food_cycle(
         f"harvested {harvested} wheat, established {new_plots} plot, "
         f"crafted {bread_crafted} bread, banked {banked} prepared food"
         + (f", gathered {seeds_gathered} seeds" if seeds_gathered else "")
+        + (f", harvested {other_edible_harvested} other edible crops"
+           if other_edible_harvested else "")
     )
     return _result(worker, success, detail, **values)
 

@@ -31,12 +31,21 @@ def run_crop_opportunity(
         inventory_reader=inventory_reader, traveler=traveler,
         block_finder=block_finder, sleeper=sleeper, state=state,
     )
+    if state is not None and isinstance(result, tuple):
+        custom = getattr(state, "custom_data", None)
+        if isinstance(custom, dict):
+            holds = custom.setdefault("crop_site_cooldowns", {})
+            key = ",".join(str(int(v)) for v in opportunity.location)
+            if result[0]:
+                holds.pop(key, None)
+            else:
+                holds[key] = time.time() + 900.0
     return result if isinstance(result, tuple) else (
         False, "home crop digging protection was unavailable", 0, 0
     )
 
 
-@protect_home_route()
+@protect_home_route(surface_work=True)
 def _run_crop_opportunity(
     client: Any, x: int, y: int, z: int,
     opportunity: LocalOpportunity, timeout: float,
@@ -67,9 +76,14 @@ def _run_crop_opportunity(
     client.transport.dispatch("farm", {"range": 8, "x": location[0], "y": location[1], "z": location[2], "replant": True})
     deadline = time.monotonic() + max(1.0, float(timeout))
     after = before
+    safe = True
     try:
         while time.monotonic() < deadline:
             sleeper(min(2.0, max(0.05, float(timeout))))
+            from ...common.farming import farm_surface_safe
+            safe = farm_surface_safe(client)
+            if not safe:
+                return False, "crop process left the safe surface", before, after
             current = inventory_reader(client)
             after = sum(int(current.get(item, 0) or 0) for item in CROP_ITEMS)
             plantable = sum(int(current.get(item, 0) or 0) for item in PLANTABLE_ITEMS)
@@ -78,10 +92,17 @@ def _run_crop_opportunity(
             if plantable < before_plantable and block_finder(client, list(CROP_BLOCKS), radius=12):
                 return True, "planting was verified in the world", before, plantable
     finally:
+        stopped = False
         try:
             client.transport.dispatch("cancel", {})
+            stopped = True
         except Exception:
             pass
+        if stopped and safe and state is not None:
+            from ..food_recovery_state import checkpointed_wheat_farm_origin
+            if checkpointed_wheat_farm_origin(state) == tuple(location):
+                from ...common.farming import replant_empty_wheat_tiles
+                replant_empty_wheat_tiles(client, *location)
 
     # If the farm command didn't change inventories but crop blocks are present
     # in the world, the patch is already planted and waiting to mature. Accept

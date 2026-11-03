@@ -52,7 +52,6 @@ def test_snapshot_accepts_only_verified_productive_scheduler_outcomes():
     )
 
     assert productive_snapshot(state) == {
-        "adaptive_scheduler.crop_farm.successful_cycles": 3,
         "adaptive_scheduler.crop_farm.verified_delta_total": 12,
     }
 
@@ -110,3 +109,29 @@ def test_success_text_without_counter_delta_is_not_productive_progress():
 
     assert not result.progressed
     assert result.no_progress_streak == 1
+
+
+def test_cycles_and_defense_success_cannot_hide_a_stalled_campaign():
+    state = _state({"food_worker": {"cycles": 10}, "adaptive_scheduler": {
+        "opportunities": {
+            "food_production": {"successful_cycles": 10, "verified_delta_total": 0},
+            "self_defense": {"successful_cycles": 10, "verified_delta_total": 3},
+        },
+    }})
+    before = productive_snapshot(state)
+    state.custom_data["food_worker"]["cycles"] += 1
+    for record in state.custom_data["adaptive_scheduler"]["opportunities"].values():
+        record["successful_cycles"] += 1
+    result = record_productive_attempt(state, "food_production", before, productive_snapshot(state))
+    assert not result.progressed
+    assert result.no_progress_streak == 1
+
+
+def test_equipment_and_edible_crop_deltas_are_productive():
+    state = _state({"food_worker": {"other_edible_crops_harvested": 4},
+                    "adaptive_scheduler": {"opportunities": {
+                        "armor_upkeep": {"verified_delta_total": 2}}}})
+    assert productive_snapshot(state) == {
+        "food_worker.other_edible_crops_harvested": 4,
+        "adaptive_scheduler.armor_upkeep.verified_delta_total": 2,
+    }

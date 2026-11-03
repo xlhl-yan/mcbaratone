@@ -38,6 +38,22 @@ def _client(blocks=None, dispatch_extra=None):
     return client, calls, blocks
 
 
+def _irrigated_plot_blocks(center=(0, 64, 0)):
+    x, y, z = center
+    blocks = {}
+    for dx in range(-2, 3):
+        for dz in range(-2, 3):
+            blocks[(x + dx, y, z + dz)] = {"id": "minecraft:farmland"}
+            blocks[(x + dx, y + 1, z + dz)] = {"id": "minecraft:air"}
+    blocks[(x, y, z)] = {
+        "id": "minecraft:water", "state": {"level": "0"}
+    }
+    blocks[(x - 1, y + 1, z)] = {
+        "id": "minecraft:wheat", "state": {"age": "7"}
+    }
+    return blocks
+
+
 def test_ensure_farm_water_returns_true_when_already_present(monkeypatch):
     client, calls, _ = _client(blocks={(0, 64, 0): "minecraft:water"})
     monkeypatch.setattr(
@@ -553,8 +569,24 @@ def test_establish_wheat_farm_uses_carried_starter_seed_batch(monkeypatch):
 
 
 def test_harvest_wheat_farm_confirms_via_wheat_increase(monkeypatch):
-    client, calls, _ = _client()
+    client, calls, blocks = _client(_irrigated_plot_blocks())
     monkeypatch.setattr(farming, "goto", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "baritone_client.common.farm_crop_identity._capture_mature_wheat",
+        lambda *_a: (),
+    )
+    monkeypatch.setattr(
+        "baritone_client.common.farm_crop_identity._stopped_after_cancel",
+        lambda *_a: True,
+    )
+    def dispatch(route, payload=None):
+        calls.append((route, payload))
+        if route == "get_block":
+            key = (payload["x"], payload["y"], payload["z"])
+            return blocks.get(key, {"id": "minecraft:air"})
+        return {"cancelled": True} if route == "cancel" else {}
+
+    client.transport.dispatch = dispatch
     counts = iter([0, 0, 3])
     monkeypatch.setattr(farming, "count_item", lambda *_a: next(counts, 3))
     monkeypatch.setattr(farming.time, "sleep", lambda _s: None)
@@ -565,7 +597,7 @@ def test_harvest_wheat_farm_confirms_via_wheat_increase(monkeypatch):
 
 
 def test_harvest_wheat_farm_fails_when_no_wheat_appears(monkeypatch):
-    client, _calls, _ = _client()
+    client, _calls, _ = _client(_irrigated_plot_blocks())
     monkeypatch.setattr(farming, "goto", lambda *_a, **_k: True)
     monkeypatch.setattr(farming, "count_item", lambda *_a: 0)
     monkeypatch.setattr(farming.time, "sleep", lambda _s: None)

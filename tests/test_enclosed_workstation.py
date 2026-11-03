@@ -141,21 +141,38 @@ def test_native_farm_process_keeps_home_digging_protected(monkeypatch):
 
     values = {"allowBreak": "true"}
     calls = []
+    blocks = {}
+    for dx in range(-2, 3):
+        for dz in range(-2, 3):
+            blocks[100 + dx, 64, 100 + dz] = {"id": "minecraft:farmland"}
+            blocks[100 + dx, 65, 100 + dz] = {"id": "minecraft:air"}
+    blocks[100, 64, 100] = {
+        "id": "minecraft:water", "state": {"level": "0"}
+    }
+    blocks[99, 65, 100] = {
+        "id": "minecraft:wheat", "state": {"age": "7"}
+    }
 
     def dispatch(route, payload):
         calls.append((route, payload))
+        if route == "get_block":
+            position = (payload["x"], payload["y"], payload["z"])
+            return blocks.get(position, {"id": "minecraft:air"})
         if route == "settings":
             if "set" in payload:
                 values[payload["set"]] = payload["value"]
             return {"value": values["allowBreak"]}
         if route == "farm":
             assert values["allowBreak"] == "false"
-        return {"is_pathing": False}
+        if route == "cancel":
+            return {"cancelled": True}
+        return {"is_pathing": False, "health": 20, "air_supply": 300,
+                "block_position": {"x": 100, "y": 65, "z": 100}}
 
     client = SimpleNamespace(_protected_home_anchor=(100, 65, 100),
                              transport=SimpleNamespace(dispatch=dispatch))
     wheat = iter((0, 2))
-    monkeypatch.setattr(farming, "count_item", lambda *_a: next(wheat))
+    monkeypatch.setattr(farming, "count_item", lambda *_a: next(wheat, 0))
     monkeypatch.setattr(farming, "goto", lambda *_a, **_k: True)
     monkeypatch.setattr(farming.time, "sleep", lambda *_a: None)
     assert farming.harvest_wheat_farm(client, 100, 64, 100)

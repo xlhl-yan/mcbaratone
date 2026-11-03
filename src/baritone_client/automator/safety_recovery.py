@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, Optional
 
 from ..common.combat import _defense_runtime, defend_or_flee
+from ..common.combat_action import exclusive_combat_action
 from ..common.defense import DefenseMode
 from .local_opportunity import LocalOpportunity, OpportunityKind
 
@@ -37,8 +38,27 @@ _TICK_BUDGET_SECONDS = 20.0
 #: skeleton 22 blocks away, while food, armour and lighting never ran.
 #: Real threats are still met by the defense that runs on every movement
 #: tick and in the safety system.
+#:
+#: A pass that leaves the bot unharmed earns the same window, even when the
+#: threat persists. Live A1 2026-10-16 stood still at full health for 35+
+#: minutes beside a skeleton it could neither escape nor reach: 776 evades,
+#: every pass "deferred" (controls held, or hostiles 1->1), no other work.
+#: The window ends early if health drops below where it was granted.
 QUIET_SECONDS = 45.0
-_quiet = {"until": 0.0, "hostiles": 0}
+_quiet = {"until": 0.0, "hostiles": 0, "health": 0.0}
+
+
+def _health(signals: object) -> Optional[float]:
+    """Observed health, or None when the signal is missing or not alive."""
+    try:
+        value = float(getattr(signals, "health", None))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _quiet_for(hostiles: int, health: Optional[float]) -> None:
+    _quiet.update(until=time.monotonic() + QUIET_SECONDS, hostiles=hostiles, health=health or 0.0)
 
 
 def select_self_defense(signals: object) -> LocalOpportunity | None:
@@ -50,7 +70,9 @@ def select_self_defense(signals: object) -> LocalOpportunity | None:
     hostiles = int(getattr(signals, "nearby_hostiles", 0) or 0)
     if hostiles <= 0:
         return None
-    if time.monotonic() < _quiet["until"] and hostiles <= _quiet["hostiles"]:
+    health = _health(signals)
+    if (time.monotonic() < _quiet["until"] and hostiles <= _quiet["hostiles"]
+            and (health is None or health >= _quiet["health"])):
         return None
     return LocalOpportunity(
         OpportunityKind.SELF_DEFENSE, 320,
@@ -74,16 +96,36 @@ def _resolved_mode(client: Any) -> Optional[DefenseMode]:
 def run_self_defense(
     client: Any, observe: Callable[[], Any]
 ) -> tuple[bool, str, int, int]:
-    """Run bounded defensive state-machine ticks and measure their effect."""
-    before = int(getattr(observe(), "nearby_hostiles", 0) or 0)
-    deadline = time.monotonic() + _TICK_BUDGET_SECONDS
-    intervened = False
-    for _ in range(_MAX_TICKS):
-        acted = defend_or_flee(client, allow_safe_recovery_movement=True)
-        intervened = intervened or acted
-        if not acted or time.monotonic() >= deadline:
-            break
-    after = int(getattr(observe(), "nearby_hostiles", 0) or 0)
+    """Run bounded defensive ticks while exclusively owning this client.
+
+    SafetySystem runs in a background thread and also advances defense. Keep
+    the complete scheduled retry window under the same per-transport action
+    lock, so the background tick defers instead of issuing duplicate movement
+    and escape commands during this opportunity.
+    """
+    first = observe()
+    before = int(getattr(first, "nearby_hostiles", 0) or 0)
+    health_before = _health(first)
+    with exclusive_combat_action(client, blocking=False) as acquired:
+        if not acquired:
+            # The owner (usually the background safety tick) is defending.
+            last = observe()
+            after = int(getattr(last, "nearby_hostiles", 0) or 0)
+            detail = "defense deferred while another client action owns controls"
+            if _unharmed(health_before, _health(last)):
+                _quiet_for(after, _health(last))
+                detail += f"; unharmed, yielding to other work for {QUIET_SECONDS:.0f}s"
+            return False, detail, before, after
+        deadline = time.monotonic() + _TICK_BUDGET_SECONDS
+        intervened = False
+        for _ in range(_MAX_TICKS):
+            acted = defend_or_flee(client, allow_safe_recovery_movement=True)
+            intervened = intervened or acted
+            if not acted or time.monotonic() >= deadline:
+                break
+    last = observe()
+    after = int(getattr(last, "nearby_hostiles", 0) or 0)
+    health_after = _health(last)
     # `nearby_hostiles` is a 24m-radius entity count, but a verified evade
     # (escape_recovery.run_away) only needs to clear a much shorter
     # separation before the state machine calls it resolved (RECOVER) --
@@ -93,19 +135,28 @@ def run_self_defense(
     mode = _resolved_mode(client)
     resolved = mode in (DefenseMode.CLEAR, DefenseMode.RECOVER)
     success = bool(intervened and (resolved or after < before))
+    yielded = ""
     if not intervened and mode is DefenseMode.CLEAR:
         # Nothing here warranted action: stop preempting other work for a
         # while, unless the number of hostiles grows.
-        _quiet.update(until=time.monotonic() + QUIET_SECONDS, hostiles=after)
+        _quiet_for(after, health_after)
+    elif not success and _unharmed(health_before, health_after):
+        _quiet_for(after, health_after)
+        yielded = f"; unharmed, yielding to other work for {QUIET_SECONDS:.0f}s"
     else:
-        _quiet.update(until=0.0, hostiles=0)
+        _quiet.update(until=0.0, hostiles=0, health=0.0)
     if after < before:
         detail = f"nearby hostiles reduced {before}->{after}"
     elif resolved and mode is not None:
         detail = f"defensive recovery resolved ({mode.value}); nearby hostiles {before}->{after}"
     else:
         detail = f"defensive recovery attempted; nearby hostiles {before}->{after}"
-    return success, detail, before, after
+    return success, detail + yielded, before, after
+
+
+def _unharmed(before: Optional[float], after: Optional[float]) -> bool:
+    """Both readings known and no health lost across the pass."""
+    return before is not None and after is not None and after >= before
 
 
 __all__ = ["run_self_defense", "select_self_defense"]

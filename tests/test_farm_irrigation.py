@@ -13,6 +13,9 @@ def client_for(blocks):
 
     def dispatch(route, payload):
         calls.append((route, payload))
+        if route == "get_state":
+            return {"position": {"x": .5, "y": 65, "z": .5},
+                    "health": 20, "is_dead": False}
         assert route == "get_block", "irrigation reuse must be read-only"
         return blocks.get((payload["x"], payload["y"], payload["z"]),
                           {"id": "minecraft:air", "state": {}})
@@ -116,7 +119,7 @@ def test_off_center_irrigation_allows_replanting_to_continue(monkeypatch, builde
                         lambda _c, *tile: planted.append(tile) or True)
     assert builder(client, 0, 64, 0) == (0, 64, 0)
     assert planted
-    assert all(route == "get_block" for route, _ in calls)
+    assert all(route in {"get_block", "get_state"} for route, _ in calls)
 
 
 @pytest.mark.parametrize("builder", [farming.establish_wheat_farm, farming.reestablish_wheat_farm])

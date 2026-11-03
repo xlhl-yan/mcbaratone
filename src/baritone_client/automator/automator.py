@@ -77,7 +77,7 @@ class EndGameAutomator:
         self.resources.inventory_observer = self._observe_inventory
         self.coordination = CoordinationHub()
         self.systems = [
-            SafetySystem(client, self.coordination, resources=self.resources),
+            SafetySystem(client, self.coordination, resources=self.resources, state_manager=self.state),
             HungerSystem(client, self.coordination, resources=self.resources),
             MappingSystem(client, self.coordination, resources=self.resources, state_manager=self.state)
         ]
@@ -249,7 +249,9 @@ class EndGameAutomator:
                 print(f"Imported {imported} shared fleet landmark(s) into locations")
         except Exception as exc:
             print(f"Shared landmark import deferred: {exc}")
-        
+
+        from ..common.home_surface import bind_home_surface
+        bind_home_surface(self.client, self.state, controller_start=True)
         return self.state.get_current_phase()
 
 

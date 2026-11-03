@@ -40,6 +40,27 @@ def test_stairs_down_to_an_ore_and_never_dig_a_floor():
         assert view.block(floor) in (STONE, "minecraft:grass_block")
 
 
+def test_later_plan_batches_preserve_floors_from_the_existing_route():
+    view = make_view(mutate=lambda v: v.__setitem__((5, 64, 0), IRON))
+    start, goal = (0, 70, 0), {(5, 64, 0)}
+    first = tp.plan(view, start, goal, set(), 70)
+    assert first is not None
+    protected = {cell for move in first for cell in move.dig}
+
+    later = tp.plan(view, start, goal, set(), 70, protected_floors=protected)
+
+    assert later is None or all(not (set(move.dig) & protected) for move in later)
+    assert later is None or tp.path_is_consistent(later, protected_floors=protected)
+
+
+def test_path_consistency_rejects_digging_a_floor_from_a_previous_batch():
+    move = tp.Move(
+        (0, 70, 0), (1, 70, 0), ((1, 70, 0), (1, 71, 0)),
+        ((1, 69, 0),),
+    )
+    assert not tp.path_is_consistent([move], protected_floors={(1, 69, 0)})
+
+
 def test_lava_beside_a_cell_makes_it_impassable_and_the_planner_goes_around():
     def lava_wall(v):
         v[(5, 64, 0)] = IRON

@@ -15,6 +15,7 @@ from .movement_recovery import (
 from .site_selection import surface_y_at
 from .surface_egress import try_lower_surface_egress
 from .tasks import PlayerDeathDetected
+from .water_hazards import allow_water, avoid_water, avoiding_water, fenced_hazard
 
 
 PRIMARY_LAND_FOOD = ("cow", "pig")
@@ -608,6 +609,7 @@ class EmergencyExploration:
     sprint_suppressed: bool = False
     surface_egress_attempted: bool = False
     waypoint_cursor: int = field(default=0, init=False)
+    clear_of_fences: Optional[tuple] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.waypoints = ExplorationWaypoints(
@@ -629,13 +631,18 @@ class EmergencyExploration:
         if self.exploring:
             client.transport.dispatch("cancel", {})
             client.transport.dispatch("chat", {"message": "#stop"})
-        target_x, target_z = self.waypoints.next()
-        self.waypoint_cursor += 1
+        for _ in range(8):  # Skip waypoints inside a drowning fence.
+            target_x, target_z = self.waypoints.next()
+            self.waypoint_cursor += 1
+            if fenced_hazard(client, target_x, target_z) is None:
+                break
         client._emergency_food_waypoint_cursor = self.waypoint_cursor
         print(
             "RECOVERY: no passive food source loaded; rotating bounded "
             f"daylight exploration toward ({target_x}, {target_z})"
         )
+        # A starving bot must not swim: crossing water is how it drowned.
+        avoid_water(client)
         client.transport.dispatch(
             "explore", {"x": target_x, "z": target_z}
         )
@@ -688,6 +695,7 @@ class EmergencyExploration:
             client.transport.dispatch("cancel", {})
             client.transport.dispatch("chat", {"message": "#stop"})
             self.exploring = False
+        allow_water(client)
         if self.sprint_suppressed:
             client.transport.dispatch(
                 "chat", {"message": "#set allowSprint true"}
@@ -695,6 +703,7 @@ class EmergencyExploration:
             self.sprint_suppressed = False
 
 
+@avoiding_water
 def hunt_target(
     client: Any,
     target: Dict,
