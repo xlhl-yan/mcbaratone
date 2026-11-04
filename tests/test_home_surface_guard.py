@@ -672,3 +672,107 @@ def test_no_excavation_from_the_open_sky_crater(monkeypatch):
         return False
 
     route_home(client, -411, 79, -12)
+
+
+# -- one stray block overhead is not a sealed pocket (A1 2026-11-03) -----------
+def _view(center, block_at):
+    """A get_view reply: every non-air block within radius 8 of ``center``."""
+    cx, cy, cz = center
+    return {"success": True, "data": {"voxels": [
+        {"x": x, "y": y, "z": z, "id": f"minecraft:{block}"}
+        for x in range(cx - 8, cx + 9) for y in range(cy - 8, cy + 9) for z in range(cz - 8, cz + 9)
+        if (block := block_at(x, y, z))]}}
+
+
+def _viewing_client(position, block_at):
+    client, _calls = _below_home_client(position)
+    plain, view = client.transport.dispatch, _view(position, block_at)
+    client.transport.dispatch = lambda route, payload=None: (
+        view if route == "get_view" else plain(route, payload))
+    return client
+
+
+def _failed_route_home(client):
+    @home_surface.protect_home_route(safe_movement=True)
+    def route_home(client, x, y, z):
+        return False
+
+    return route_home(client, -411, 79, -12)
+
+
+STRAY = (-422, 75, -1)
+
+
+def _yard(x, y, z):
+    """Live bridge column at STRAY: grass y74, air y75-77, cobblestone y78.
+
+    Short grass covers the rest of the yard; plants do not wall the bot in.
+    """
+    if (x, y, z) == (-422, 78, -1):
+        return "cobblestone"
+    if y == 75 and (x, z) != (-422, -1):
+        return "short_grass"
+    return {74: "grass_block", 73: "dirt", 72: "dirt"}.get(y, "stone" if y < 72 else None)
+
+
+def test_a_lone_block_over_the_open_yard_is_not_a_sealed_pocket(monkeypatch):
+    """A1 resumed under one stray cobblestone and dug an egress into its yard."""
+    monkeypatch.setattr(home_surface.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr("baritone_client.common.build_site_recovery.excavate_surface_egress",
+                        lambda *_a, **_k: pytest.fail("one stray block is not a sealed pocket"))
+    client = _viewing_client(STRAY, _yard)
+    guard = home_surface.home_route_floor(client, STRAY[0], 79, STRAY[2])
+    assert not home_surface.below_home_surface(guard, dict(zip("xyz", STRAY)), client)
+    _failed_route_home(_viewing_client(STRAY, _yard))  # a fresh client: no cached verdict
+
+
+def test_a_walk_home_under_a_lone_block_does_not_abort(monkeypatch):
+    path = [(-436, 75, -1), STRAY, (-415, 78, -8), (-411, 79, -12)]
+    result, outcome, _views = _walk_home(monkeypatch, path, view=_view(STRAY, _yard))
+    assert result and outcome == "arrived"
+
+
+TUNNEL = (-425, 66, 7)
+
+
+def _mine(mouth=None):
+    """A1's mine tunnel: 1x2 along z=7 at y=66 under solid terrain.
+
+    ``mouth``: from this x eastward the tunnel opens into an open-sky cut.
+    """
+    def block_at(x, y, z):
+        if mouth is not None and x >= mouth and 5 <= z <= 9 and y >= 66:
+            return None
+        if z == 7 and y in (66, 67):
+            return None
+        return {74: "grass_block", 73: "dirt", 72: "dirt"}.get(y, "stone" if y < 72 else None)
+    return block_at
+
+
+def test_a_roofed_tunnel_with_floor_and_walls_in_view_is_still_sealed(monkeypatch):
+    monkeypatch.setattr(home_surface.time, "sleep", lambda *_a: None)
+    tunnels = []
+    monkeypatch.setattr("baritone_client.common.build_site_recovery.excavate_surface_egress",
+                        lambda c, origin, expected_y, avoid, avoid_radius: tunnels.append(origin) or origin)
+    assert not _failed_route_home(_viewing_client(TUNNEL, _mine()))
+    assert tunnels == [TUNNEL]
+
+
+@pytest.mark.parametrize("steps, sealed", [(2, False), (3, True)])
+def test_open_sky_counts_only_within_two_walking_steps(steps, sealed):
+    client = _viewing_client(TUNNEL, _mine(mouth=TUNNEL[0] + steps))
+    guard = home_surface.home_route_floor(client, TUNNEL[0], 79, TUNNEL[2])
+    assert home_surface.below_home_surface(guard, dict(zip("xyz", TUNNEL)), client) is sealed
+
+
+@pytest.mark.parametrize("cap, sealed", [(77, True), (78, False)])
+def test_stepping_out_of_a_hole_needs_jump_headroom(cap, sealed):
+    """In a 1-deep hole, a block at head+1 leaves no room to jump onto the ledge."""
+    def hole(x, y, z):
+        if (x, z) == STRAY[::2]:
+            return "cobblestone" if y == cap else ("dirt" if y <= 74 else None)
+        return {75: "grass_block", 74: "dirt", 73: "dirt"}.get(y, "stone" if y < 73 else None)
+
+    client = _viewing_client(STRAY, hole)
+    guard = home_surface.home_route_floor(client, STRAY[0], 79, STRAY[2])
+    assert home_surface.below_home_surface(guard, dict(zip("xyz", STRAY)), client) is sealed

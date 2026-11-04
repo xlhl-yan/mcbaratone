@@ -9,6 +9,7 @@ import math
 import time
 from functools import wraps
 from inspect import signature
+from .escape_recovery import _HAZARDS, _passable
 from .tasks import PlayerDeathDetected, SurvivalRecoveryRequired
 
 
@@ -89,7 +90,14 @@ def below_home_surface(guard, position, client=None, *, anywhere=False):
 
 
 def _under_roof(client, position):
-    """One fresh view: True roofed, False open sky, None unknown."""
+    """One fresh view: True sealed, False open sky, None unknown.
+
+    A roof over the bot's own column alone is not a sealed pocket. Live A1
+    resumed on grass at (-422,75,-1) under one stray cobblestone at y=78,
+    open sky all round, and dug an egress staircase into its own yard.
+    Open sky over a cell it can walk to in ``_EXIT_STEPS`` steps also proves
+    the surface; a tunnel under solid terrain has no such cell.
+    """
     cell = tuple(int(position[axis]) for axis in ("x", "y", "z"))
     now = time.monotonic()
     cache = getattr(client, "_home_roof_cache", None)
@@ -97,20 +105,70 @@ def _under_roof(client, position):
         cache = client._home_roof_cache = {}
     if cell in cache and cache[cell][1] > now:
         return cache[cell][0]
-    x, y, z = cell
     try:
         view = client.transport.dispatch("get_view", {"radius": _ROOF_VIEW})
         if view.get("success") is False:
             raise ValueError("view refused")
-        roofed = any(
-            int(v["x"]) == x and int(v["z"]) == z and y + 2 <= int(v["y"]) <= y + 1 + _ROOF_REACH
-            and not str(v.get("id", "")).endswith("_leaves")
+        # get_view omits air, so an absent cell is air or unknown.
+        blocks = {
+            (int(v["x"]), int(v["y"]), int(v["z"])): str(v.get("id", "")).split(":")[-1]
             for v in view.get("data", view)["voxels"]
-        )
+        }
+        roofed = _roofed(blocks, cell) and not _open_exit(blocks, cell)
     except Exception:
         roofed = None  # unproven sky keeps the flat floor
     cache[cell] = (roofed, now + _ROOF_TTL)
     return roofed
+
+
+#: Walking steps searched for open sky from under a roof.
+_EXIT_STEPS = 2
+_NO_FLOOR = frozenset({"water", "lava", "bubble_column", "powder_snow"})
+
+
+def _roofed(blocks, cell):
+    x, y, z = cell
+    return any(
+        not blocks[(x, h, z)].endswith("_leaves")
+        for h in range(y + 2, y + 2 + _ROOF_REACH) if (x, h, z) in blocks
+    )
+
+
+def _clear(blocks, x, z, low, high):
+    return all(_passable(blocks.get((x, h, z), "air")) for h in range(low, high + 1))
+
+
+def _stands(blocks, x, y, z):
+    """A proven floor under clear, hazard-free feet and head."""
+    floor = blocks.get((x, y - 1, z))
+    if not floor or floor in _NO_FLOOR or _passable(floor):
+        return False  # no voxel: air or unknown, never a proven floor
+    cells = (floor, blocks.get((x, y, z), ""), blocks.get((x, y + 1, z), ""))
+    if any(token in name for name in cells for token in _HAZARDS):
+        return False
+    return _clear(blocks, x, z, y, y + 1)
+
+
+def _open_exit(blocks, start):
+    """Whether a walk of ``_EXIT_STEPS`` reaches a cell under open sky."""
+    seen, frontier = {start}, [start]
+    for _ in range(_EXIT_STEPS):
+        reached = []
+        for x, y, z in frontier:
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                for ny in (y, y + 1, y - 1):
+                    nxt = (x + dx, ny, z + dz)
+                    top = max(y, ny) + 1  # a step needs headroom in both columns
+                    if (nxt in seen or not _stands(blocks, *nxt)
+                            or not _clear(blocks, x, z, y, top)
+                            or not _clear(blocks, nxt[0], nxt[2], ny, top)):
+                        continue
+                    if not _roofed(blocks, nxt):
+                        return True
+                    seen.add(nxt)
+                    reached.append(nxt)
+        frontier = reached
+    return False
 
 
 def _checked_response_data(response, operation):
