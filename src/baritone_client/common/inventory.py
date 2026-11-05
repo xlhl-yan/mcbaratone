@@ -971,36 +971,10 @@ def ensure_tool_sticks(client, item_id: str, count: int = 1) -> bool:
     return count_item(client, "minecraft:stick") >= required
 
 
-def _nearest_local_crafting_table(
-    client,
-    found_tables,
-    *,
-    maximum_distance: float = 12.0,
-):
-    """Reject loaded tables that require a survival-expensive commute."""
-    try:
-        state = client.transport.dispatch("get_state", {})
-        position = state.get("block_position", state.get("position", {}))
-        px = float(position["x"])
-        pz = float(position["z"])
-    except (KeyError, TypeError, ValueError):
-        return None
+def _nearest_local_crafting_table(client, found_tables, *, maximum_distance: float = 12.0):
+    from .crafting_workstation import nearest_local_crafting_table
 
-    candidates = []
-    for table in found_tables:
-        try:
-            x = int(table["x"])
-            y = int(table["y"])
-            z = int(table["z"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        distance = ((x - px) ** 2 + (z - pz) ** 2) ** 0.5
-        if distance <= float(maximum_distance):
-            candidates.append((distance, x, y, z))
-    if not candidates:
-        return None
-    _, x, y, z = min(candidates)
-    return (x, y, z)
+    return nearest_local_crafting_table(client, found_tables, maximum_distance=maximum_distance)
 
 
 def craft(client, item_id: str, count: int = 1) -> bool:
@@ -2167,18 +2141,11 @@ def is_full(client) -> bool:
 
 
 def free_inventory_slots(client) -> int:
-    """Return the number of empty slots in the 36-slot carried inventory."""
+    """Count capacity only from a valid current carried-slot snapshot."""
     try:
-        raw_inv = client.transport.dispatch("get_inventory", {})
-        data = raw_inv.get("data", raw_inv)
-        occupied = {
-            int(item.get("slot", -1))
-            for item in data.get("inventory", [])
-            if 0 <= int(item.get("slot", -1)) < 36
-            and item.get("id") not in (None, "", "minecraft:air")
-            and int(item.get("count", 0)) > 0
-        }
-        return max(0, 36 - len(occupied))
+        from ..inventory_evidence import free_carried_slots
+
+        return free_carried_slots(client.transport.dispatch("get_inventory", {}))
     except Exception:
         return 0
 

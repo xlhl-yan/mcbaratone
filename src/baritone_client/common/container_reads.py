@@ -119,33 +119,26 @@ def forget_missing_container(
         print(f"STORAGE: missing-container catalog update deferred ({exc})")
 
 
-#: The only blocks a storage visit may dig out of a container's way: the
-#: bot's own misplaced crafting table and plain terrain or filler. Anything
-#: else beside a chest is presumed built on purpose. Live 2026-09-29 at the
-#: family camp, a forester tried to break both hoppers feeding the sorter's
-#: public intake (and removed a wall torch) because this cleared any
-#: non-container block.
+#: Only incidental ground cover can be cleared for storage interaction.
+#: Terrain and workstations may be shelter, a floor, or another owner's build.
+#: Their presence requires another access route, never automatic demolition.
 CLEARABLE_OCCLUDERS = frozenset(
     "minecraft:" + name
     for name in (
-        "crafting_table", "dirt", "coarse_dirt", "rooted_dirt", "grass_block",
-        "podzol", "mud", "stone", "cobblestone", "mossy_cobblestone",
-        "deepslate", "cobbled_deepslate", "andesite", "diorite", "granite",
-        "tuff", "calcite", "gravel", "sand", "red_sand", "netherrack",
-        "snow", "snow_block", "short_grass", "tall_grass", "fern",
-        "large_fern", "dead_bush", "vine",
+        "snow", "short_grass", "tall_grass", "fern",
+        "large_fern", "dead_bush", "vine", "leaf_litter",
     )
 )
 
 
 def is_clearable_occluder(block: str) -> bool:
-    return block in CLEARABLE_OCCLUDERS or block.endswith("_leaves")
+    return block in CLEARABLE_OCCLUDERS
 
 
 def clear_occluded_container_face(
     client: Any, position: Tuple[int, int, int], _block_id: str = ""
 ) -> None:
-    """Clear solid blocks that prevent horizontal container interaction."""
+    """Clear incidental cover while preserving structural container surrounds."""
     cx, cy, cz = (int(axis) for axis in position)
     try:
         state = client.transport.dispatch("get_state", {})

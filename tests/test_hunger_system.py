@@ -466,7 +466,7 @@ def _hunger_tick(screen, food):
     client.transport.dispatch = MagicMock(side_effect=dispatch)
     hunger = HungerSystem(client, MagicMock(spec=CoordinationHub))
     attempts = []
-    hunger.try_eat = lambda level: attempts.append(level)
+    hunger.try_eat = lambda level, **_kwargs: attempts.append(level)
     hunger.tick()
     return attempts, sent
 
@@ -499,6 +499,6 @@ def test_an_unreadable_screen_never_blocks_eating():
     client.transport.dispatch = MagicMock(side_effect=dispatch)
     hunger = HungerSystem(client, MagicMock(spec=CoordinationHub))
     attempts = []
-    hunger.try_eat = lambda level: attempts.append(level)
+    hunger.try_eat = lambda level, **_kwargs: attempts.append(level)
     hunger.tick()
     assert attempts == [12]

@@ -50,6 +50,21 @@ def test_remote_loaded_crafting_table_is_not_selected_for_survival_work():
     )
 
 
+def test_workstation_selection_counts_height_before_choosing_a_nearby_roof():
+    client = DummyClient(DummyTransport({"get_state": {"block_position": {"x": 10, "y": 70, "z": 10}}}))
+    assert inventory._nearest_local_crafting_table(client, [
+        {"x": 11, "y": 74, "z": 10},
+        {"x": 12, "y": 70, "z": 11},
+    ]) == (12, 70, 11)
+    assert inventory._nearest_local_crafting_table(client, [{"x": 10, "y": 83, "z": 10}]) is None
+
+
+@pytest.mark.parametrize("height", [None, True, float("nan"), float("inf")])
+def test_unverified_player_height_cannot_choose_a_crafting_workstation(height):
+    client = DummyClient(DummyTransport({"get_state": {"block_position": {"x": 10, "y": height, "z": 10}}}))
+    assert inventory._nearest_local_crafting_table(client, [{"x": 11, "y": 70, "z": 10}]) is None
+
+
 class RecipeAwareTransport:
     """Tiny inventory simulator for dependency-order regression tests."""
 
@@ -2150,18 +2165,17 @@ def test_harness_hotbar_failure_does_not_break_selection(monkeypatch):
     assert inventory.select_item(client, "minecraft:torch", allow_swap=True) is False
 
 
-def test_clear_occluded_chest_face_breaks_front_and_head_occluders(monkeypatch):
-    """A chest whose front face + head slot get dug via break_block, and the
-    solid block directly on top of the chest (which buries it) is cleared too."""
+def test_clear_occluded_chest_face_only_clears_incidental_ground_cover(monkeypatch):
+    """Cover can be cleared without treating walls or workstations as debris."""
     from baritone_client.common import inventory as inv
 
     state = {
         "block_position": {"x": -432.0, "y": 78.0, "z": -1.0},
     }
     blocks = {
-        (-432, 78, 1): "minecraft:crafting_table",  # front face toward player
-        (-432, 79, 1): "minecraft:dirt",            # head slot above front
-        (-432, 79, 2): "minecraft:dirt",            # directly on top (buries chest)
+        (-432, 78, 1): "minecraft:short_grass",     # front face toward player
+        (-432, 79, 1): "minecraft:vine",            # head slot above front
+        (-432, 79, 2): "minecraft:snow",            # thin layer above chest
         (-432, 78, 2): "minecraft:chest",           # the chest itself
     }
     broken = []
@@ -2188,9 +2202,7 @@ def test_clear_occluded_chest_face_breaks_front_and_head_occluders(monkeypatch):
     client = SimpleNamespace(transport=Transport())
     inv._clear_occluded_chest_face(client, (-432, 78, 2), "minecraft:chest")
 
-    assert (-432, 78, 1) in broken, "front-face crafting table must be broken"
-    assert (-432, 79, 1) in broken, "head-slot dirt must be broken"
-    assert (-432, 79, 2) in broken, "block directly above the chest must be broken"
+    assert broken == [(-432, 78, 1), (-432, 79, 1), (-432, 79, 2)]
 
 
 def test_clear_occluded_chest_face_never_digs_another_container(monkeypatch):

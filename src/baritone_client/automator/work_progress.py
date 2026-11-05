@@ -15,10 +15,10 @@ from typing import Any, Mapping
 
 
 _COUNTER_KEYS = {
-    "cycles",
     "plots",
     "crop_tiles",
     "wheat_harvested",
+    "other_edible_crops_harvested",
     "crops_replanted",
     "bread_crafted",
     "prepared_food_banked",
@@ -62,8 +62,7 @@ _PRODUCTIVE_OPPORTUNITIES = {
     "enchanting_xp",
     "enchanting_material",
     "storage_maintenance",
-    "clear_hostiles_aid",
-    "self_defense",
+    "armor_upkeep",
 }
 
 
@@ -118,7 +117,7 @@ def productive_snapshot(state: Any) -> dict[str, int]:
                 or not isinstance(raw, Mapping)
             ):
                 continue
-            for key in ("successful_cycles", "verified_delta_total"):
+            for key in ("verified_delta_total",):
                 number = _number(raw.get(key))
                 if number is not None:
                     snapshot[f"adaptive_scheduler.{kind}.{key}"] = number

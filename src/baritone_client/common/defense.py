@@ -86,6 +86,9 @@ class DefenseRuntime:
     # aggregate streak as well so switching between two attackers does not
     # reset a demonstrably failed escape strategy forever.
     consecutive_evade_failures: int = 0
+    # Highest protected escape floor during the current threat episode. Keep
+    # repeated failed routes from ratcheting the next floor downward.
+    escape_floor: Optional[float] = None
 
     def record_evade_result(self, entity_id: Optional[int], escaped: bool) -> None:
         """Track a run_away() outcome against one specific threat."""
@@ -123,6 +126,8 @@ class DefenseRuntime:
         if mode != self.mode:
             self.mode = mode
             self.entered_at = now
+        if mode is DefenseMode.CLEAR:
+            self.escape_floor = None
         self.last_reason = reason
         if mode in (DefenseMode.ALERT, DefenseMode.EVADE, DefenseMode.ENGAGE):
             self.last_threat_at = now
@@ -267,7 +272,12 @@ def _conditional_is_active(
     return distance <= 3.5
 
 
-def _closing_speed(entity: Dict, player_state: Dict) -> float:
+def _closing_speed(
+    entity: Dict,
+    player_state: Dict,
+    *,
+    ignore_grounded_vertical_velocity: bool = False,
+) -> float:
     position = entity.get("position") or {}
     player = player_state.get(
         "block_position",
@@ -282,10 +292,15 @@ def _closing_speed(entity: Dict, player_state: Dict) -> float:
         distance = math.sqrt(dx * dx + dy * dy + dz * dz)
         if distance < 0.01:
             return 0.0
+        player_vertical_velocity = (
+            0.0
+            if ignore_grounded_vertical_velocity
+            else float(player_velocity.get("y", 0))
+        )
         radial_velocity = (
             (float(velocity.get("x", 0)) - float(player_velocity.get("x", 0)))
             * dx
-            + (float(velocity.get("y", 0)) - float(player_velocity.get("y", 0)))
+            + (float(velocity.get("y", 0)) - player_vertical_velocity)
             * dy
             + (float(velocity.get("z", 0)) - float(player_velocity.get("z", 0)))
             * dz
@@ -295,26 +310,182 @@ def _closing_speed(entity: Dict, player_state: Dict) -> float:
         return 0.0
 
 
+def _creeper_below_work_floor(entity, state, distance, closing):
+    """Recognize a hidden cave creeper without lowering same-level clearance."""
+    try:
+        if any(key in entity and entity[key] is not False
+               for key in ("is_attacking", "angry_at_player")):
+            return False
+        vectors = (entity["position"], state.get("position", state.get("block_position")))
+        if any(
+            isinstance(vector[axis], bool) or not isinstance(vector[axis], (int, float))
+            or not math.isfinite(vector[axis])
+            for vector in vectors for axis in ("x", "y", "z")
+        ):
+            return False
+        mob, player = vectors
+        observed = math.dist(
+            [mob[axis] for axis in ("x", "y", "z")],
+            [player[axis] for axis in ("x", "y", "z")],
+        )
+        return (player["y"] - mob["y"] >= 5.0 and distance > 5.0
+                and observed > 5.0 and abs(distance - observed) <= 0.25
+                and closing <= 0.05)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+#: Vanilla gravity a grounded entity reports every tick (-0.0784 Y).
+_GROUNDED_FALL = 0.0785
+
+
+def _settled(entity):
+    """Drop a mob's grounded-gravity Y velocity, as #88 did for the player.
+
+    Grounded gravity alone must not make a stationary mob look closer.
+    """
+    try:
+        velocity = entity["velocity"]
+        if -_GROUNDED_FALL <= float(velocity["y"]) <= 0.0:
+            return {**entity, "velocity": {**velocity, "y": 0.0}}
+    except (KeyError, TypeError, ValueError):
+        pass
+    return entity
+
+
+def _sealed_above(entity, state, distance):
+    """A blind, calm mob standing on a ceiling over the player's head.
+
+    Feet three blocks over the player's leave a block between the mob and
+    the player's head space; its jumps and steps stay inside its pocket,
+    so only sideways approach counts. Fuse and melee range stay
+    actionable, and the reported distance must match the positions. The
+    separation is measured from the live position, so a player stepping
+    up its staircase need not be grounded.
+    """
+    try:
+        mob, player = entity["position"], state.get("position", state.get("block_position"))
+        velocity = entity["velocity"]
+        values = [velocity["x"], velocity["z"]] + [state["velocity"][axis] for axis in ("x", "y", "z")] + [
+            vector[axis] for vector in (mob, player) for axis in ("x", "y", "z")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in values):
+            return False
+        observed = math.dist([mob[axis] for axis in ("x", "y", "z")],
+                             [player[axis] for axis in ("x", "y", "z")])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    dx, dz = player["x"] - mob["x"], player["z"] - mob["z"]
+    across = math.hypot(dx, dz)
+    approach = (velocity["x"] * dx + velocity["z"] * dz) / across if across > 0 else 0.0
+    return (mob["y"] - player["y"] >= 3.0 and distance > 3.0
+            and abs(distance - observed) <= 0.25 and approach <= 0.1)
+
+
 def _occluded_calm_mob(entity, state, entity_type, profile, distance, closing):
     """Keep shelter only on explicit, fresh evidence of a non-actionable mob.
 
     A nearby cave mob must not drive the player out of a safe work area.
-    Unknown telemetry, contact, pursuit, explosives, bosses, and wall-crossing
-    vexes retain the conservative policy; every snapshot reassesses visibility.
+    Unknown telemetry, contact, pursuit, other explosives, bosses, and
+    wall-crossing vexes retain the conservative policy; every snapshot
+    reassesses visibility.
     """
-    if not (
+    # Creepers are normally avoid-only, but a creeper that is positively
+    # observed as calm, occluded, stationary, and well outside fuse range is
+    # not an actionable threat.  Without this narrow exception, an idle
+    # creeper just beyond the 10m action radius can keep the controller in an
+    # evade/relocate loop forever.  Explosives remain fail-closed when any of
+    # those observations are missing or uncertain.
+    calm_creeper = entity_type == "creeper"
+    stationary_creeper = False
+    vertically_separated = False
+    sealed = _sealed_above(entity, state, distance)
+    if calm_creeper and not sealed:
+        # Fabric can report vanilla grounded gravity (-0.0784 Y velocity)
+        # even while `is_on_ground` is true. That artificial vertical component
+        # made a stationary creeper below the player look like it was closing.
+        # Only suppress it for an explicitly grounded player with a complete,
+        # finite velocity vector; airborne and unknown states stay fail-closed.
+        if state.get("is_on_ground") is not True:
+            return False
+        try:
+            player_velocity = state["velocity"]
+            if not all(math.isfinite(float(player_velocity[axis])) for axis in ("x", "y", "z")):
+                return False
+            grounded_vertical_velocity = float(player_velocity["y"])
+            if not -0.1 <= grounded_vertical_velocity <= 0.05:
+                return False
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        try:
+            velocity = _settled(entity)["velocity"]
+            components = [float(velocity[axis]) for axis in ("x", "y", "z")]
+            stationary_creeper = (
+                all(math.isfinite(component) for component in components)
+                and math.sqrt(sum(component * component for component in components)) <= 0.05
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        closing = _closing_speed(
+            _settled(entity), state, ignore_grounded_vertical_velocity=True
+        )
+    elif (
         profile.style in (AttackStyle.MELEE, AttackStyle.RANGED)
+        and state.get("is_on_ground") is True
+    ):
+        # Occluded mobs several blocks below the surface can move laterally
+        # without being able to reach the player. Require complete fresh
+        # player velocity here so airborne falls and unknown ground state
+        # retain the normal closing-speed policy.
+        try:
+            mob_y = float(entity["position"]["y"])
+            player_y = float(
+                state.get("block_position", state.get("position"))["y"]
+            )
+            player_velocity = state["velocity"]
+            velocity_is_finite = all(
+                math.isfinite(float(player_velocity[axis]))
+                for axis in ("x", "y", "z")
+            )
+            vertically_separated = (
+                velocity_is_finite
+                and -0.1 <= float(player_velocity["y"]) <= 0.05
+                and math.isfinite(mob_y)
+                and math.isfinite(player_y)
+                and player_y - mob_y >= 6.0
+            )
+            if velocity_is_finite and -0.1 <= float(player_velocity["y"]) <= 0.05:
+                # A grounded player is reported falling at -0.0784. With a
+                # sealed mob four blocks below, that phantom fall read as
+                # ~0.06 closing, over the 0.05 limit: live A1 2026-10-16 froze
+                # for 35+ minutes beside a buried, blind, motionless skeleton.
+                # The mob's own motion still counts, as for creepers.
+                closing = _closing_speed(_settled(entity), state, ignore_grounded_vertical_velocity=True)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            vertically_separated = False
+    if not (
+        (profile.style in (AttackStyle.MELEE, AttackStyle.RANGED) or calm_creeper)
         and entity_type not in _PROJECTILE_TYPES | {"vex"}
         and entity.get("can_see_player") is False
         and entity.get("is_aggressive") is False
+        and not any(entity.get(key) is True for key in ("is_attacking", "angry_at_player"))
         and _explicit_aggression(entity, state) is False
-        and math.isfinite(distance) and 5.0 < distance < 999.0
-        and closing <= 0.05
+        and math.isfinite(distance)
+        and distance < 999.0
+        and (sealed or (
+            (distance > (6.0 if calm_creeper else 5.0)
+             or (calm_creeper and _creeper_below_work_floor(entity, state, distance, closing)))
+            and (not calm_creeper or stationary_creeper)
+            and (closing <= 0.05 or vertically_separated or stationary_creeper)))
     ):
         return False
     target = entity.get("target_id")
     if target is not None and target == state.get("entity_id", state.get("player_id")):
         return False
+    if calm_creeper:
+        # Do not suppress a creeper with an ambiguous target.
+        if target is not None:
+            return False
     vectors = [entity.get("position"), entity.get("velocity"),
                state.get("block_position", state.get("position"))]
     if "velocity" in state:
@@ -431,6 +602,8 @@ def choose_defense_action(
 ) -> DefenseDecision:
     """Choose a conservative action while retaining post-fight hysteresis."""
     now = time.monotonic() if now is None else now
+    if not threats:
+        runtime.escape_floor = None
     if health < 12.0:
         if threats and threats[0].distance <= 12.0:
             return DefenseDecision(

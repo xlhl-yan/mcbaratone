@@ -270,11 +270,16 @@ def ensure_torches(client: Any, state: Any, wanted: int, anchor) -> int:
     from ..common import harness_ops
     from ..common.inventory import craft
     from ..common.livestock_food import _home_furnace
-    from ..common.resources import gather_wood
+    from .charcoal_wood import gather_charcoal_logs
 
     def torches() -> int:
         return _count(client, "minecraft:torch")
 
+    if torches() >= wanted:
+        return torches()
+    from .torch_recovery import retrieve_torch_supplies
+
+    retrieve_torch_supplies(client, state, wanted, anchor)
     if torches() >= wanted:
         return torches()
     fuel_needed = math.ceil((wanted - torches()) / 4)
@@ -282,15 +287,7 @@ def ensure_torches(client: Any, state: Any, wanted: int, anchor) -> int:
         logs_needed = fuel_needed - _fuel(client) + 2  # +2 for planks and sticks
         carried_logs = sum(_count(client, log) for log in _log_items())
         if carried_logs < logs_needed:
-            gather_wood(
-                client,
-                count=logs_needed,
-                timeout=180,
-                latest_world_time=11500,
-                max_distance_from_origin=48.0,
-                abort_on_threats=True,
-                minimum_health=MIN_HEALTH,
-            )
+            gather_charcoal_logs(client, state, logs_needed - carried_logs, anchor)
         pair = _carried_log(client)
         planks, plank_item = _planks(client)
         if pair is not None and planks < 4:

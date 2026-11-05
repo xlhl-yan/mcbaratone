@@ -321,6 +321,8 @@ def test_ore_gather_recounts_drops_when_pathing_stops(monkeypatch):
     class OreTransport(RecordingTransport):
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return {"is_pathing": False}
             return {}
@@ -530,6 +532,8 @@ def test_ore_gather_retry_bounded_to_three_safe_exact_targets(monkeypatch):
 
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return next(self.states)
             return {}
@@ -617,6 +621,8 @@ def test_ore_gather_restarts_after_one_safe_descent(monkeypatch):
     class OreTransport(RecordingTransport):
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return {"is_pathing": False, "food_level": 20}
             return {}
@@ -658,6 +664,8 @@ def test_ore_gather_relocates_from_wet_column_before_final_descent(monkeypatch):
     class OreTransport(RecordingTransport):
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return {"is_pathing": False, "food_level": 20}
             return {}
@@ -1141,6 +1149,8 @@ def test_bounded_wood_gather_stops_at_expedition_radius(monkeypatch):
     class RadiusTransport(RecordingTransport):
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return {
                     "world_time": 1000,
@@ -1174,6 +1184,8 @@ def test_wood_gather_aborts_after_aquatic_safety_intervention(monkeypatch):
     class SwampTransport(RecordingTransport):
         def dispatch(self, route, payload):
             self.calls.append((route, payload))
+            if route == "get_inventory":
+                return {"inventory": [], "armor": [], "offhand": []}
             if route == "get_state":
                 return {
                     "world_time": 1000,

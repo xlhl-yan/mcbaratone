@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Callable, Optional
 
@@ -148,8 +149,13 @@ def excavate_surface_egress(
     origin: tuple[int, int, int],
     expected_y: int,
     timeout_per_attempt: float = 45.0,
+    avoid: Optional[tuple[float, float, float]] = None,
+    avoid_radius: float = 0.0,
 ) -> Optional[tuple[int, int, int]]:
-    """Tunnel diagonally upward when walk-only and ``#surface`` routes fail."""
+    """Tunnel diagonally upward when walk-only and ``#surface`` routes fail.
+
+    Targets within ``avoid_radius`` of ``avoid`` (a house) are skipped.
+    """
     ox, oy, oz = origin
     for command in (
         "#set allowBreak true",
@@ -159,6 +165,8 @@ def excavate_surface_egress(
         client.transport.dispatch("chat", {"message": command})
     for dx, dz in ((8, 0), (-8, 0), (0, 8), (0, -8)):
         target = {"x": ox + dx, "y": expected_y, "z": oz + dz, "radius": 2}
+        if avoid is not None and math.hypot(target["x"] - avoid[0], target["z"] - avoid[2]) <= avoid_radius:
+            continue
         print(
             "  Surface routes were unreachable; excavating an upward egress "
             f"toward ({target['x']}, {target['y']}, {target['z']})"

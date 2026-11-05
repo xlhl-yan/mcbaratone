@@ -334,7 +334,8 @@ def test_defensive_recovery_requires_a_measured_hostile_reduction(monkeypatch):
 
     assert result.success
     assert (result.before, result.after) == (2, 0)
-    assert state.custom_data["productive_work"]["no_progress_streak"] == 0
+    # Escaping a threat is safety recovery; it does not advance production.
+    assert state.custom_data["productive_work"]["no_progress_streak"] == 1
 
 
 def test_iron_role_selects_bounded_mining_after_initial_setup_even_at_night():

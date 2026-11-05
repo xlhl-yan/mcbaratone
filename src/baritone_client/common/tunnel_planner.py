@@ -238,6 +238,7 @@ def plan(
     surface_y: int,
     *,
     max_cost: float = 250.0,
+    protected_floors: Iterable[Cell] = (),
 ) -> Optional[List[Move]]:
     """Cheapest safe path from ``start`` to any goal cell, or ``None``.
 
@@ -251,7 +252,10 @@ def plan(
         return None
     best: Dict[Cell, float] = {start: 0.0}
     came: Dict[Cell, Tuple[Cell, Move]] = {}
-    floors: Dict[Cell, frozenset] = {start: frozenset()}
+    # A trip may plan in several batches. Floors supporting the route from
+    # earlier batches are just as important as floors laid down in this path.
+    initial_floors = frozenset(protected_floors)
+    floors: Dict[Cell, frozenset] = {start: initial_floors}
     dug: Dict[Cell, frozenset] = {start: frozenset()}
     heap: List[Tuple[float, Cell]] = [(0.0, start)]
     reached: Optional[Cell] = None
@@ -290,12 +294,14 @@ def plan(
         node, move = came[node]
         path.append(move)
     path.reverse()
-    return path if path_is_consistent(path) else None
+    return path if path_is_consistent(path, protected_floors=initial_floors) else None
 
 
-def path_is_consistent(path: Sequence[Move]) -> bool:
-    """No move may dig the floor a previous move stands on."""
-    floors: Set[Cell] = set()
+def path_is_consistent(
+    path: Sequence[Move], *, protected_floors: Iterable[Cell] = ()
+) -> bool:
+    """No move may dig a prior or protected route floor."""
+    floors: Set[Cell] = set(protected_floors)
     dug: Set[Cell] = set()
     for move in path:
         if any(cell in floors for cell in move.dig):

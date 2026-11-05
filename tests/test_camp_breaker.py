@@ -98,6 +98,55 @@ def test_a_failed_break_keeps_the_streak_so_it_retries():
     assert camp_breaker.should_break_camp(state)
 
 
+def _attempt(escalation_level):
+    return SimpleNamespace(escalation_level=escalation_level)
+
+
+def test_low_escalation_never_breaks_camp():
+    """Below the fleet-aid threshold, this must not touch movement at all."""
+    state = _state()
+    targets = []
+
+    assert not camp_breaker.self_rescue_if_escalated(
+        _client(), state, _attempt(camp_breaker.ESCALATION_SELF_RESCUE_THRESHOLD - 1),
+        goto=lambda _c, x, y, z, **_k: targets.append((x, y, z)) or True,
+    )
+    assert targets == []
+
+
+def test_high_escalation_self_rescues_with_no_fleet_to_ask():
+    """mutual_aid.py's own threshold: a solo bot has nobody else to wait for.
+
+    Repeated defensive work must not leave a solo worker waiting forever
+    for assistance from a fleet that is not available.
+    """
+    state = _state()
+    targets = []
+
+    moved = camp_breaker.self_rescue_if_escalated(
+        _client(), state, _attempt(camp_breaker.ESCALATION_SELF_RESCUE_THRESHOLD),
+        goto=lambda _c, x, y, z, **_k: targets.append((x, y, z)) or True,
+    )
+
+    assert moved is True
+    (tx, _ty, tz), = targets
+    distance = max(abs(tx - 100), abs(tz - (-200)))
+    assert distance == camp_breaker.CAMP_BREAK_DISTANCE
+
+
+def test_self_rescue_failure_is_swallowed_not_raised():
+    """A broken relocation must never take the whole scheduler down with it."""
+    state = _state()
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("bridge unavailable")
+
+    assert not camp_breaker.self_rescue_if_escalated(
+        _client(), state, _attempt(camp_breaker.ESCALATION_SELF_RESCUE_THRESHOLD),
+        goto=_boom,
+    )
+
+
 def test_measured_relocation_clears_streak_when_route_reports_failure():
     state = _state()
     for _ in range(camp_breaker.CAMP_HOLD_LIMIT):

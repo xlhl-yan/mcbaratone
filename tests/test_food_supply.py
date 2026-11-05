@@ -10,6 +10,7 @@ def _state(data):
 
 def _inventory(monkeypatch, counts):
     monkeypatch.setattr(food_supply, "get_inventory", lambda _client: dict(counts))
+    monkeypatch.setattr(food_supply, "_bread_output_capacity", lambda _client: 128)
     monkeypatch.setattr(food_supply, "_survival_ready", lambda _client: True)
     monkeypatch.setattr(
         food_supply,
@@ -138,6 +139,30 @@ def test_harvest_and_bank_are_credited_only_by_inventory_delta(monkeypatch):
     result = food_supply.run_food_cycle(object(), _state({"wheat_farm": {"origin": [0, 64, 0]}}))
     assert (result.wheat_harvested, result.prepared_food_banked) == (4, 2)
     assert result.total_food_banked == 2
+
+
+def test_direct_crop_harvest_is_progress_but_not_wheat_or_bread(monkeypatch):
+    counts = {"minecraft:carrot": 1, "minecraft:wheat": 0}
+    monkeypatch.setattr(food_supply, "get_inventory", lambda _client: dict(counts))
+    monkeypatch.setattr(food_supply, "_survival_ready", lambda _client: True)
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        food_supply, "harvest_wheat_farm",
+        lambda *_a, **_k: counts.__setitem__("minecraft:carrot", 4) or True,
+    )
+    monkeypatch.setattr(food_supply, "_stock_seeds", lambda *_a, **_k: 0)
+    monkeypatch.setattr(food_supply, "establish_wheat_farm", lambda *_a, **_k: None)
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+
+    result = food_supply.run_food_cycle(
+        object(), _state({"wheat_farm": {"origin": [0, 64, 0]}})
+    )
+
+    assert result.success
+    assert result.other_edible_crops_harvested == 3
+    assert result.total_other_edible_crops_harvested == 3
+    assert result.wheat_harvested == 0
+    assert result.bread_crafted == 0
 
 
 def test_known_plot_inspection_is_round_robin_and_bounded(monkeypatch):
@@ -320,6 +345,105 @@ def test_exhausted_empty_frontier_is_reopened_once_after_setup_repair():
     assert candidate == (578, 79, -304)
     assert worker["failed_plot_sites"] == []
     assert worker["failed_site_reset_anchor"] == list(anchor)
+
+
+def test_exhausted_frontier_reopens_with_an_existing_unproductive_plot():
+    anchor = (100, 70, 100)
+    rejected = [[132, 70, 100], [100, 70, 132], [68, 70, 100], [100, 70, 68]]
+    worker = {
+        "failed_plot_sites": rejected, "expansion_cursor": 10000,
+        "failed_site_reset_anchor": list(anchor),
+        "exhausted_frontier_streak": food_supply.EXHAUSTED_FRONTIER_RETRY_STREAK - 1,
+    }
+    assert food_supply._next_plot_candidate(anchor, [anchor], worker, 32, 3) == (132, 70, 100)
+    assert worker["failed_plot_sites"] == []
+
+
+def test_last_three_wheat_are_food_not_a_permanent_uncraftable_reserve(monkeypatch):
+    counts = {food_supply.WHEAT: 3, food_supply.SEEDS: 8}
+    _inventory(monkeypatch, counts)
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(food_supply, "_stock_seeds", lambda *_a: 0)
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+
+    def craft(_client, item, amount):
+        assert item == food_supply.BREAD and amount == 1
+        counts[food_supply.WHEAT] = 0
+        counts[food_supply.BREAD] = 1
+        return True
+
+    monkeypatch.setattr(food_supply, "craft", craft)
+    monkeypatch.setattr(
+        food_supply,
+        "craft_bread_at_saved_home",
+        lambda _client, _state, _anchor, amount, **kwargs:
+            kwargs["craft"](object(), food_supply.BREAD, amount),
+    )
+    result = food_supply.run_food_cycle(object(), _state({}))
+    assert result.success and result.bread_crafted == 1
+
+
+def test_failed_home_workstation_does_not_erase_harvest_credit(monkeypatch):
+    counts = {food_supply.WHEAT: 0, food_supply.BREAD: 0}
+    _inventory(monkeypatch, counts)
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        food_supply, "harvest_wheat_farm",
+        lambda *_a, **_k: counts.__setitem__(food_supply.WHEAT, 7) or True,
+    )
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+    home_anchor = (10, 65, 10)
+    state = _state({
+        "base_location": list(home_anchor),
+        "food_worker": {"farm_plots": [{"origin": list(home_anchor)}]},
+    })
+    client = SimpleNamespace(transport=SimpleNamespace(dispatch=lambda *_a: {
+        "block_position": {"x": 10, "y": 65, "z": 10},
+    }))
+    attempted = []
+
+    def refused(_client, _state, anchor, count, **_kwargs):
+        attempted.append((anchor, count))
+        return False  # unknown/unreachable home workstation
+
+    monkeypatch.setattr(food_supply, "craft_bread_at_saved_home", refused)
+    result = food_supply.run_food_cycle(client, state)
+
+    assert attempted == [(home_anchor, 2)]
+    assert result.wheat_harvested == 7 and result.bread_crafted == 0
+    assert counts[food_supply.WHEAT] == 7 and counts[food_supply.BREAD] == 0
+
+
+def test_food_cycle_does_not_leave_house_through_unverified_closed_door(monkeypatch):
+    _inventory(monkeypatch, {"minecraft:wheat": 0, "minecraft:wheat_seeds": 8})
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        food_supply, "prepare_house_door_for_departure", lambda *_a: False
+    )
+    monkeypatch.setattr(
+        food_supply, "harvest_wheat_farm",
+        lambda *_a, **_k: pytest.fail("farm travel must wait for a verified doorway"),
+    )
+    state = _state({
+        "base_location": [10, 65, 10],
+        "structures": {"starter_house": {"origin": [9, 65, 9]}},
+    })
+    client = SimpleNamespace(transport=SimpleNamespace(dispatch=lambda *_a: {}))
+
+    result = food_supply.run_food_cycle(client, state)
+
+    assert not result.success
+    assert "door" in result.detail
+
+
+def test_farm_expansion_rejects_cave_soil_and_returns_home(monkeypatch):
+    monkeypatch.setattr(food_supply, "_approach_candidate", lambda *_a: None)
+    monkeypatch.setattr(food_supply, "find_farm_surface_near", lambda *_a: (32, 50, 0))
+    returned = []
+    monkeypatch.setattr(food_supply, "_return_to_anchor", lambda _c, anchor: returned.append(anchor) or True)
+    monkeypatch.setattr(food_supply, "establish_wheat_farm", lambda *_a, **_k: pytest.fail("no cave farm"))
+    assert food_supply._establish_candidate(object(), _state({"base_location": [0, 70, 0]}), (32, 70, 0), 5) is None
+    assert returned == [(0, 70, 0)]
 
 
 def test_exhausted_frontier_reopens_again_after_the_one_shot_reset_is_spent():
@@ -642,3 +766,73 @@ def test_first_plot_does_not_reuse_flowing_water_as_irrigation(monkeypatch):
 
     assert food_supply._establish_candidate(client, state, None, 5) is None
     assert lookups == [{"radius": 20}]
+
+
+@pytest.mark.parametrize("intervened", [False, True])
+def test_return_home_allows_recovery_movement_but_keeps_defense(monkeypatch, intervened):
+    from baritone_client.common import combat, navigation
+    client = SimpleNamespace()
+    defended = []
+    monkeypatch.setattr(combat, "defend_or_flee", lambda c, **kw: defended.append((c, kw)) or intervened)
+    def goto(c, x, y, z, **kw):
+        assert c is client and (x, y, z) == (0, 70, 0)
+        assert kw["timeout"] == food_supply.RETURN_HOME_TIMEOUT
+        return not kw["on_defense"]()
+    monkeypatch.setattr(navigation, "goto", goto)
+    assert food_supply._return_to_anchor(client, (0, 70, 0)) is (not intervened)
+    assert defended == [(client, {"allow_safe_recovery_movement": True})]
+
+
+def test_carried_wheat_becomes_verified_bread_before_any_farm_departure(monkeypatch):
+    counts = {food_supply.WHEAT: 6, food_supply.BREAD: 1}
+    _inventory(monkeypatch, counts)
+    st = _state({"base_location": [0, 70, 0], "wheat_farm": {"origin": [30, 70, 0]},
+                 "food_worker": {"bread_crafted": 5, "cycles": 3}})
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(food_supply, "prepare_house_door_for_departure", lambda *_a: pytest.fail("use carried grain before leaving"))
+    def craft_home(_client, state, anchor, count, **_kwargs):
+        assert state is st and anchor == (0, 70, 0) and count == 2
+        counts[food_supply.WHEAT] -= 6
+        counts[food_supply.BREAD] += 2
+        return True
+    monkeypatch.setattr(food_supply, "craft_bread_at_saved_home", craft_home)
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+    result = food_supply.run_food_cycle(object(), st)
+    assert result.success and result.bread_crafted == 2 and result.wheat_harvested == 0
+    assert result.total_bread_crafted == 7 and st.custom_data["food_worker"]["cycles"] == 4
+
+
+@pytest.mark.parametrize("safe", [True, False])
+def test_carried_grain_gets_no_production_credit_without_inventory_change(monkeypatch, safe):
+    counts = {food_supply.WHEAT: 6, food_supply.BREAD: 1}
+    _inventory(monkeypatch, counts)
+    monkeypatch.setattr(food_supply, "_survival_ready", lambda *_a: safe)
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    attempted = []
+    monkeypatch.setattr(food_supply, "craft_bread_at_saved_home", lambda *_a, **_k: attempted.append(True) or True)
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+    monkeypatch.setattr(food_supply, "prepare_house_door_for_departure", lambda *_a: False)
+    st = _state({"base_location": [0, 70, 0]})
+    result = food_supply.run_food_cycle(object(), st)
+    assert not result.success and result.bread_crafted == 0
+    assert attempted == ([True] if safe else [])
+    assert st.custom_data["food_worker"].get("bread_crafted", 0) == 0
+
+
+@pytest.mark.parametrize("gain", [0, 4])
+def test_seed_surplus_is_shed_at_the_farm_only_after_a_harvest(monkeypatch, gain):
+    """Each harvest returns more seed than replanting uses; A1 carried 548."""
+    counts = {"minecraft:wheat": 0, "minecraft:bread": 10}
+    monkeypatch.setattr(food_supply, "get_inventory", lambda _client: dict(counts))
+    monkeypatch.setattr(food_supply, "_survival_ready", lambda _client: True)
+    monkeypatch.setattr(food_supply, "eat_until_hunger", lambda *_a, **_k: True)
+    monkeypatch.setattr(food_supply, "harvest_wheat_farm",
+                        lambda *_a, **_k: counts.__setitem__("minecraft:wheat", gain) or True)
+    monkeypatch.setattr(food_supply, "local_farm_wait_reason", lambda *_a: "growing wheat")
+    monkeypatch.setattr(food_supply, "craft", lambda *_a, **_k: False)
+    monkeypatch.setattr(food_supply, "resolve_storage_location", lambda *_a, **_k: None)
+    shed = []
+    monkeypatch.setattr(food_supply, "shed_surplus_seeds", lambda client: shed.append(client) or 0)
+    client = SimpleNamespace(transport=SimpleNamespace(dispatch=lambda *_a: {}))
+    food_supply.run_food_cycle(client, _state({"wheat_farm": {"origin": [0, 64, 0]}}))
+    assert shed == ([client] if gain else [])

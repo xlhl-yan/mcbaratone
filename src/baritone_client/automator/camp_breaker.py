@@ -182,10 +182,36 @@ def note_hold(client: Any, state: Any, reason: str) -> bool:
     return break_camp(client, state)
 
 
+#: mutual_aid.py raises a fleet-aid request at this same threshold; a solo
+#: bot has no fleet to answer it, so this is the self-rescue fallback.
+ESCALATION_SELF_RESCUE_THRESHOLD = 3
+
+
+def self_rescue_if_escalated(
+    client: Any, state: Any, attempt: Any, *, goto: Any = None
+) -> bool:
+    """Break camp once work_progress reports sustained no-progress escalation.
+
+    Repeated defensive work can monopolize the scheduler without changing
+    the environment. A solo worker needs a bounded local fallback when
+    repeated no-progress attempts would otherwise request fleet assistance.
+    """
+    level = int(getattr(attempt, "escalation_level", 0) or 0)
+    if level < ESCALATION_SELF_RESCUE_THRESHOLD:
+        return False
+    try:
+        return break_camp(client, state, goto=goto)
+    except Exception as exc:  # best-effort; never kill the scheduler
+        print(f"  Escalation self-rescue failed: {exc}")
+        return False
+
+
 __all__ = [
     "note_hold",
+    "self_rescue_if_escalated",
     "CAMP_HOLD_LIMIT",
     "CAMP_BREAK_DISTANCE",
+    "ESCALATION_SELF_RESCUE_THRESHOLD",
     "break_camp",
     "clear_holds",
     "hold_streak",

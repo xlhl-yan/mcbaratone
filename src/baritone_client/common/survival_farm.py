@@ -20,6 +20,21 @@ from .navigation import allow_recovery_navigation
 SURVIVAL_FARM_REACH = 16.0
 #: The survival loop calls this every few seconds; the farm needs minutes.
 SURVIVAL_FARM_INTERVAL = 60.0
+#: Below the 14-food work gate a bot with no carried food could never reach
+#: the farm that bakes its bread: A1 sat in that loop from 2026-10-18 06:00
+#: for two days. Healthy and not starving is enough for the home farm.
+HOME_FARM_HEALTH = 12.0
+HOME_FARM_FOOD = 6
+
+
+def fed_enough_for_home_farm(client: Any) -> bool:
+    """Whether a bot that could not eat may still tend its own farm."""
+    live = client.transport.dispatch("get_state", {})
+    try:
+        return (float(live.get("health", 0) or 0) >= HOME_FARM_HEALTH
+                and int(live.get("food_level", live.get("food", 0)) or 0) >= HOME_FARM_FOOD)
+    except (AttributeError, TypeError, ValueError):
+        return False
 #: Plots are 5x5 around a water center (see ``establish_wheat_farm``).
 _HALF = 2
 _MATURE_WHEAT_AGE = "7"

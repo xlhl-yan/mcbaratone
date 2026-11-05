@@ -19,7 +19,8 @@ def test_native_crop_process_holds_digging_guard_and_restores_after_stop(dies):
                 settings["value"] = payload["value"]
             return dict(settings)
         if route == "get_state":
-            return {"is_pathing": False}
+            return {"is_pathing": False, "health": 20, "air_supply": 300,
+                    "block_position": {"x": 0, "y": 65, "z": 0}}
         if route == "farm":
             farm_calls.append(settings["value"])
             if dies:

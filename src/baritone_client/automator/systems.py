@@ -70,8 +70,15 @@ class SafetySystem(BackgroundSystem):
     - Emits critical events
     """
     
-    def __init__(self, client, coordination_hub: CoordinationHub, resources=None):
+    def __init__(
+        self,
+        client,
+        coordination_hub: CoordinationHub,
+        resources=None,
+        state_manager=None,
+    ):
         super().__init__(client, coordination_hub, "SafetySystem", interval=1.0, resources=resources)
+        self.state_manager = state_manager
         self.low_health_threshold = 8.0  # 4 hearts
         self._last_health = 20.0
 
@@ -79,6 +86,13 @@ class SafetySystem(BackgroundSystem):
         try:
             # Poll player state - transport is thread-safe via RLock
             state = self.client.transport.dispatch("get_state", {}, timeout=1.0)
+
+            if self.state_manager is not None:
+                # Refresh the protected surface anchor from checkpointed
+                # state before ambient defense can select a flee destination.
+                from ..common.home_surface import bind_home_surface
+
+                bind_home_surface(self.client, self.state_manager)
             
             health = state.get("health", 20.0)
             
@@ -273,7 +287,7 @@ class HungerSystem(BackgroundSystem):
             if food_level < self.min_food_level and not (
                 food_level > self.HUNGER_URGENT and self._container_open()
             ):
-                self.try_eat(food_level)
+                self.try_eat(food_level, health=state.get("health"))
 
             # Broadcast critical event if food is VERY low
             crit_threshold = 6
@@ -291,7 +305,7 @@ class HungerSystem(BackgroundSystem):
             logger.error(f"Hunger Check Failed: {e}")
 
     @exclusive_client_action
-    def try_eat(self, current_food: int):
+    def try_eat(self, current_food: int, *, health=None):
         """Attempt to find food and eat it."""
         from .actions import EatAction
         
@@ -302,29 +316,13 @@ class HungerSystem(BackgroundSystem):
         
         try:
             inventory_data = self.client.transport.dispatch("get_inventory", {})
-            all_items = inventory_data.get("inventory", []) + inventory_data.get("offhand", [])
-            
-            best_food = None
-            
-            # Create a localized map of available items
-            available_items = set()
-            for item in all_items:
-                if item.get("count", 0) > 0:
-                    available_items.add(item.get("id"))
-            
-            # Determine if we're desperate (very low food)
-            is_desperate = current_food <= 2
-            
-            # Find highest priority food present
-            for food_id in self.food_priority:
-                if food_id in available_items:
-                    # Skip desperate-only foods unless we're starving
-                    if food_id in self.desperate_only_foods and not is_desperate:
-                        continue
-                    if food_id in self.cook_first_foods and current_food > self.raw_meat_food_floor:
-                        continue
-                    best_food = food_id
-                    break
+            from .hunger_food import choose_food
+
+            best_food = choose_food(
+                inventory_data, self.food_priority, self.desperate_only_foods,
+                self.cook_first_foods, current_food, health,
+                raw_meat_food_floor=self.raw_meat_food_floor,
+            )
             
             if best_food:
                 if best_food in self.desperate_only_foods:

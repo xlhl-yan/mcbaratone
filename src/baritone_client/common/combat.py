@@ -28,11 +28,13 @@ from .emergency_food import (
     wait_for_safe_regeneration,
 )
 from .health_recovery import recover_health
+from .water_hazards import restore_water_routes, turn_back_at_fence
 from .movement_recovery import block_position
 from .passive_hunt_navigation import (
     PassiveHuntNavigation,
     find_unrequested_hostile,
 )
+from .airborne_threat_confirmation import handle_transient_airborne_creeper
 
 from ..core.exceptions import TransportError
 
@@ -511,6 +513,7 @@ def heal_if_needed(client, threshold: float = 10.0) -> bool:
 
 
 @allow_recovery_navigation
+@restore_water_routes
 def acquire_emergency_food(
     client,
     minimum_health: float = 12.0,
@@ -655,6 +658,8 @@ def acquire_emergency_food(
         if not enforce_dry_food_search_state(client, state, stop_exploring):
             return False
         exploration.observe(state)
+        if turn_back_at_fence(exploration, client, state):
+            continue
         if recovery_complete(state):
             stop_exploring()
             return True
@@ -790,11 +795,8 @@ def acquire_emergency_food(
 
         stop_exploring()
         outcome = hunt_target(
-            client,
-            target,
-            minimum_health=minimum_health,
-            recovery_complete=recovery_complete,
-            unreachable=unreachable_food,
+            client, target, minimum_health=minimum_health,
+            recovery_complete=recovery_complete, unreachable=unreachable_food,
         )
         if outcome is False:
             return False
@@ -1413,7 +1415,7 @@ def defend_or_flee(
     client,
     *,
     allow_safe_recovery_movement: bool = False,
-    observed_snapshot: Optional[Dict] = None,
+    observed_snapshot: Optional[Dict] = None, _skip_airborne_recheck: bool = False,
 ) -> bool:
     """Advance the canonical defensive state machine by one supervised tick."""
     client._last_defense_intervention = None
@@ -1510,6 +1512,10 @@ def defend_or_flee(
     )
     _stop_for_defense(client)
     if decision.mode == DefenseMode.EVADE:
+        if not _skip_airborne_recheck and handle_transient_airborne_creeper(
+            client, snapshot, primary, assessments, runtime, defend_or_flee,
+            allow_safe_recovery_movement):
+            return True
         threat_id = primary.entity.get("id")
         escaped = run_away(client, primary.entity)
         runtime.record_evade_result(threat_id, escaped)

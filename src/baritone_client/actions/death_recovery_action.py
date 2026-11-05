@@ -16,6 +16,7 @@ from ..common.combat import (
 )
 from ..common.inventory import get_inventory, reset_inventory_cache
 from ..common.surface_recovery import position_is_aquatic
+from ..common.water_hazards import fence_drowning_death
 from .rearm_safety import survivable_bootstrap_window
 from ..automator.state_manager import Phase
 from .death_recovery_state import (
@@ -645,9 +646,8 @@ class DeathRecoveryAction(BaseAction):
                 context.client, state
             )
             expected_critical = _critical_inventory(get_inventory(context.client))
-            recovery_state = context.state.custom_data.setdefault(
-                "death_recovery", {}
-            )
+            recovery_state = context.state.custom_data.setdefault("death_recovery", {})
+            fence_drowning_death(context.state, context.client, state, recovery_state, death_position, death_dimension)
             pending_location = recovery_state.get("pending_location")
             resuming_pending = (
                 isinstance(pending_location, (list, tuple))

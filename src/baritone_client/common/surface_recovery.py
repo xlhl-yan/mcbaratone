@@ -76,6 +76,10 @@ def _configure_surface_pathing(
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Apply upward and water-surface constraints before starting movement."""
+    from .water_hazards import allow_water
+
+    # Surfacing has to swim; a starving search may have banned water routes.
+    allow_water(client, sleep=sleep)
     for command in (
         "#set allowBreak true",
         "#set allowPlace true",

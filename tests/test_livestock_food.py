@@ -138,17 +138,21 @@ def test_full_reserve_does_not_hunt(world):
 
 def test_balanced_food_production_runs_livestock_before_wheat(monkeypatch):
     order = []
+    inventory = {}
+    def livestock_cycle(*_args, **kwargs):
+        order.append(("livestock", kwargs["target"]))
+        inventory["minecraft:cooked_beef"] = 6
+        return livestock_food.LivestockResult(True, "hunted 6 raw meat, cooked 6", 6, 6)
     monkeypatch.setattr(
         "baritone_client.common.livestock_food.run_livestock_food_cycle",
-        lambda *_a, **kwargs: order.append(("livestock", kwargs["target"]))
-        or livestock_food.LivestockResult(True, "hunted 6 raw meat, cooked 6", 6, 6),
+        livestock_cycle,
     )
     monkeypatch.setattr(
         "baritone_client.common.food_supply.run_food_cycle",
         lambda *_a, **_k: order.append(("wheat", None))
         or SimpleNamespace(success=False, detail="harvested 0 wheat"),
     )
-    monkeypatch.setattr(food_opportunity, "count_item", lambda *_a: 0)
+    monkeypatch.setattr(food_opportunity, "get_inventory", lambda *_a: dict(inventory))
 
     success, detail, _before, _after = food_opportunity.run_balanced_food_production(
         object(), SimpleNamespace(custom_data={})

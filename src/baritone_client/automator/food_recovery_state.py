@@ -1,5 +1,6 @@
 """Checkpoint-backed coordination for renewable food recovery."""
 
+import time
 from typing import Any, Callable, Mapping, Optional
 
 from ..common.combat import eat_until_hunger
@@ -20,6 +21,10 @@ _STORED_FOOD_TARGETS = {
     "minecraft:cooked_rabbit": 8,
     "minecraft:cooked_salmon": 8,
     "minecraft:golden_carrot": 8,
+    # Raw but edible. Live A1 2026-10-18..20 starved for two days with 3159
+    # carrots banked at home because this list never asked for them.
+    "minecraft:carrot": 16,
+    "minecraft:apple": 8,
     # Last resort, and deliberately included. The fleet had 199 rotten flesh
     # banked while bots starved at food 0, because withdrawal only ever asked
     # for good food. Eating it is already safe and already last in
@@ -58,7 +63,11 @@ def checkpointed_wheat_farm_origin(state: Any) -> Optional[tuple[int, int, int]]
 
     wheat_farm = custom.get("wheat_farm", {})
     canonical = wheat_farm.get("origin") if isinstance(wheat_farm, Mapping) else None
-    candidates = [canonical, custom.get("farm_location")]
+    worker = custom.get("food_worker", {})
+    plots = worker.get("farm_plots", []) if isinstance(worker, Mapping) else []
+    candidates = [p.get("origin") for p in plots if isinstance(p, Mapping)]
+    candidates.extend([canonical, custom.get("farm_location")])
+    holds = custom.get("crop_site_cooldowns", {})
 
     structures = custom.get("structures", {})
     source = structures.get("food_source", {}) if isinstance(structures, Mapping) else {}
@@ -77,7 +86,11 @@ def checkpointed_wheat_farm_origin(state: Any) -> Optional[tuple[int, int, int]]
         if retired is not None and list(candidate) == list(retired):
             continue
         try:
-            return tuple(int(float(value)) for value in candidate)
+            location = tuple(int(float(value)) for value in candidate)
+            key = ",".join(str(v) for v in location)
+            if isinstance(holds, Mapping) and float(holds.get(key, 0)) > time.time():
+                continue
+            return location
         except (TypeError, ValueError):
             continue
     return None

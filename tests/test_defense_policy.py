@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from baritone_client.actions.combat import CombatAction
+from baritone_client.automator.systems import SafetySystem
 from baritone_client.common import combat, escape_recovery
 from baritone_client.common.defense import (
     DefenseMode,
@@ -205,20 +207,27 @@ class EscapeTransport:
         self.hazardous_primary = hazardous_primary
         self.calls = []
         self.entity_reads = 0
+        self.setting = "true"
+        self.player_y = 64
 
-    def dispatch(self, route, payload):
+    def dispatch(self, route, payload, **_kwargs):
         self.calls.append((route, payload))
         if route == "get_state":
             return {
                 "health": 20,
                 "world_time": 13000,
-                "block_position": {"x": 0, "y": 64, "z": 0},
+                "block_position": {"x": 0, "y": self.player_y, "z": 0},
+                "is_pathing": False,
             }
+        if route == "settings":
+            if "set" in payload:
+                self.setting = payload["value"]
+            return {"value": self.setting}
         if route == "get_combat_snapshot":
             return {
                 "player": {
                     "health": 20,
-                    "block_position": {"x": -6, "y": 64, "z": 0},
+                    "block_position": {"x": -6, "y": self.player_y, "z": 0},
                 },
                 "entities": [],
                 "skipped_count": 0,
@@ -260,6 +269,163 @@ def test_run_away_rejects_lava_endpoint_before_pathing():
     goals = [payload for route, payload in transport.calls if route == "goal"]
     assert goals
     assert goals[0] != {"x": -30, "y": 64, "z": 0}
+
+
+def test_run_away_filters_drop_candidates_and_disables_excavation(monkeypatch):
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    client = SimpleNamespace(transport=transport)
+    candidates = [
+        EscapeCandidate(-30, 61, 0, 2.0),
+        EscapeCandidate(-31, 64, 0, 1.0),
+    ]
+    monkeypatch.setattr(combat, "scan_for_threats", lambda *_a, **_k: [threat])
+    monkeypatch.setattr(escape_recovery, "plan_escape_candidates", lambda *_a, **_k: candidates)
+    monkeypatch.setattr(escape_recovery, "destination_safe", lambda *_a, **_k: True)
+    observed_floor = []
+
+    def verify(*_args, **kwargs):
+        observed_floor.append(kwargs["minimum_y"])
+        return True
+
+    monkeypatch.setattr(escape_recovery, "verify_escape_from_threats", verify)
+
+    assert combat.run_away(client, threat, timeout=1)
+
+    goals = [payload for route, payload in transport.calls if route == "goal"]
+    assert goals == [{"x": -31, "y": 64, "z": 0}]
+    assert observed_floor == [62.0]
+    assert ("settings", {"set": "allowBreak", "value": "false"}) in transport.calls
+    assert transport.setting == "true"
+
+
+def test_fresh_safety_system_binds_checkpoint_home_for_escape_floor(monkeypatch):
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    transport.player_y = 72
+    client = SimpleNamespace(transport=transport)
+    state_manager = SimpleNamespace(custom_data={"base_location": [0, 70, 0]})
+    safety = SafetySystem(
+        client,
+        SimpleNamespace(broadcast=lambda _event: None),
+        state_manager=state_manager,
+    )
+
+    with patch("baritone_client.common.combat.defend_or_flee") as defend:
+        safety.tick()
+
+    defend.assert_called_once_with(client)
+    assert client._protected_home_anchor == (0.0, 70.0, 0.0)
+
+    candidates = [
+        EscapeCandidate(-30, 67, 0, 2.0),
+        EscapeCandidate(-31, 72, 0, 1.0),
+    ]
+    monkeypatch.setattr(combat, "scan_for_threats", lambda *_a, **_k: [threat])
+    monkeypatch.setattr(escape_recovery, "plan_escape_candidates", lambda *_a, **_k: candidates)
+    monkeypatch.setattr(escape_recovery, "destination_safe", lambda *_a, **_k: True)
+    monkeypatch.setattr(escape_recovery, "verify_escape_from_threats", lambda *_a, **_k: True)
+
+    assert combat.run_away(client, threat, timeout=1)
+    goals = [payload for route, payload in transport.calls if route == "goal"]
+    assert goals == [{"x": -31, "y": 72, "z": 0}]
+
+
+def test_run_away_does_not_start_when_allow_break_setting_is_unknown(monkeypatch):
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    transport.setting = "unknown"
+    client = SimpleNamespace(transport=transport)
+    monkeypatch.setattr(combat, "scan_for_threats", lambda *_a, **_k: [threat])
+
+    assert not combat.run_away(client, threat, timeout=1)
+    assert not any(route == "goal" for route, _payload in transport.calls)
+    assert client._last_escape_failure_reason == "error"
+
+
+def test_run_away_keeps_digging_disabled_when_stop_is_unverified(monkeypatch):
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    client = SimpleNamespace(transport=transport)
+    original_dispatch = transport.dispatch
+    state_reads = {"count": 0}
+
+    def dispatch(route, payload):
+        response = original_dispatch(route, payload)
+        if route == "get_state":
+            state_reads["count"] += 1
+            if state_reads["count"] > 1:
+                response["is_pathing"] = True
+        return response
+
+    monkeypatch.setattr(transport, "dispatch", dispatch)
+    monkeypatch.setattr(combat, "scan_for_threats", lambda *_a, **_k: [threat])
+    monkeypatch.setattr(escape_recovery, "verify_escape_from_threats", lambda *_a, **_k: True)
+
+    assert not combat.run_away(client, threat, timeout=1)
+    assert transport.setting == "false"
+    assert client._last_escape_failure_reason == "route_stop_unverified"
+    assert ("chat", {"message": "#stop"}) in transport.calls
+    # Live A1 2026-10-21: this used to leave digging off for 16 hours.
+    assert client._home_route_owed == {"allowBreak": "true"}
+
+
+def test_an_unverified_flee_stop_is_restored_once_nothing_moves(monkeypatch):
+    from baritone_client.common import home_surface
+
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    client = SimpleNamespace(transport=transport)
+    original_dispatch = transport.dispatch
+    moving = {"value": True}
+    state_reads = {"count": 0}
+
+    def dispatch(route, payload=None):
+        response = original_dispatch(route, payload)
+        if route == "get_state":
+            state_reads["count"] += 1
+            if state_reads["count"] > 1:
+                response["is_pathing"] = moving["value"]
+        return response
+
+    monkeypatch.setattr(transport, "dispatch", dispatch)
+    monkeypatch.setattr(combat, "scan_for_threats", lambda *_a, **_k: [threat])
+    monkeypatch.setattr(escape_recovery, "verify_escape_from_threats", lambda *_a, **_k: True)
+    monkeypatch.setattr(home_surface.time, "sleep", lambda *_a: None)
+    combat.run_away(client, threat, timeout=1)
+    assert transport.setting == "false"
+
+    moving["value"] = False
+    assert home_surface.restore_owed_home_route_settings(client)
+    assert transport.setting == "true"
+    assert client._home_route_owed == {}
+
+
+def test_escape_verification_fails_when_fresh_position_crosses_floor(monkeypatch):
+    threat = _entity(1, "zombie", 10, 4, 0)
+    transport = EscapeTransport(threat)
+    client = SimpleNamespace(transport=transport)
+    monkeypatch.setattr(
+        combat,
+        "_get_combat_snapshot",
+        lambda *_a, **_k: {
+            "player": {
+                "health": 20,
+                "block_position": {"x": -2, "y": 61, "z": 0},
+            },
+            "entities": [],
+            "skipped_count": 0,
+        },
+    )
+
+    assert not escape_recovery.verify_escape_from_threats(
+        client,
+        {1: 4.0},
+        {"x": 0, "y": 64, "z": 0},
+        timeout=1,
+        minimum_gain=5,
+        minimum_y=62,
+    )
 
 
 def test_surface_escape_scan_is_bounded_for_active_combat():

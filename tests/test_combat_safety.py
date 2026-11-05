@@ -2676,23 +2676,28 @@ class _RelocateTransport:
         self.calls = []
         self._positions = list(positions)
 
-    def dispatch(self, route, payload):
+    def dispatch(self, route, payload, **kwargs):
         self.calls.append((route, payload))
         if route == "get_state":
             x = self._positions[0]
             if len(self._positions) > 1:
                 self._positions.pop(0)
-            return {"health": 20.0, "block_position": {"x": x, "y": 64, "z": 0}}
+            return {"health": 20.0, "block_position": {"x": x, "y": 64, "z": 0},
+                    "is_pathing": False}
+        if route == "find_blocks":
+            return {"found": [{"x": -16, "y": 63, "z": 0}]}
+        if route == "get_block":
+            return {"id": "minecraft:grass_block" if payload["y"] == 63 else "minecraft:air"}
+        if route == "settings":
+            return {"value": "false"}
+        if route == "get_combat_snapshot":
+            player = self.dispatch("get_state", {})
+            return {"player": player, "entities": [], "skipped_count": 0}
         return {}
 
 
-def test_relocate_heads_directly_away_using_a_y_agnostic_goal(monkeypatch):
-    """The relocation goal must not pin a Y coordinate. goto's arrival test is
-    3D, so passing the player's current Y made the destination unreachable
-    whenever the ground 28 blocks away sat more than `tolerance` higher or
-    lower -- it returned False on every call, the caller never reset its evade
-    counter, and Bot07 climbed to "evasion failed 42x" without gathering a
-    single log. Two-argument #goto lets Baritone resolve a walkable column."""
+def test_relocate_uses_observed_height_instead_of_blind_horizontal_goal(monkeypatch):
+    """Resolve terrain before routing; horizontal goals can select caves."""
     monkeypatch.setattr(combat.time, "sleep", lambda _s: None)
     # Player starts at x=0 and walks to x=-30; threat sits at x=+5.
     transport = _RelocateTransport([0, -12, -30])
@@ -2701,13 +2706,9 @@ def test_relocate_heads_directly_away_using_a_y_agnostic_goal(monkeypatch):
 
     assert combat._relocate_away_from(client, threat, distance=28)
 
-    goals = [
-        payload["message"]
-        for route, payload in transport.calls
-        if route == "chat" and payload.get("message", "").startswith("#goto")
-    ]
-    # Directly away from +x means -x, a full 28 blocks out, and no Y term.
-    assert goals == ["#goto -28 0"]
+    assert ("goal", {"x": -16, "y": 64, "z": 0}) in transport.calls
+    assert not any(route == "chat" and payload.get("message", "").startswith("#goto")
+                   for route, payload in transport.calls)
 
 
 def test_relocate_reports_failure_when_separation_never_grows(
