@@ -61,6 +61,20 @@
                 当轮就连探几次（get_player_pos 很便宜），之后每轮验收一次进度。
                 判断"它真在动"看三样：位置在变 / 产出在涨 / 手上工具对。
 
+                【目标与步骤分开记】
+
+                goal 管"往哪走"，todo 管"这一步分几小步"——别拿一个当两个用。
+
+                create_goal(objective="做出一把铁镐")  ← 一句话，步骤别塞进来
+                todo_write([{task:"挖 3 圆石合成石镐",status:"in_progress"},
+                            {task:"挖 3 铁矿石"}, {task:"搞到燃料"},
+                            {task:"合熔炉并放下"}, {task:"烧铁取锭"}, {task:"合成铁镐"}])
+                干完一项 → todo_write 把那项标 completed、下一项标 in_progress
+                全做完 → update_goal(action="complete")
+
+                ⚠️ 自动续轮里**改不了 goal**（edit / pause / resume 都要人回合发起），
+                所以进度一律记在 todo 里，别惦记着去 edit objective。
+
                 【遇到麻烦怎么办】
                 没有外援，所有问题自己解决。
                 - 真危险（血≤6 / 被围 / 掉岩浆 / 溺水）→ 第一优先是活着。跑、躲、上岸。装备可以再做，死了掉落物找不回来。
