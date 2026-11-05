@@ -73,4 +73,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C 是正常关闭信号：DSH 退出时整个进程组都会收到，本进程被顺势打断
+        # 属于预期行为，不是错误。安静退出，别吐一屏 traceback 吓人。
+        raise SystemExit(0)
