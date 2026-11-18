@@ -197,6 +197,19 @@ public class StateCommandHandler extends AsyncCommandHandler {
                         "pathing_goal_description",
                         baritone.getPathingBehavior().getGoal().toString());
                 }
+
+                // 「我在干什么」和「我正在往哪走」是两件事：pathingBehavior 的 goal
+                // 是当前这一段路线的终点，customGoalProcess 的 goal 才是任务本身
+                // （goto / mine iron_ore / explore …）。
+                // 自动战斗要"打完了接着干原来的活"，靠的是后者 —— 前者打完一段就变，
+                // 恢复它等于只回到半路。
+                if (baritone.getCustomGoalProcess().getGoal() != null) {
+                    data.addProperty(
+                        "custom_goal",
+                        baritone.getCustomGoalProcess().getGoal().toString());
+                }
+                data.addProperty(
+                    "custom_goal_active", baritone.getCustomGoalProcess().isActive());
             } catch (Exception e) {
                 logger.debug("Could not get pathing status", e);
                 data.addProperty("is_pathing", false);

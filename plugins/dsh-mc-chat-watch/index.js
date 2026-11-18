@@ -1279,6 +1279,296 @@ export function apply(ctx, input = {}) {
     return amount < 1 ? amount.toFixed(1) : String(Math.round(amount));
   };
 
+  // ── 自动战斗（auto 模式）：把"挨打后的条件反射"从 agent 手里接过来 ────────
+  //
+  // 用户 2026-11-18 的原话：「我之前设计的是由AI全程自行决定，但是目前面临一个问题：
+  // 事件和做出决定的延迟太高了，高到AI没办法处理，目前只能退而求其次，给一些辅助工具
+  // 让AI能够正常游玩下去，而不是一直受击死亡」。
+  //
+  // 所以这不是"不信 AI 判断"，是两条速度完全不同的通道：
+  //   · 慢通道（agent）—— 打什么怪、去哪、怎么打，几秒的思考完全够用，而且它看得懂局面；
+  //   · 快通道（这里）—— 挨打后 200ms 内必须有的反应，模型来不及，交给代码。
+  // 模式由 agent 自己切（get_combat_mode / set_combat_mode），默认 manual = 什么都不接管。
+  //
+  // 玩家打的**不走快通道**：那是社交判断（闹着玩？真生气？开玩笑？），不是反射。
+  const AUTO_EAT_BELOW_PERCENT = 50;
+  const AUTO_FLEE_BELOW_PERCENT = 30;
+
+  /** 食物按回血价值从高到低。 */
+  const FOOD_RANK = [
+    'golden_carrot', 'cooked_beef', 'cooked_porkchop', 'cooked_mutton', 'cooked_chicken',
+    'cooked_rabbit', 'cooked_cod', 'cooked_salmon', 'bread', 'baked_potato', 'apple',
+    'carrot', 'melon_slice', 'beef', 'porkchop', 'mutton', 'chicken', 'cod', 'salmon', 'potato',
+  ];
+
+  /** 武器按材质从好到差。剑优先于斧；镐子排最后 —— 伤害不如空手高多少，但总比空手强。 */
+  const WEAPON_RANK = [
+    'netherite_sword', 'diamond_sword', 'iron_sword', 'stone_sword', 'golden_sword', 'wooden_sword',
+    'netherite_axe', 'diamond_axe', 'iron_axe', 'stone_axe', 'golden_axe', 'wooden_axe',
+    'netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'golden_pickaxe', 'wooden_pickaxe',
+  ];
+
+  /** 读当前战斗模式；读失败返回空串（按手动处理 —— 宁可不动，也不要误接管）。 */
+  const readCombatMode = async (cfg) => {
+    try {
+      const reply = await bridgeCall(cfg, 'combat_mode', {});
+      const data = (reply && reply.data) || reply || {};
+      return String(data.mode || '').toLowerCase();
+    } catch {
+      return '';
+    }
+  };
+
+  /** 从背包里按候选顺序挑第一个有的，返回那一条（含 id / count / slot）。 */
+  const pickFromInventory = (items, rank) => {
+    for (const want of rank) {
+      const hit = items.find(
+        (i) => String(i.id || '').replace('minecraft:', '') === want && Number(i.count) > 0,
+      );
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  /** 翻背包找一件能用的武器；读不到背包就返回 null（调用方会转去撤离）。 */
+  const findWeapon = async (cfg) => {
+    try {
+      const inv = await bridgeCall(cfg, 'get_inventory', {});
+      const items = (inv && inv.data && inv.data.inventory) || [];
+      return pickFromInventory(items, WEAPON_RANK);
+    } catch {
+      return null;
+    }
+  };
+
+  /** 吃东西回血。返回 true 表示确实吃了（否则调用方会转去反击）。 */
+  const autoEat = async (cfg) => {
+    try {
+      const inv = await bridgeCall(cfg, 'get_inventory', {});
+      const items = (inv && inv.data && inv.data.inventory) || [];
+      const food = pickFromInventory(items, FOOD_RANK);
+      if (!food) return false;
+      // select_slot 只认快捷栏 0-8；食物在主背包里时先不管 —— 逃生时操作背包容易点错。
+      const slot = Number(food.slot ?? food.index);
+      if (!Number.isFinite(slot) || slot < 0 || slot > 8) return false;
+      await bridgeCall(cfg, 'select_slot', { slot });
+      await bridgeCall(cfg, 'use_item', { duration_ms: 1800 });
+      return true;
+    } catch (error) {
+      log(`[auto] 进食失败：${String((error && error.message) || error)}`);
+      return false;
+    }
+  };
+
+  /**
+   * 撤离：先停掉当前 Baritone 任务（否则它会让角色继续往矿里钻），再让 Baritone 走开。
+   * 不用坐标目标是因为 bridge 的 goal 命令只支持 yLevel；explore 足够脱离接触。
+   */
+  const autoRetreat = async (cfg) => {
+    try {
+      await bridgeCall(cfg, 'cancel', {});
+      await bridgeCall(cfg, 'explore', {});
+    } catch (error) {
+      log(`[auto] 撤离失败：${String((error && error.message) || error)}`);
+    }
+  };
+
+  /**
+   * auto 模式下的条件反射。**调用方不 await** —— 它慢或失败都不能拖住唤醒链。
+   */
+  // ── 战斗状态机 ────────────────────────────────────────────────────────
+  //
+  // 用户 2026-11-18 给的伪逻辑（原话）：
+  //   「AI角色处于正常状态，此时收到攻击，进入战斗状态，此时用一个队列把攻击者记录下来，
+  //     然后战斗状态自动从这个队列中锁定攻击目标，循环调用攻击指令直到怪物死亡，
+  //     怪物死亡后再从队列里找新的目标，如果10秒找不到，就退出战斗状态」
+  //
+  // 为什么不能"一次挨打就回一次手"：一轮要 4 次 bridge 往返（get_state / get_inventory /
+  // equip / attack_entity），200~400ms。成堆怪物时高频事件全挤在这段时间里，
+  // 旧实现用 busy 标志直接把后来的**丢弃**了 —— 十次攻击可能只回一次手。
+  // 改成队列 + 固定节拍的循环，入队是同步的，一条都不丢。
+  const COMBAT_TICK_MS = 600;            // 略大于 MC 攻击冷却（0.6s），避免点了不生效
+  const COMBAT_IDLE_EXIT_MS = 10000;     // 队列空且这么久没进展 → 退出战斗
+
+  /** null = 不在战斗；否则 { queue, targetId, lastProgressAt, timer, suspendedTask }。 */
+  let combat = null;
+
+  /** setInterval 不会等上一次跑完 —— 这个标志保证同一时刻只有一轮 tick 在跑。 */
+  let combatTicking = false;
+
+  /**
+   * 进入战斗：先挂起 Baritone 原任务，再开始打。
+   *
+   * 用户 2026-11-18 选的方案：「在进入战斗时，把 Baritone 任务记下来，然后取消这个任务，
+   * 等退出时重新发起」。不取消的话 Baritone 会拖着角色继续跑，边跑边打大概率一只也打不死。
+   *
+   * 顺序很重要：**先 save 再 cancel**。反过来的话 cancel 已经把 target 清了，存不到东西。
+   */
+  const enterCombat = async (cfg) => {
+    if (combat) return;
+    combat = { queue: [], targetId: null, lastProgressAt: Date.now(), timer: null, suspendedTask: false };
+
+    try {
+      const saved = await bridgeCall(cfg, 'task_memory', { action: 'save' });
+      const d = (saved && saved.data) || saved || {};
+      if (d.has_saved) {
+        combat.suspendedTask = true;
+        await bridgeCall(cfg, 'cancel', {});
+        log(`[auto] 已挂起原任务：${String(d.goal || '')}`);
+      }
+    } catch (error) {
+      // 挂不起来也照打 —— 战斗优先级高于任务连续性
+      log(`[auto] 挂起原任务失败（继续战斗）：${String((error && error.message) || error)}`);
+    }
+
+    combat.timer = setInterval(() => { void combatTick(cfg); }, COMBAT_TICK_MS);
+    log('[auto] 进入战斗状态');
+  };
+
+  /**
+   * 退出战斗：把挂起的任务还回去。
+   *
+   * ⚠️ 恢复不了不算失败，但要**说清楚**——比如 {@code mine} 这类命令的 Baritone goal
+   * 是 null，本来就存不下来。让 agent 知道"原来的活没接上"，比它以为还在挖矿要好。
+   */
+  const exitCombat = async (cfg, reason) => {
+    if (!combat) return;
+    const hadTask = combat.suspendedTask;
+    clearInterval(combat.timer);
+    combat.timer = null;
+    combat = null;
+    log(`[auto] 退出战斗：${reason}`);
+
+    if (!hadTask) return;
+    try {
+      const restored = await bridgeCall(cfg, 'task_memory', { action: 'restore' });
+      const d = (restored && restored.data) || restored || {};
+      if (d.restored) {
+        log(`[auto] 已恢复原任务：${String(d.goal || '')}`);
+      } else {
+        log(`[auto] 原任务没能恢复：${String(d.reason || '未知')}`);
+      }
+    } catch (error) {
+      log(`[auto] 恢复原任务失败：${String((error && error.message) || error)}`);
+    }
+  };
+
+  /**
+   * 把攻击者记进队列。**同步操作**，不查状态不攻击 —— 所以高频攻击也不会丢。
+   * 同一只怪连续咬你只记一条。
+   */
+  const enqueueAttacker = (evData) => {
+    if (!combat) return;
+    const id = Number(evData.attacker_id);
+    if (!Number.isFinite(id)) return;
+    if (combat.targetId === id || combat.queue.includes(id)) return;
+    combat.queue.push(id);
+    log(`[auto] 入队攻击者 #${id}（队列 ${combat.queue.length}）`);
+  };
+
+  /** 读血并处理进食/撤离。返回 false 表示已经不该继续打了。 */
+  const checkVitals = async (cfg) => {
+    const state = await bridgeCall(cfg, 'get_state', {});
+    const s = (state && state.data) || state || {};
+    const hp = Number(s.health);
+    const maxHp = Number(s.max_health) || 20;
+    if (!Number.isFinite(hp) || hp <= 0) return true;   // 读不到就继续，别因读失败停手
+    const pct = (hp / maxHp) * 100;
+
+    if (pct < AUTO_FLEE_BELOW_PERCENT) {
+      log(`[auto] 血 ${hp.toFixed(1)}/${maxHp}（${pct.toFixed(0)}%）低于撤离线，先跑`);
+      await autoRetreat(cfg);
+      return false;
+    }
+    if (pct <= AUTO_EAT_BELOW_PERCENT) {
+      if (await autoEat(cfg)) {
+        log(`[auto] 血 ${hp.toFixed(1)}/${maxHp}，已进食`);
+      }
+    }
+    return true;
+  };
+
+  /** 战斗主循环：一个节拍只做一件事，绝不并发。 */
+  const combatTick = async (cfg) => {
+    if (!combat || combatTicking) return;
+    combatTicking = true;
+    try {
+      await combatTickBody(cfg);
+    } finally {
+      combatTicking = false;
+    }
+  };
+
+  /** 真正的一轮：查血 → 打当前目标 → 换目标 → 超时退出。 */
+  const combatTickBody = async (cfg) => {
+
+    // 模式被切回 manual → 立刻收手（agent 要自己打）
+    if ((await readCombatMode(cfg)) !== 'auto') {
+      await exitCombat(cfg, '模式已切回 manual');
+      return;
+    }
+
+    if (!(await checkVitals(cfg))) {
+      await exitCombat(cfg, '血量低于撤离线');
+      return;
+    }
+
+    // ① 有锁定目标 → 继续打
+    if (combat.targetId !== null) {
+      try {
+        await bridgeCall(cfg, 'attack_entity', { entity_id: combat.targetId });
+        combat.lastProgressAt = Date.now();
+        return;
+      } catch (error) {
+        // attack_entity 对已死/已消失的目标报 "Entity not found" —— 这就是击杀信号
+        log(`[auto] 目标 #${combat.targetId} 已不在：${String((error && error.message) || error)}`);
+        combat.targetId = null;
+        combat.lastProgressAt = Date.now();
+      }
+    }
+
+    // ② 从队列取下一位
+    if (combat.queue.length > 0) {
+      const next = combat.queue.shift();
+      try {
+        const weapon = await findWeapon(cfg);
+        if (!weapon || !weapon.id) {
+          log('[auto] 没有可用武器，撤离');
+          await autoRetreat(cfg);
+          await exitCombat(cfg, '手上没有武器');
+          return;
+        }
+        await bridgeCall(cfg, 'equip', { slot: 'mainhand', item: String(weapon.id) });
+      } catch (error) {
+        // 切武器失败不该丢掉目标 —— 拿着手边的东西也要打
+        log(`[auto] 切武器失败，用当前手持：${String((error && error.message) || error)}`);
+      }
+      combat.targetId = next;
+      combat.lastProgressAt = Date.now();
+      log(`[auto] 锁定目标 #${next}`);
+      return;
+    }
+
+    // ③ 队列空：等下一个挨打事件填队列，超时就退出
+    if (Date.now() - combat.lastProgressAt > COMBAT_IDLE_EXIT_MS) {
+      await exitCombat(cfg, `${Math.round(COMBAT_IDLE_EXIT_MS / 1000)} 秒没有新目标`);
+    }
+  };
+
+  /**
+   * DAMAGE 事件的入口。auto 模式只是**入队 + 确保战斗在跑**，不在这里做任何
+   * 网络往返 —— 这样高频攻击下也不会丢事件。
+   */
+  const runAutoReflex = async (cfg, evData, isPlayerAttacker) => {
+    if (isPlayerAttacker) return;
+    // 环境伤害（溺水/摔落/岩浆）没有攻击者，不归战斗管
+    if (!Number.isFinite(Number(evData.attacker_id))) return;
+    if ((await readCombatMode(cfg)) !== 'auto') return;
+
+    if (!combat) await enterCombat(cfg);
+    enqueueAttacker(evData);
+  };
+
   const handleDamageEvent = (evData) => {
     const line = `⚠受伤-${formatDamage(evData.amount)}` +
       (evData.attacker_type ? `(${String(evData.attacker_type).replace('minecraft:', '')})` : '');
@@ -1310,6 +1600,12 @@ export function apply(ctx, input = {}) {
     const byPlayer = attackerType.includes('player');
     const attackerName = String(evData.attacker_name || '');
     const isKnownPlayer = byPlayer && attackerName !== '' && attackerName === cfg.playerName;
+
+    // ②.5 auto 模式：不 await —— 反射走自己的通道，唤醒链照旧往下走。
+    // 玩家打的不进这条（isKnownPlayer / byPlayer 由 runAutoReflex 内部再挡一次）。
+    if (!isKnownPlayer) {
+      void runAutoReflex(cfg, evData, byPlayer);
+    }
 
     let advice;
     if (!hasAttacker) {

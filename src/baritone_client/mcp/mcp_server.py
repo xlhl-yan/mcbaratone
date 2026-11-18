@@ -1130,6 +1130,49 @@ def create_mcp_server(config: BridgeConfig) -> FastMCP:
         )
 
     @mcp.tool()
+    def get_combat_mode(ctx: RequestContext) -> Dict[str, Any]:
+        """Show which combat mode is active right now.
+
+        - ``manual`` —— 受伤只上报给你，要不要还手、用什么武器都由你判断。
+        - ``auto`` —— "挨打后怎么反应"这段条件反射已授权给插件执行：怪物攻击时
+          自动切武器反击；血 ≤ 50% 自动进食；血 < 30% 自动撤离。
+
+        返回值里带 ``eat_below_percent`` / ``flee_below_percent``，所以你能知道
+        它在什么位置会自己动手 —— 需要精细控制时就切回 ``manual`` 自己来。
+
+        只读，不改变任何状态。
+        """
+        return _call_bridge(
+            ctx,
+            "command/get_combat_mode",
+            lambda client: client.transport.dispatch("combat_mode", {}),
+        )
+
+    @mcp.tool()
+    def set_combat_mode(mode: str, ctx: RequestContext) -> Dict[str, Any]:
+        """Switch the combat mode.
+
+        Args:
+            mode: ``"auto"`` 或 ``"manual"``。传别的值会被拒绝（不会静默改成默认）。
+
+        什么时候值得切到 ``auto``：你正在挖矿/赶路/睡觉，做别的事时顾不上挨打；
+        或者网络/模型延迟让你来不及反应。什么时候切回 ``manual``：你在主动打怪、
+        在玩家基地附近（自动撤离可能跑丢）、或者需要精细控制走位的时候。
+
+        ``auto`` 不会替你决定**打谁** —— 它只对"正在打你的怪物"做反应，目标选择
+        和后续行动仍然是你的事。它也**不会**因为你挨打就中断你正在做的事，
+        除非血量掉到撤离线。
+        """
+        want = str(mode or "").strip().lower()
+        if want not in ("auto", "manual"):
+            raise ValueError(f'mode 只能是 "auto" 或 "manual"，收到: {mode!r}')
+        return _call_bridge(
+            ctx,
+            "command/set_combat_mode",
+            lambda client: client.transport.dispatch("combat_mode", {"mode": want}),
+        )
+
+    @mcp.tool()
     def get_look_target(ctx: RequestContext) -> Dict[str, Any]:
         """What the crosshair is pointing at right now (read-only).
 
