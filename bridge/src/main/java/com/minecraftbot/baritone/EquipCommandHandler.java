@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
@@ -38,6 +39,76 @@ public class EquipCommandHandler extends AsyncCommandHandler {
                 }
                 if (itemId.isBlank()) {
                     return CommandResult.error("Missing item parameter");
+                }
+
+                // 主手不是固定索引 —— 它由"快捷栏当前选中格"决定，所以 mainhand
+                // 走一套和护甲/副手完全不同的逻辑：找到物品，把它弄进快捷栏，
+                // 再选中那一格。护甲槽那套 getTargetInventoryIndex 返回 null，
+                // 以前调用方传 "mainhand" 只会拿到 Unsupported equip slot。
+                if ("mainhand".equals(slotName) || "hand".equals(slotName)) {
+                    Inventory handInv = client.player.getInventory();
+                    int found = findItemSlot(handInv, itemId);
+                    if (found < 0) {
+                        return CommandResult.error("Item not found in inventory: " + itemId);
+                    }
+                    AbstractContainerMenu handHandler = client.player.containerMenu;
+                    if (handHandler != client.player.inventoryMenu) {
+                        return CommandResult.error(
+                            "Close the active container screen before equipping");
+                    }
+                    if (!handHandler.getCarried().isEmpty()) {
+                        return CommandResult.error(
+                            "Cannot equip while the inventory cursor is occupied");
+                    }
+
+                    int heldSlot;
+                    String mode;
+                    if (found <= 8) {
+                        // 已经在快捷栏：切过���就行，不动物品
+                        handInv.selected = found;
+                        client.player.connection.send(new ServerboundSetCarriedItemPacket(found));
+                        heldSlot = found;
+                        mode = "select_slot";
+                    } else {
+                        // 在背包深处：跟当前选中格互换，然后选中它
+                        int target = handInv.selected;
+                        Integer fromScreen = findScreenSlotId(handHandler, handInv, found);
+                        Integer toScreen = findScreenSlotId(handHandler, handInv, target);
+                        if (fromScreen == null || toScreen == null) {
+                            return CommandResult.error("Unable to resolve slot ids for equip");
+                        }
+                        int syncId = handHandler.containerId;
+                        client.gameMode.handleContainerInput(
+                            syncId, fromScreen, 0, ContainerInput.PICKUP, client.player);
+                        client.gameMode.handleContainerInput(
+                            syncId, toScreen, 0, ContainerInput.PICKUP, client.player);
+                        if (!handHandler.getCarried().isEmpty()) {
+                            // 目标格原来装着别的 → 塞回物品原来的格子
+                            client.gameMode.handleContainerInput(
+                                syncId, fromScreen, 0, ContainerInput.PICKUP, client.player);
+                        }
+                        if (!handHandler.getCarried().isEmpty()) {
+                            return CommandResult.error("Swap left the cursor occupied");
+                        }
+                        heldSlot = target;
+                        mode = "swap_into_hand";
+                    }
+
+                    ItemStack held = handInv.getItem(handInv.selected);
+                    boolean heldOk = !held.isEmpty()
+                        && BuiltInRegistries.ITEM.getKey(held.getItem())
+                            .equals(Identifier.parse(itemId));
+                    JsonObject handData = new JsonObject();
+                    handData.addProperty("equipped", heldOk);
+                    handData.addProperty("slot", "mainhand");
+                    handData.addProperty("item", itemId);
+                    handData.addProperty("mode", mode);
+                    handData.addProperty("held_slot", heldSlot);
+                    handData.addProperty("cursor_empty", true);
+                    if (!heldOk) {
+                        return CommandResult.error("Equip postcondition failed for mainhand");
+                    }
+                    return CommandResult.success(handData);
                 }
 
                 Integer targetInventoryIndex = getTargetInventoryIndex(slotName);
